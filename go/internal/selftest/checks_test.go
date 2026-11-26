@@ -14,6 +14,7 @@ import (
 type fakeRunner struct {
 	out map[string]string // key: "name arg arg"
 	err map[string]error
+	fn  func(name string, args []string) ([]byte, bool) // fallback (tpm2 trial sessions)
 }
 
 func (f *fakeRunner) Run(name string, args ...string) ([]byte, error) {
@@ -21,8 +22,16 @@ func (f *fakeRunner) Run(name string, args ...string) ([]byte, error) {
 	if e, ok := f.err[k]; ok {
 		return nil, e
 	}
+	if e, ok := f.err[name]; ok {
+		return nil, e
+	}
 	if o, ok := f.out[k]; ok {
 		return []byte(o), nil
+	}
+	if f.fn != nil {
+		if o, ok := f.fn(name, args); ok {
+			return o, nil
+		}
 	}
 	return nil, errors.New("unexpected command: " + k)
 }
@@ -52,47 +61,6 @@ const goodNft = `{"nftables":[{"metainfo":{}},{"table":{"family":"ip","name":"en
 
 const unitsCmd = "systemctl list-units --all --plain --no-legend --state=active"
 
-const (
-	nvGetcapCmd = "tpm2_getcap handles-nv-index"
-	nvPublicCmd = "tpm2_nvreadpublic 0x01800E01"
-	nvReadCmd   = "tpm2_nvread 0x01800E01 -C 0x01800E01 -s 32"
-	// tpm2-tools 5.7 output for a written, write-locked index
-	nvPublicLocked = "0x1800e01:\n  name: 000b07fa\n  hash algorithm:\n    friendly: sha256\n    value: 0xB\n" +
-		"  attributes:\n    friendly: policywrite|writelocked|writedefine|authread|no_da|written\n    value: 0x22042808\n" +
-		"  size: 32\n  authorization policy: EB05C41A8B59DE8F4426211037729B203124BC759E30950A87CFCE5B00FF5B84\n\n"
-)
-
-// goodRoot builds a fully passing fake root and runner.
-func goodRoot(t *testing.T) (string, *fakeRunner) {
-	root := t.TempDir()
-	put(t, root, sbPath, "\x06\x00\x00\x00\x01")
-	put(t, root, smPath, "\x06\x00\x00\x00\x00")
-	put(t, root, "sys/kernel/security/lockdown", "none integrity [confidentiality]\n")
-	put(t, root, "sys/module/module/parameters/sig_enforce", "Y\n")
-	put(t, root, "proc/self/mountinfo",
-		"20 1 253:0 / /usr ro,relatime shared:1 - erofs /dev/mapper/usr ro\n"+
-			"21 1 253:1 / /var rw,relatime shared:2 - ext4 /dev/mapper/var rw\n")
-	put(t, root, "sys/dev/block/253:0/dm/uuid", "CRYPT-VERITY-abc-usr\n")
-	put(t, root, "sys/dev/block/253:1/dm/uuid", "CRYPT-LUKS2-abc-var\n")
-	if err := os.MkdirAll(filepath.Join(root, "sys/dev/block/253:1/slaves/vda4"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	put(t, root, "sys/module/apparmor/parameters/enabled", "Y\n")
-	put(t, root, "usr/lib/enklave/role", " ref\n")
-	put(t, root, "usr/lib/os-release", "NAME=Enklave\nIMAGE_VERSION=1.2.3\n")
-	put(t, root, "proc/cmdline", "usrhash=ab lockdown=confidentiality systemd.import_credentials=no root=tmpfs\n")
-	put(t, root, "run/enklave/var-authenticated", strings.Repeat("15", 32)+"\n")
-	r := &fakeRunner{out: map[string]string{
-		"cryptsetup luksDump /dev/vda4": "Tokens:\n  0: systemd-tpm2\n",
-		nvGetcapCmd:                     "- 0x1500016\n- 0x1800E01\n",
-		nvPublicCmd:                     nvPublicLocked,
-		nvReadCmd:                       strings.Repeat("\x15", 32),
-		"nft -j list ruleset":           goodNft,
-		unitsCmd:                        "sshd-not.service loaded active running x\nfoo.service loaded active running y\n",
-	}}
-	return root, r
-}
-
 func find(t *testing.T, rs []Result, name string) Result {
 	t.Helper()
 	for _, r := range rs {
@@ -108,7 +76,8 @@ func TestAllGood(t *testing.T) {
 	root, r := goodRoot(t)
 	rs := RunChecks(root, r)
 	wantOrder := []string{"secureboot", "setupmode_off", "lockdown", "module_sig_enforce", "usr_verity", "usr_readonly",
-		"var_luks", "var_tpm_bound", "var_authenticated", "no_pkg_manager", "apparmor", "nft_default_drop", "no_getty", "ipv6_absent", "no_credentials", "role", "version"}
+		"var_luks", "var_tpm_bound", "var_authenticated", "var_integrity", "var_rollback", "tpm_locked", "pcr11_sealed",
+		"no_pkg_manager", "apparmor", "nft_default_drop", "no_getty", "ipv6_absent", "no_credentials", "role", "version"}
 	if len(rs) != len(wantOrder) {
 		t.Fatalf("got %d results: %+v", len(rs), rs)
 	}
@@ -152,10 +121,22 @@ func TestChecksNotOk(t *testing.T) {
 			put(t, root, "sys/dev/block/253:1/dm/uuid", "CRYPT-VERITY-x\n")
 		}},
 		{"var_tpm_bound", func(t *testing.T, root string, r *fakeRunner) {
-			r.out["cryptsetup luksDump /dev/vda4"] = "Tokens:\n"
+			r.out[luksDumpCmd] = strings.Replace(goodLuksDump, "enklave-tpm2-nv", "systemd-tpm2", 1)
 		}},
 		{"var_authenticated", func(t *testing.T, root string, r *fakeRunner) {
-			r.out[nvReadCmd] = strings.Repeat("\xAA", 32) // swapped volume
+			r.out[recordReadCmd] = strings.Repeat("\xAA", 32) // swapped volume
+		}},
+		{"var_integrity", func(t *testing.T, root string, r *fakeRunner) {
+			r.out[luksDumpCmd] = strings.Replace(goodLuksDump, "integrity: hmac(sha256)", "integrity: (no)", 1)
+		}},
+		{"var_rollback", func(t *testing.T, root string, r *fakeRunner) {
+			put(t, root, "var/lib/enklave/rollback-counter", "41\n")
+		}},
+		{"tpm_locked", func(t *testing.T, root string, r *fakeRunner) {
+			r.out[hierCmd] = strings.Replace(lockedHier, "disableClear:              1", "disableClear:              0", 1)
+		}},
+		{"pcr11_sealed", func(t *testing.T, root string, r *fakeRunner) {
+			put(t, root, "run/enklave/policy.json", `{"pcr11_policy":"`+strings.Repeat("cc", 32)+`"}`)
 		}},
 		{"no_pkg_manager", func(t *testing.T, root string, r *fakeRunner) { put(t, root, "usr/bin/dpkg", "x") }},
 		{"apparmor", func(t *testing.T, root string, r *fakeRunner) {
@@ -426,50 +407,6 @@ func TestRequireSecureBootUsageErrorsStillGuard(t *testing.T) {
 	}
 }
 
-func TestVarAuthenticated(t *testing.T) {
-	cases := []struct {
-		name   string
-		mutate func(t *testing.T, root string, r *fakeRunner)
-	}{
-		{"index missing", func(t *testing.T, root string, r *fakeRunner) { r.out[nvGetcapCmd] = "- 0x1500016\n" }},
-		{"not write-locked", func(t *testing.T, root string, r *fakeRunner) {
-			r.out[nvPublicCmd] = strings.Replace(nvPublicLocked, "0x22042808", "0x22042008", 1)
-		}},
-		{"weak attributes", func(t *testing.T, root string, r *fakeRunner) {
-			r.out[nvPublicCmd] = strings.Replace(nvPublicLocked, "0x22042808", "0x2204280A", 1)
-		}},
-		{"wrong size", func(t *testing.T, root string, r *fakeRunner) {
-			r.out[nvPublicCmd] = strings.Replace(nvPublicLocked, "size: 32", "size: 64", 1)
-		}},
-		{"no auth record", func(t *testing.T, root string, r *fakeRunner) {
-			if err := os.Remove(filepath.Join(root, "run/enklave/var-authenticated")); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{"record differs from NV", func(t *testing.T, root string, r *fakeRunner) {
-			put(t, root, "run/enklave/var-authenticated", strings.Repeat("aa", 32)+"\n")
-		}},
-		{"short read", func(t *testing.T, root string, r *fakeRunner) { r.out[nvReadCmd] = "\x15\x15" }},
-		{"read error", func(t *testing.T, root string, r *fakeRunner) {
-			delete(r.out, nvReadCmd)
-			r.err = map[string]error{nvReadCmd: errors.New("tpm gone")}
-		}},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			root, r := goodRoot(t)
-			c.mutate(t, root, r)
-			if x := find(t, RunChecks(root, r), "var_authenticated"); x.OK || x.Detail == "" {
-				t.Errorf("%+v", x)
-			}
-		})
-	}
-	root, r := goodRoot(t)
-	if x := find(t, RunChecks(root, r), "var_authenticated"); !x.OK || !strings.Contains(x.Detail, "0x01800E01") {
-		t.Errorf("good case: %+v", x)
-	}
-}
-
 func TestNoCredentials(t *testing.T) {
 	check := func(t *testing.T, root string, r *fakeRunner, wantOK bool) {
 		t.Helper()
@@ -496,6 +433,8 @@ func TestNoCredentials(t *testing.T) {
 	})
 	for _, cl := range []string{
 		"systemd.import_credentials=yes",
+		"systemd.import_credentials=no systemd.import_credentials=yes", // last one wins
+		"systemd.import_credentials=no systemd.import_credentials",
 		"systemd.import_credentials=no2",
 		"xsystemd.import_credentials=no",
 		"systemd.import_credentials=0",

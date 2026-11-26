@@ -5,7 +5,6 @@ package selftest
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,8 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	"enklave.local/base/internal/varauth"
 )
 
 // Runner runs external commands (nft, cryptsetup, systemctl).
@@ -67,6 +64,10 @@ func checkList() []check {
 		{"var_luks", func(root string, _ Runner) (string, error) { return dmUUIDPrefix(root, "/var", "CRYPT-LUKS2-") }},
 		{"var_tpm_bound", checkVarTPM},
 		{"var_authenticated", checkVarAuthenticated},
+		{"var_integrity", checkVarIntegrity},
+		{"var_rollback", checkVarRollback},
+		{"tpm_locked", checkTPMLocked},
+		{"pcr11_sealed", checkPCR11Sealed},
 		{"no_pkg_manager", checkNoPkg},
 		{"apparmor", func(root string, _ Runner) (string, error) {
 			return fileEquals(root, "sys/module/apparmor/parameters/enabled", "Y")
@@ -229,63 +230,6 @@ func checkUsrRO(root string, _ Runner) (string, error) {
 	return "", fmt.Errorf("/usr mounted with options %q, not ro", m.opts)
 }
 
-func checkVarTPM(root string, r Runner) (string, error) {
-	m, err := findMount(root, "/var")
-	if err != nil {
-		return "", err
-	}
-	ents, err := os.ReadDir(filepath.Join(root, "sys/dev/block", m.majmin, "slaves"))
-	if err != nil {
-		return "", err
-	}
-	if len(ents) == 0 {
-		return "", errors.New("/var device has no slaves")
-	}
-	dev := "/dev/" + ents[0].Name()
-	out, err := r.Run("cryptsetup", "luksDump", dev)
-	if err != nil {
-		return "", fmt.Errorf("cryptsetup luksDump %s: %w", dev, err)
-	}
-	if !strings.Contains(string(out), "systemd-tpm2") {
-		return "", fmt.Errorf("no systemd-tpm2 token on %s", dev)
-	}
-	return dev, nil
-}
-
-// checkVarAuthenticated verifies the /var authentication record: the NV index
-// exists, is written and write-locked with the expected attributes, and holds
-// the PCR 15 value that enklave-varauth verified before /var was mounted.
-// (The live PCR 15 is extended later in boot, e.g. by systemd-pcrmachine, so
-// it is compared via the record written by enklave-varauth.)
-func checkVarAuthenticated(root string, r Runner) (string, error) {
-	exists, err := varauth.IndexExists(r)
-	if err != nil {
-		return "", err
-	}
-	if !exists {
-		return "", fmt.Errorf("NV index %s missing", varauth.Index)
-	}
-	pub, err := varauth.ReadPublic(r)
-	if err != nil {
-		return "", err
-	}
-	if err := varauth.CheckPublic(pub, nil); err != nil {
-		return "", err
-	}
-	nv, err := varauth.ReadNV(r)
-	if err != nil {
-		return "", err
-	}
-	rec, err := readTrim(root, "run/enklave/var-authenticated")
-	if err != nil {
-		return "", err
-	}
-	if rec != hex.EncodeToString(nv) {
-		return "", fmt.Errorf("NV index %s holds %x, verified PCR 15 was %s", varauth.Index, nv, rec)
-	}
-	return fmt.Sprintf("NV index %s locked, PCR 15 %s", varauth.Index, rec), nil
-}
-
 // mustNotExist succeeds only if the path definitively does not exist; any
 // other stat error (e.g. ENOTDIR, EACCES) is a failure.
 func mustNotExist(root, rel string) error {
@@ -377,14 +321,16 @@ func checkNoCredentials(root string, _ Runner) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	found := false
+	// The kernel/systemd use the last occurrence of an option: the last
+	// systemd.import_credentials= token must be exactly "no".
+	last := ""
 	for _, f := range strings.Fields(string(cl)) {
-		if f == noCredentialsArg {
-			found = true
+		if strings.HasPrefix(f, "systemd.import_credentials=") || f == "systemd.import_credentials" {
+			last = f
 		}
 	}
-	if !found {
-		return "", fmt.Errorf("%s missing from kernel command line", noCredentialsArg)
+	if last != noCredentialsArg {
+		return "", fmt.Errorf("last systemd.import_credentials token is %q, want %s", last, noCredentialsArg)
 	}
 	ents, err := os.ReadDir(filepath.Join(root, "run/credentials/@system"))
 	switch {
