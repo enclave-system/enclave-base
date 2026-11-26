@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // ApplyOptions configures Apply.
@@ -39,21 +40,32 @@ func Apply(opts ApplyOptions, bundle, sig []byte) (uint64, error) {
 	if m.Role != opts.Role {
 		return 0, fmt.Errorf("%w: bundle is for %q, this machine is %q", ErrWrongRole, m.Role, opts.Role)
 	}
-	cur, err := readState(opts.Root)
-	if err != nil {
-		return 0, err
-	}
-	if m.Version <= cur {
-		return 0, fmt.Errorf("%w: bundle %d, installed %d", ErrRollback, m.Version, cur)
-	}
 	keep := opts.Keep
 	if keep <= 0 {
 		keep = defaultKeep
 	}
 
-	versions := filepath.Join(opts.Root, "versions")
-	if err := os.MkdirAll(versions, 0o755); err != nil {
+	if err := ensureRoot(opts.Root); err != nil {
 		return 0, err
+	}
+	// Serialize all Applies on this Root; everything below, including the
+	// rollback check, runs under the lock.
+	unlock, err := lockRoot(opts.Root)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+
+	versions := filepath.Join(opts.Root, "versions")
+	if err := ensureVersionsDir(versions); err != nil {
+		return 0, err
+	}
+	floor, err := rollbackFloor(opts.Root, versions)
+	if err != nil {
+		return 0, err
+	}
+	if m.Version <= floor {
+		return 0, fmt.Errorf("%w: bundle %d, installed %d", ErrRollback, m.Version, floor)
 	}
 	if err := cleanupTmp(opts.Root); err != nil {
 		return 0, err
@@ -101,7 +113,7 @@ func Apply(opts ApplyOptions, bundle, sig []byte) (uint64, error) {
 	if err := writeState(opts.Root, m.Version); err != nil {
 		return 0, err
 	}
-	pruneVersions(versions, keep)
+	pruneVersions(versions, keep, m.Version)
 	return m.Version, nil
 }
 
@@ -217,13 +229,27 @@ func cleanupTmp(root string) error {
 	return nil
 }
 
-// pruneVersions removes all but the newest keep versions. Best effort: the
-// new version is already live, so failures here are not reported as Apply
-// failures.
-func pruneVersions(versions string, keep int) {
-	es, err := os.ReadDir(versions)
+// pruneVersions removes all but the newest keep versions, never the one just
+// applied and never anything at or above it. Best effort: the new version is
+// already live, so failures here are not reported as Apply failures.
+func pruneVersions(versions string, keep int, applied uint64) {
+	nums, err := listVersions(versions)
 	if err != nil {
 		return
+	}
+	for i := keep; i < len(nums); i++ {
+		if nums[i] < applied {
+			os.RemoveAll(filepath.Join(versions, strconv.FormatUint(nums[i], 10)))
+		}
+	}
+}
+
+// listVersions returns the numeric versions/<N> entries, newest first.
+// *.tmp and other names are ignored.
+func listVersions(versions string) ([]uint64, error) {
+	es, err := os.ReadDir(versions)
+	if err != nil {
+		return nil, err
 	}
 	var nums []uint64
 	for _, e := range es {
@@ -233,7 +259,73 @@ func pruneVersions(versions string, keep int) {
 		}
 	}
 	sort.Slice(nums, func(i, j int) bool { return nums[i] > nums[j] })
-	for i := keep; i < len(nums); i++ {
-		os.RemoveAll(filepath.Join(versions, strconv.FormatUint(nums[i], 10)))
+	return nums, nil
+}
+
+// rollbackFloor is the highest version known to have been installed:
+// max(state.json, highest versions/<N>, target of current). A missing or
+// zeroed state.json therefore cannot reopen old versions; a corrupt one
+// fails closed.
+func rollbackFloor(root, versions string) (uint64, error) {
+	floor, err := readState(root)
+	if err != nil {
+		return 0, err
 	}
+	nums, err := listVersions(versions)
+	if err != nil {
+		return 0, err
+	}
+	if len(nums) > 0 && nums[0] > floor {
+		floor = nums[0]
+	}
+	if l, err := os.Readlink(filepath.Join(root, "current")); err == nil {
+		if n, err := strconv.ParseUint(filepath.Base(l), 10, 64); err == nil && n > floor {
+			floor = n
+		}
+	}
+	return floor, nil
+}
+
+func ensureRoot(root string) error {
+	if fi, err := os.Stat(root); err == nil {
+		if !fi.IsDir() {
+			return fmt.Errorf("%s: not a directory", root)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
+	}
+	return os.Chmod(root, 0o755)
+}
+
+func ensureVersionsDir(versions string) error {
+	fi, err := os.Lstat(versions)
+	if os.IsNotExist(err) {
+		if err := os.Mkdir(versions, 0o755); err != nil {
+			return err
+		}
+		return os.Chmod(versions, 0o755)
+	}
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() { // Lstat: a symlink is not a directory here
+		return fmt.Errorf("%s: not a plain directory", versions)
+	}
+	return nil
+}
+
+func lockRoot(root string) (func(), error) {
+	f, err := os.OpenFile(filepath.Join(root, ".lock"), os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
