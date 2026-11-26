@@ -724,23 +724,31 @@ const (
 	sessPC = "PC" // admin branch of the counter policy (NV_ChangeAuth only)
 )
 
-// session runs cmd with a policy session of the given kind. enc is "",
-// "encrypt" (response) or "decrypt" (command) parameter encryption; any
-// encryption requires the verified salt key.
+// session runs cmd with a policy session of the given kind. enc is "" (no
+// parameter encryption: the command carries no secret), "encrypt" (response)
+// or "decrypt" (command); encryption requires the verified salt key and is
+// only used where the authorized entity has an empty authValue (the TPM mixes
+// that authValue into the encryption key; see auxEncrypt for the others).
+// tpm2_startauthsession -c enables both directions, so the unwanted one is
+// switched off explicitly.
 func (t *tpm) session(kind, enc string, cmd ...string) ([]byte, error) {
 	if !t.ready {
 		return nil, errors.New("policy not authorized")
 	}
 	s := t.w("s.ctx")
 	start := []string{"tpm2_startauthsession", "--policy-session", "-S", s}
-	if t.salted {
-		start = append(start, "-c", SaltHandle)
-	} else if enc != "" {
-		return nil, errors.New("parameter encryption requested without a verified salt key")
-	}
 	steps := [][]string{start}
-	if enc != "" {
-		steps = append(steps, []string{"tpm2_sessionconfig", s, "--enable-" + enc})
+	switch enc {
+	case "":
+	case "decrypt", "encrypt":
+		if !t.salted {
+			return nil, errors.New("parameter encryption requested without a verified salt key")
+		}
+		steps[0] = append(start, "-c", SaltHandle)
+		off := map[string]string{"decrypt": "--disable-encrypt", "encrypt": "--disable-decrypt"}[enc]
+		steps = append(steps, []string{"tpm2_sessionconfig", s, off})
+	default:
+		return nil, fmt.Errorf("unknown parameter encryption %q", enc)
 	}
 	steps = append(steps,
 		[]string{"tpm2_policypcr", "-S", s, "-l", "sha256:11"},
@@ -916,8 +924,13 @@ func (t *tpm) lockFresh() error {
 }
 
 // rotate re-applies the hierarchy policies and fresh random authValues on a
-// locked TPM (healing).
+// locked TPM (healing). The current authValues are unknown (discarded), so
+// the authorizing policy session cannot encrypt parameters; the new
+// authValue is encrypted by an auxiliary salted HMAC session instead.
 func (t *tpm) rotate() error {
+	if !t.salted {
+		return errors.New("rotation requires the verified salt key")
+	}
 	for _, h := range []string{"o", "e", "l"} {
 		if _, err := t.session(sessP, "", "tpm2_setprimarypolicy", "-C", h, "-L", t.w("p.bin"), "-g", "sha256", "-P"); err != nil {
 			return err
@@ -928,7 +941,16 @@ func (t *tpm) rotate() error {
 		if err != nil {
 			return err
 		}
-		if _, err := t.session(sessP, "decrypt", "tpm2_changeauth", "-c", h, "hex:"+v, "-p"); err != nil {
+		aux := t.w("aux.ctx")
+		if _, err := t.run("tpm2_startauthsession", "--hmac-session", "-S", aux, "-c", SaltHandle); err != nil {
+			return err
+		}
+		_, err = t.run("tpm2_sessionconfig", aux, "--disable-encrypt")
+		if err == nil {
+			_, err = t.session(sessP, "", "tpm2_changeauth", "-c", h, "-S", aux, "hex:"+v, "-p")
+		}
+		t.r.Run("tpm2_flushcontext", aux) //nolint:errcheck
+		if err != nil {
 			return err
 		}
 	}

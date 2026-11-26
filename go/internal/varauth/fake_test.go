@@ -37,7 +37,7 @@ type hierarchy struct {
 
 type fsess struct {
 	policy, salted bool
-	enc            string
+	dec, encr      bool // parameter encryption attributes (salted default: both)
 	d              []byte
 	avUsed         bool
 	cc             string
@@ -169,9 +169,18 @@ func (f *fakeTPM) authEntity(v string, auth string, policy []byte, admin string)
 }
 
 func (f *fakeTPM) requireEnc(s *fsess, want, what string) {
-	if s == nil || !s.salted || s.enc != want {
+	if s == nil || !s.salted || (want == "decrypt" && !s.dec) || (want == "encrypt" && !s.encr) {
 		f.violate("%s without a salted %s session", what, want)
 	}
+}
+
+// garbled models the real TPM: the parameter-encryption key of a policy
+// authorization session includes the authValue of the authorized entity, so
+// an encrypted parameter decrypts to garbage when the caller does not supply
+// that (non-empty) authValue (observed with swtpm and tpm2-tools 5.7).
+func (f *fakeTPM) garbled(v, entityAuth string) bool {
+	s, given, err := f.sessionAuth(v)
+	return err == nil && s.policy && s.salted && s.dec && entityAuth != "" && given != entityAuth
 }
 
 func (f *fakeTPM) nvIndex(handle string) (*nvIdx, uint64, error) {
@@ -211,6 +220,7 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 				return nil, errors.New("TPM_RC_HANDLE (salt key)")
 			}
 			ns.salted = true
+			ns.dec, ns.encr = true, true // tpm2_startauthsession -c enables both
 		}
 		trial := args[0] != "--policy-session" && args[0] != "--hmac-session"
 		if trial {
@@ -219,7 +229,15 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 		f.sess[arg(args, "-S")] = ns
 		return nil, nil
 	case "tpm2_sessionconfig":
-		f.sess[args[0]].enc = strings.TrimPrefix(args[1], "--enable-")
+		for _, a := range args[1:] {
+			on := strings.HasPrefix(a, "--enable-")
+			switch strings.TrimPrefix(strings.TrimPrefix(a, "--enable-"), "--disable-") {
+			case "decrypt":
+				f.sess[args[0]].dec = on
+			case "encrypt":
+				f.sess[args[0]].encr = on
+			}
+		}
 		return nil, nil
 	case "tpm2_policyauthorize":
 		ref := string(f.read(arg(args, "-q")))
@@ -322,6 +340,9 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 			return nil, err
 		}
 		hi.policy = f.read(arg(args, "-L"))
+		if f.garbled(arg(args, "-P"), hi.auth) {
+			hi.policy = h([]byte("garbage"), hi.policy)
+		}
 		return nil, nil
 	case "tpm2_clearcontrol":
 		if f.h["l"].auth != "" {
@@ -342,8 +363,16 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			f.requireEnc(sx, "decrypt", "changeauth "+target)
+			old := hi.auth
 			hi.auth = newAuth
+			if aux := f.sess[arg(args, "-S")]; aux != nil && !aux.policy {
+				f.requireEnc(aux, "decrypt", "changeauth "+target) // auxiliary encryption session
+			} else {
+				f.requireEnc(sx, "decrypt", "changeauth "+target)
+				if f.garbled(arg(args, "-p"), old) {
+					hi.auth = "garbage"
+				}
+			}
 			return nil, nil
 		}
 		ix, _, err := f.nvIndex(target)

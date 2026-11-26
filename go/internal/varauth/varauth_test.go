@@ -242,7 +242,7 @@ func TestHealing(t *testing.T) {
 		t.Error("volume key not replaced")
 	}
 	for _, k := range []string{"o", "e", "l"} {
-		if e.f.h[k].auth == oldAuth[k] {
+		if e.f.h[k].auth == oldAuth[k] || e.f.h[k].auth == "garbage" || len(e.f.h[k].auth) != 64 {
 			t.Errorf("hierarchy %s auth not rotated", k)
 		}
 	}
