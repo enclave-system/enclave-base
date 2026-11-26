@@ -17,7 +17,7 @@ $SUDO apt-get install -y --no-install-recommends \
     bubblewrap debian-archive-keyring dosfstools mtools e2fsprogs \
     squashfs-tools erofs-utils systemd-container apt zstd xz-utils kmod \
     cpio uidmap python3 gnupg efi-shell-x64 \
-    build-essential flex bison bc libelf-dev libssl-dev dwarves rsync
+    build-essential flex bison bc libelf-dev libssl-dev dwarves rsync debhelper dpkg-dev
 
 if [ -d /opt/mkosi/.git ]; then
     $SUDO git -C /opt/mkosi fetch --tags --quiet
