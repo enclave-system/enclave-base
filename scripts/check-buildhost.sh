@@ -33,12 +33,13 @@ fi
 
 for c in qemu-system-x86_64 swtpm sbsign sbverify cert-to-efi-sig-list \
          sign-efi-sig-list openssl pytest systemd-repart ukify veritysetup \
-         cryptsetup virt-fw-vars git; do
+         cryptsetup virt-fw-vars gpg mcopy mkfs.vfat git; do
     have "$c" || missing "$c"
 done
 
 [ -e /usr/share/OVMF/OVMF_CODE_4M.secboot.fd ] || missing OVMF_CODE_4M.secboot.fd
 [ -e /dev/kvm ] || missing /dev/kvm
+[ -e /usr/share/efi-shell-x64/shellx64.efi ] || missing efi-shell-x64
 
 # kernel bindeb-pkg build dependencies
 for p in build-essential flex bison bc libelf-dev libssl-dev dwarves rsync cpio kmod zstd; do

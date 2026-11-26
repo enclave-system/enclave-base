@@ -16,7 +16,7 @@ $SUDO apt-get install -y --no-install-recommends \
     cryptsetup-bin golang git ca-certificates \
     bubblewrap debian-archive-keyring dosfstools mtools e2fsprogs \
     squashfs-tools erofs-utils systemd-container apt zstd xz-utils kmod \
-    cpio uidmap python3 \
+    cpio uidmap python3 gnupg efi-shell-x64 \
     build-essential flex bison bc libelf-dev libssl-dev dwarves rsync
 
 if [ -d /opt/mkosi/.git ]; then
