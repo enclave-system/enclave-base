@@ -5,6 +5,7 @@ package selftest
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"enklave.local/base/internal/varauth"
 )
 
 // Runner runs external commands (nft, cryptsetup, systemctl).
@@ -63,6 +66,7 @@ func checkList() []check {
 		{"usr_readonly", checkUsrRO},
 		{"var_luks", func(root string, _ Runner) (string, error) { return dmUUIDPrefix(root, "/var", "CRYPT-LUKS2-") }},
 		{"var_tpm_bound", checkVarTPM},
+		{"var_authenticated", checkVarAuthenticated},
 		{"no_pkg_manager", checkNoPkg},
 		{"apparmor", func(root string, _ Runner) (string, error) {
 			return fileEquals(root, "sys/module/apparmor/parameters/enabled", "Y")
@@ -70,6 +74,7 @@ func checkList() []check {
 		{"nft_default_drop", checkNft},
 		{"no_getty", checkNoGetty},
 		{"ipv6_absent", checkIPv6Absent},
+		{"no_credentials", checkNoCredentials},
 		{"role", checkRole},
 		{"version", checkVersion},
 	}
@@ -247,6 +252,40 @@ func checkVarTPM(root string, r Runner) (string, error) {
 	return dev, nil
 }
 
+// checkVarAuthenticated verifies the /var authentication record: the NV index
+// exists, is written and write-locked with the expected attributes, and holds
+// the PCR 15 value that enklave-varauth verified before /var was mounted.
+// (The live PCR 15 is extended later in boot, e.g. by systemd-pcrmachine, so
+// it is compared via the record written by enklave-varauth.)
+func checkVarAuthenticated(root string, r Runner) (string, error) {
+	exists, err := varauth.IndexExists(r)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", fmt.Errorf("NV index %s missing", varauth.Index)
+	}
+	pub, err := varauth.ReadPublic(r)
+	if err != nil {
+		return "", err
+	}
+	if err := varauth.CheckPublic(pub, nil); err != nil {
+		return "", err
+	}
+	nv, err := varauth.ReadNV(r)
+	if err != nil {
+		return "", err
+	}
+	rec, err := readTrim(root, "run/enklave/var-authenticated")
+	if err != nil {
+		return "", err
+	}
+	if rec != hex.EncodeToString(nv) {
+		return "", fmt.Errorf("NV index %s holds %x, verified PCR 15 was %s", varauth.Index, nv, rec)
+	}
+	return fmt.Sprintf("NV index %s locked, PCR 15 %s", varauth.Index, rec), nil
+}
+
 // mustNotExist succeeds only if the path definitively does not exist; any
 // other stat error (e.g. ENOTDIR, EACCES) is a failure.
 func mustNotExist(root, rel string) error {
@@ -325,6 +364,41 @@ func checkIPv6Absent(root string, _ Runner) (string, error) {
 		return "", err
 	}
 	return "", nil
+}
+
+const noCredentialsArg = "systemd.import_credentials=no"
+
+// checkNoCredentials verifies that systemd does not import credentials from
+// unauthenticated sources (ESP via systemd-stub, SMBIOS, fw_cfg): the signed
+// kernel command line must disable the import, and no system credential may
+// be present.
+func checkNoCredentials(root string, _ Runner) (string, error) {
+	cl, err := os.ReadFile(filepath.Join(root, "proc/cmdline"))
+	if err != nil {
+		return "", err
+	}
+	found := false
+	for _, f := range strings.Fields(string(cl)) {
+		if f == noCredentialsArg {
+			found = true
+		}
+	}
+	if !found {
+		return "", fmt.Errorf("%s missing from kernel command line", noCredentialsArg)
+	}
+	ents, err := os.ReadDir(filepath.Join(root, "run/credentials/@system"))
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return "", err
+	case len(ents) > 0:
+		names := make([]string, 0, len(ents))
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		return "", fmt.Errorf("system credentials present: %s", strings.Join(names, ","))
+	}
+	return "import disabled, no system credentials", nil
 }
 
 func checkRole(root string, _ Runner) (string, error) {
