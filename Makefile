@@ -20,6 +20,14 @@ REF_KERNEL_FLAVOR := server
 # Security epoch of this release line: raise it to revoke every older UKI
 # (README "Revoking a vulnerable release").
 SECURITY_EPOCH ?= $(shell tr -d '[:space:]' < SECURITY_EPOCH)
+# State volumes provisioned under an epoch < HEAL_BELOW are rekeyed and wiped
+# on the first boot of this release (README "Healing after a compromise").
+HEAL_BELOW ?= $(shell tr -d '[:space:]' < HEAL_BELOW)
+# Output directories (overridable for variant builds, e.g. other epochs).
+REF_OUT      ?= ref
+REF_TEST_OUT ?= ref-test
+# Development only: allow signing prod images with a DEV-KEYS PKI.
+ENKLAVE_DEV_PROD ?= 0
 
 export ENKLAVE_PKI_DIR
 # PCR signing public key, plus a self-signed X.509 wrapper of the same key:
@@ -59,6 +67,7 @@ stage: go check-pki
 	install -D -m 0755 $(OUT)/bin/enklave-selftest $(STAGE)/usr/lib/enklave/enklave-selftest
 	install -D -m 0755 $(OUT)/bin/enklave-varauth $(STAGE)/usr/lib/enklave/enklave-varauth
 	install -D -m 0644 $(ENKLAVE_PKI_DIR)/config/config-signing.pub $(STAGE)/usr/share/enklave/keys/config-signing.pub
+	printf '{"epoch":%d,"heal_below":%d}\n' $(SECURITY_EPOCH) $(HEAL_BELOW) > $(STAGE)/usr/lib/enklave/release.json
 
 pcr-cert: check-pki
 	mkdir -p $(dir $(ENKLAVE_PCR_CERT))
@@ -93,16 +102,18 @@ define mkosi_build
 	PATH="$$PATH:/usr/sbin:/sbin" $(OUT)/bin/enklave-sign-policy \
 	    --uki $(OUT)/$(2)/enklave-$(1)_$(3).efi \
 	    --key $(ENKLAVE_PKI_DIR)/pcr/pcr-signing.key --pub $(ENKLAVE_PKI_DIR)/pcr/pcr-signing.pub \
-	    --epoch $(SECURITY_EPOCH) \
+	    --epoch $(SECURITY_EPOCH) --role $(1) --profile $(6) --pki $(ENKLAVE_PKI_DIR) \
+	    $(if $(filter 1,$(ENKLAVE_DEV_PROD)),--allow-dev-key-for-prod) \
 	    --out $(OUT)/$(2)/enklave-$(1)_$(3).policy.json \
 	    --image $(OUT)/$(2)/enklave-$(1)_$(3).raw
 endef
 
+# $(6) above: profile (prod|test), bound into the TPM policyRef.
 ref: kernel-$(REF_KERNEL_FLAVOR) stage pcr-cert
-	$(call mkosi_build,ref,ref,$(REF_VERSION),$(REF_KERNEL_FLAVOR),)
+	$(call mkosi_build,ref,$(REF_OUT),$(REF_VERSION),$(REF_KERNEL_FLAVOR),,prod)
 
 ref-test: kernel-$(REF_KERNEL_FLAVOR) stage pcr-cert
-	$(call mkosi_build,ref,ref-test,$(REF_VERSION),$(REF_KERNEL_FLAVOR),--profile=test)
+	$(call mkosi_build,ref,$(REF_TEST_OUT),$(REF_VERSION),$(REF_KERNEL_FLAVOR),--profile=test,test)
 
 test-unit:
 	cd go && go vet ./... && go test ./... -race -count=1

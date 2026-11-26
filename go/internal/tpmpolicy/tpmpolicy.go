@@ -2,18 +2,21 @@
 // "approved policy" file shared by the build-time signer
 // (cmd/enklave-sign-policy) and the runtime (internal/varauth).
 //
-// An enklave UKI of security epoch N comes with one signed approved policy:
+// An enklave UKI of role R, profile P (prod|test) and security epoch N comes
+// with one signed approved policy:
 //
 //	approved = PolicyNV(E, operandB = bit N, offset 0, TPM_EO_BITCLEAR)
 //	           applied on top of PolicyPCR(sha256:11 = the UKI's value in the
 //	           phase enter-initrd:leave-initrd)
 //
 // signed (RSASSA-PKCS1-v1_5, SHA-256) with the PCR signing key over
-// approved || Ref. The NV indices that guard /var use
-// PolicyAuthorize(PCR signing key, Ref), so only such a signature satisfies
-// them. E is a TPM_NT_BITS index; setting bit k revokes every UKI of epoch k
-// irreversibly. systemd's own .pcrsig signatures use an empty policyRef and
-// therefore never satisfy these policies.
+// approved || Ref(R, P). The NV indices and TPM hierarchies that guard /var
+// use PolicyAuthorize(PCR signing key, Ref(R, P)), so only a signature for
+// the same role and profile satisfies them: a test-profile UKI can never open
+// a production /var, a client UKI never a gateway /var. E is a TPM_NT_BITS
+// index; setting bit k revokes every UKI of epoch k irreversibly. systemd's
+// own .pcrsig signatures use an empty policyRef and never satisfy these
+// policies.
 package tpmpolicy
 
 import (
@@ -22,17 +25,34 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 )
 
 const (
-	// Ref is the policyRef (qualifying data) of all enklave /var policies.
-	Ref = "enklave-var-v1"
+	// RefPrefix is the versioned prefix of every enklave policyRef.
+	RefPrefix = "enklave-var-v1"
 	// MaxEpoch is the highest epoch representable in the 64-bit E index.
 	MaxEpoch = 63
 
 	ccPolicyNV = 0x00000149 // TPM_CC_PolicyNV
 	eoBitClear = 0x000B     // TPM_EO_BITCLEAR
 )
+
+var (
+	roleRe   = regexp.MustCompile(`^(ref|client|gateway|terminal|console|sluice|backup|fileserver)$`)
+	profiles = map[string]bool{"prod": true, "test": true}
+)
+
+// Ref returns the policyRef for a role and profile.
+func Ref(role, profile string) (string, error) {
+	if !roleRe.MatchString(role) {
+		return "", fmt.Errorf("invalid role %q", role)
+	}
+	if !profiles[profile] {
+		return "", fmt.Errorf("invalid profile %q (prod|test)", profile)
+	}
+	return RefPrefix + ":" + role + ":" + profile, nil
+}
 
 // EpochOperand is operandB for PolicyNV: an 8-byte big-endian mask with only
 // bit epoch set.
@@ -90,9 +110,13 @@ func Approved(pcr11Policy []byte, epoch int, epochName []byte) ([]byte, error) {
 }
 
 // File is the signed approved policy shipped next to the UKI on the ESP
-// (/EFI/enklave/policy/<uki>.json).
+// (/EFI/enklave/policy/<uki>.json). Only approved||ref is covered by the
+// TPM-verified signature; role, profile and epoch are bound because the
+// runtime recomputes approved and ref from its own, verity-protected values.
 type File struct {
 	Version     int    `json:"version"`
+	Role        string `json:"role"`
+	Profile     string `json:"profile"`
 	Epoch       int    `json:"epoch"`
 	PCR11Policy string `json:"pcr11_policy"` // hex
 	Approved    string `json:"approved"`     // hex
@@ -100,10 +124,15 @@ type File struct {
 	Signature   string `json:"signature"` // base64 RSASSA-PKCS1-v1_5/SHA-256 over approved||ref
 }
 
-// Decode returns the binary PCR 11 policy and approved digest of f.
-func (f File) Decode() (pcr11, approved []byte, err error) {
-	if f.Version != 1 || f.Ref != Ref {
-		return nil, nil, fmt.Errorf("unsupported policy file (version %d, ref %q)", f.Version, f.Ref)
+// Decode checks f against the expected role/profile and returns the binary
+// PCR 11 policy and approved digest.
+func (f File) Decode(role, profile string) (pcr11, approved []byte, err error) {
+	ref, err := Ref(role, profile)
+	if err != nil {
+		return nil, nil, err
+	}
+	if f.Version != 2 || f.Ref != ref || f.Role != role || f.Profile != profile {
+		return nil, nil, fmt.Errorf("policy file is for %s/%s (ref %q, version %d), want %s", f.Role, f.Profile, f.Ref, f.Version, ref)
 	}
 	if pcr11, err = hex.DecodeString(f.PCR11Policy); err != nil || len(pcr11) != sha256.Size {
 		return nil, nil, fmt.Errorf("bad pcr11_policy %q", f.PCR11Policy)
@@ -115,6 +144,24 @@ func (f File) Decode() (pcr11, approved []byte, err error) {
 }
 
 // SignedMessage is the byte string covered by the signature.
-func SignedMessage(approved []byte) []byte {
-	return append(append([]byte{}, approved...), Ref...)
+func SignedMessage(approved []byte, ref string) []byte {
+	return append(append([]byte{}, approved...), ref...)
+}
+
+// Release is the verity-protected release metadata in
+// /usr/lib/enklave/release.json.
+type Release struct {
+	Epoch     int `json:"epoch"`
+	HealBelow int `json:"heal_below"` // /var provisioned under an epoch < HealBelow is rekeyed
+}
+
+// Validate checks the release values.
+func (r Release) Validate() error {
+	if r.Epoch < 0 || r.Epoch > MaxEpoch {
+		return fmt.Errorf("release epoch %d out of range", r.Epoch)
+	}
+	if r.HealBelow < 0 || r.HealBelow > r.Epoch {
+		return fmt.Errorf("heal_below %d must be within 0..epoch (%d)", r.HealBelow, r.Epoch)
+	}
+	return nil
 }

@@ -165,3 +165,10 @@ def test_init_leaves_no_temp_files(tmp_path):
     assert list(tdir.iterdir()) == []
     ps = run("ps", "-eo", "args").stdout
     assert not [l for l in ps.splitlines() if "gpg-agent" in l and str(tdir) in l]
+
+
+def test_init_dev_marker(tmp_path):
+    run(TOOL, "init", "--dev", tmp_path / "dev")
+    assert (tmp_path / "dev" / "DEV-KEYS").is_file()
+    run(TOOL, "init", tmp_path / "prod")
+    assert not (tmp_path / "prod" / "DEV-KEYS").exists()

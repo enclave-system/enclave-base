@@ -154,7 +154,7 @@ func digest(out []byte) ([]byte, error) {
 
 // epochName defines E exactly as the target does (on a throw-away swtpm),
 // initializes it and returns its TPM Name.
-func epochName(pub, tmp string) ([]byte, error) {
+func epochName(pub, ref, tmp string) ([]byte, error) {
 	state := filepath.Join(tmp, "swtpm")
 	if err := os.MkdirAll(state, 0o700); err != nil {
 		return nil, err
@@ -182,7 +182,7 @@ func epochName(pub, tmp string) ([]byte, error) {
 	time.Sleep(500 * time.Millisecond)
 	env := []string{fmt.Sprintf("TPM2TOOLS_TCTI=swtpm:host=127.0.0.1,port=%d", port)}
 	w := func(n string) string { return filepath.Join(tmp, n) }
-	if err := os.WriteFile(w("ref.bin"), []byte(tpmpolicy.Ref), 0o600); err != nil {
+	if err := os.WriteFile(w("ref.bin"), []byte(ref), 0o600); err != nil {
 		return nil, err
 	}
 	steps := [][]string{
@@ -307,10 +307,29 @@ func main() {
 	epoch := flag.Int("epoch", -1, "security epoch of this release")
 	out := flag.String("out", "", "output JSON")
 	image := flag.String("image", "", "disk image whose ESP receives the JSON (optional)")
+	role := flag.String("role", "", "image role (ref, client, ...)")
+	profile := flag.String("profile", "", "prod or test")
+	pkiDir := flag.String("pki", "", "PKI directory (checked for the DEV-KEYS marker)")
+	allowDevProd := flag.Bool("allow-dev-key-for-prod", false, "development only: sign a prod image with dev keys")
 	flag.Parse()
-	if *uki == "" || *keyPath == "" || *pub == "" || *epoch < 0 || *out == "" {
+	if *uki == "" || *keyPath == "" || *pub == "" || *epoch < 0 || *out == "" || *pkiDir == "" {
 		flag.Usage()
 		os.Exit(2)
+	}
+	ref, err := tpmpolicy.Ref(*role, *profile)
+	if err != nil {
+		die("%v", err)
+	}
+	// OOS-1: test images only with dev keys, prod images never with dev keys.
+	_, devErr := os.Stat(filepath.Join(*pkiDir, "DEV-KEYS"))
+	dev := devErr == nil
+	switch {
+	case *profile == "test" && !dev:
+		die("refusing to sign a test-profile image with non-dev keys (%s has no DEV-KEYS marker)", *pkiDir)
+	case *profile == "prod" && dev && !*allowDevProd:
+		die("refusing to sign a prod image with dev keys (%s/DEV-KEYS); use --allow-dev-key-for-prod for development builds only", *pkiDir)
+	case *profile == "prod" && dev:
+		fmt.Fprintln(os.Stderr, "enklave-sign-policy: WARNING: prod image signed with DEV keys (development build, never ship)")
 	}
 	tmp, err := os.MkdirTemp("", "enklave-sign-policy")
 	if err != nil {
@@ -353,7 +372,7 @@ func main() {
 		die(".pcrsig policy %x is not the %s phase (%x)", pol, phase, want)
 	}
 
-	name, err := epochName(*pub, tmp)
+	name, err := epochName(*pub, ref, tmp)
 	if err != nil {
 		die("epoch index name: %v", err)
 	}
@@ -365,18 +384,18 @@ func main() {
 	if err != nil {
 		die("%v", err)
 	}
-	h := sha256.Sum256(tpmpolicy.SignedMessage(approved))
+	h := sha256.Sum256(tpmpolicy.SignedMessage(approved, ref))
 	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, h[:])
 	if err != nil {
 		die("%v", err)
 	}
-	doc := tpmpolicy.File{Version: 1, Epoch: *epoch, PCR11Policy: hex.EncodeToString(pol),
-		Approved: hex.EncodeToString(approved), Ref: tpmpolicy.Ref, Signature: base64.StdEncoding.EncodeToString(signature)}
+	doc := tpmpolicy.File{Version: 2, Role: *role, Profile: *profile, Epoch: *epoch, PCR11Policy: hex.EncodeToString(pol),
+		Approved: hex.EncodeToString(approved), Ref: ref, Signature: base64.StdEncoding.EncodeToString(signature)}
 	b, _ := json.MarshalIndent(doc, "", "  ")
 	if err := os.WriteFile(*out, append(b, '\n'), 0o644); err != nil {
 		die("%v", err)
 	}
-	fmt.Printf("enklave-sign-policy: %s: phase %s proven, epoch %d, approved %x\n", filepath.Base(*uki), phase, *epoch, approved)
+	fmt.Printf("enklave-sign-policy: %s: phase %s proven, ref %s, epoch %d, approved %x\n", filepath.Base(*uki), phase, ref, *epoch, approved)
 	if *image != "" {
 		n := strings.TrimSuffix(filepath.Base(*uki), ".efi") + ".json"
 		if err := embed(*image, *out, n); err != nil {

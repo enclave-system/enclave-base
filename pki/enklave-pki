@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # enklave-pki: offline key generation for the enklave ecosystem.
 #
-#   enklave-pki init <dir>                 generate the complete PKI into a NEW directory
+#   enklave-pki init [--dev] <dir>         generate the complete PKI into a NEW directory
+#                                          (--dev: mark it DEV-KEYS; only test images
+#                                          may be signed with it)
 #   enklave-pki ovmf-vars <dir> <out.fd>   build an OVMF VARS file (PK/KEK/db enrolled,
 #                                          Secure Boot user mode, no Microsoft keys)
 #
@@ -20,7 +22,7 @@ cleanup() {
     fi
 }
 die() { echo "enklave-pki: $*" >&2; exit 1; }
-usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 # selfsigned <keyfile> <crtfile> <CN> <genpkey args...> -- <extra -addext args...>
 selfsigned() {
@@ -46,11 +48,16 @@ efi_auth() {
 }
 
 cmd_init() {
+    local dev=0
+    if [ "${1:-}" = "--dev" ]; then dev=1; shift; fi
     [ "$#" -eq 1 ] || usage
     local dir="$1"
     [ ! -e "$dir" ] || die "$dir already exists; refusing to overwrite"
     mkdir -p "$(dirname "$dir")"
     mkdir -m 700 "$dir"
+    if [ "$dev" = 1 ]; then
+        echo 'enklave development PKI: only test-profile images may be signed with it' > "$dir/DEV-KEYS"
+    fi
     cd "$dir"
     local d
     for d in sb verity modsign config ca update pcr; do mkdir -m 700 "$d"; done

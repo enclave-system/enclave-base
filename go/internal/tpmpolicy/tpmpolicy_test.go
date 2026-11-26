@@ -56,29 +56,59 @@ func TestEpochOperandAndMask(t *testing.T) {
 	}
 }
 
-func TestFileDecode(t *testing.T) {
-	f := File{Version: 1, Epoch: 0, PCR11Policy: vecPCR11Policy, Approved: vecApproved, Ref: Ref, Signature: "x"}
-	if _, _, err := f.Decode(); err != nil {
-		t.Fatal(err)
-	}
-	for _, bad := range []File{
-		{Version: 2, Ref: Ref, PCR11Policy: vecPCR11Policy, Approved: vecApproved},
-		{Version: 1, Ref: "", PCR11Policy: vecPCR11Policy, Approved: vecApproved},
-		{Version: 1, Ref: Ref, PCR11Policy: "zz", Approved: vecApproved},
-		{Version: 1, Ref: Ref, PCR11Policy: vecPCR11Policy, Approved: "00"},
-	} {
-		if _, _, err := bad.Decode(); err == nil {
-			t.Errorf("accepted %+v", bad)
-		}
-	}
-	if m := SignedMessage([]byte{1, 2}); !bytes.Equal(m, append([]byte{1, 2}, Ref...)) {
-		t.Errorf("signed message %x", m)
-	}
-}
-
 // swtpm vector (PolicyNV on a written bits index 0x01800E05).
 const (
 	vecPCR11Policy = "fd32fa22c52cfc8e1a0c29eb38519f87084cab0b04b0d8f020a4d38b2f4e223e"
 	vecEpochName   = "000b5f08a0dbf9b0227bf779fc40887bc6fa5691cfa6f1c86f047a49b027ec689969"
 	vecApproved    = "bc21ecdbe442dc1c68c05af8dafc80c3c37a18e3a9dde917e564e9e9629479c7"
 )
+
+func TestRefAndFileDecode(t *testing.T) {
+	ref, err := Ref("ref", "prod")
+	if err != nil || ref != "enklave-var-v1:ref:prod" {
+		t.Fatalf("%q %v", ref, err)
+	}
+	for _, bad := range [][2]string{{"evil", "prod"}, {"ref", "dev"}, {"ref:x", "prod"}, {"", ""}} {
+		if _, err := Ref(bad[0], bad[1]); err == nil {
+			t.Errorf("accepted %v", bad)
+		}
+	}
+	good := File{Version: 2, Role: "ref", Profile: "prod", PCR11Policy: vecPCR11Policy, Approved: vecApproved, Ref: ref}
+	if _, _, err := good.Decode("ref", "prod"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := good.Decode("ref", "test"); err == nil {
+		t.Error("prod policy accepted by a test profile")
+	}
+	if _, _, err := good.Decode("client", "prod"); err == nil {
+		t.Error("ref policy accepted by another role")
+	}
+	mut := func(f func(*File)) File { c := good; f(&c); return c }
+	for _, bad := range []File{
+		mut(func(f *File) { f.Version = 1 }),
+		mut(func(f *File) { f.Ref = "enklave-var-v1:ref:test" }),
+		mut(func(f *File) { f.Profile = "test" }),
+		mut(func(f *File) { f.PCR11Policy = "zz" }),
+		mut(func(f *File) { f.Approved = "00" }),
+	} {
+		if _, _, err := bad.Decode("ref", "prod"); err == nil {
+			t.Errorf("accepted %+v", bad)
+		}
+	}
+	if m := SignedMessage([]byte{1, 2}, ref); !bytes.Equal(m, append([]byte{1, 2}, ref...)) {
+		t.Errorf("signed message %x", m)
+	}
+}
+
+func TestRelease(t *testing.T) {
+	for _, r := range []Release{{0, 0}, {3, 3}, {3, 1}} {
+		if err := r.Validate(); err != nil {
+			t.Errorf("%+v: %v", r, err)
+		}
+	}
+	for _, r := range []Release{{-1, 0}, {64, 0}, {2, 3}, {2, -1}} {
+		if err := r.Validate(); err == nil {
+			t.Errorf("%+v accepted", r)
+		}
+	}
+}
