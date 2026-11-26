@@ -5,5 +5,7 @@ mkosi.builddir/
 *.raw
 *.key
 *.pem
+!*.crt.pem
+pki-out/
 __pycache__/
 .pytest_cache/
