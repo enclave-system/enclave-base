@@ -1,0 +1,25 @@
+# Unlock /var with the TPM2 token only (headless: never ask for a passphrase).
+# Fails if PCR 7 or the signed PCR 11 policy do not match; then var.mount and
+# local-fs.target fail and the system does not come up.
+[Unit]
+Description=Unlock TPM2-bound /var
+DefaultDependencies=no
+IgnoreOnIsolate=true
+Requires=enklave-var-repart.service
+After=enklave-var-repart.service cryptsetup-pre.target systemd-udevd-kernel.socket
+Wants=tpm2.target
+After=tpm2.target
+BindsTo=dev-disk-by\x2dpartlabel-enklave\x2dvar.device
+After=dev-disk-by\x2dpartlabel-enklave\x2dvar.device
+Before=cryptsetup.target blockdev@dev-mapper-var.target umount.target
+Wants=blockdev@dev-mapper-var.target
+Conflicts=umount.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+KeyringMode=shared
+OOMScoreAdjust=500
+TimeoutSec=300
+ExecStart=/usr/lib/systemd/systemd-cryptsetup attach var /dev/disk/by-partlabel/enklave-var - tpm2-device=auto,headless=true
+ExecStop=/usr/lib/systemd/systemd-cryptsetup detach var

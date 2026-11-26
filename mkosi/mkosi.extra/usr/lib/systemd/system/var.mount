@@ -1,0 +1,16 @@
+[Unit]
+Description=Encrypted persistent /var
+DefaultDependencies=no
+Requires=enklave-var-unlock.service
+After=enklave-var-unlock.service local-fs-pre.target
+Before=local-fs.target umount.target
+Conflicts=umount.target
+
+[Mount]
+What=/dev/mapper/var
+Where=/var
+Type=ext4
+Options=nosuid,nodev,noexec
+
+[Install]
+RequiredBy=local-fs.target

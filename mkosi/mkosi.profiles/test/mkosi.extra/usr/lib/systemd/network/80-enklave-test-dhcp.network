@@ -1,0 +1,7 @@
+# Test profile only: DHCP on every Ethernet link (QEMU user networking).
+[Match]
+Type=ether
+
+[Network]
+DHCP=ipv4
+LinkLocalAddressing=no

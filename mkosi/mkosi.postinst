@@ -1,0 +1,20 @@
+#!/bin/bash
+# Runs after packages and extra trees are installed ($BUILDROOT = image root).
+set -euo pipefail
+root="${BUILDROOT:?}"
+
+# No interactive login: lock root, mask every getty and the debug shell.
+mkosi-chroot passwd -l root
+systemctl --root="$root" mask \
+    getty@.service serial-getty@.service console-getty.service autovt@.service \
+    container-getty@.service getty.target debug-shell.service systemd-firstboot.service
+
+# Firewall and AppArmor.
+systemctl --root="$root" enable apparmor.service nftables.service
+
+# /etc is volatile (factory copy); the ruleset itself lives in /usr.
+ln -sfn ../usr/lib/enklave/nftables.conf "$root/etc/nftables.conf"
+mkdir -p "$root/usr/lib/enklave/nft.d"
+
+# Secure Boot guard: enklave-selftest dispatches on argv[0].
+ln -sfn enklave-selftest "$root/usr/lib/enklave/require-secureboot"

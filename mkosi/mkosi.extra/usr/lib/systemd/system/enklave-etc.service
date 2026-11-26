@@ -1,0 +1,21 @@
+# / is a tmpfs, so /etc starts empty at every boot. Populate it from the
+# image's /etc snapshot (mkosi.finalize copies it to /usr/share/factory/etc)
+# before anything reads it. Unit enablement and masks do not depend on this:
+# mkosi.finalize moves them into /usr/lib/systemd/system.
+[Unit]
+Description=Populate volatile /etc from /usr/share/factory/etc
+DefaultDependencies=no
+ConditionPathIsDirectory=/usr/share/factory/etc
+After=systemd-remount-fs.service
+Before=sysinit.target shutdown.target
+Before=systemd-sysusers.service systemd-tmpfiles-setup.service systemd-sysctl.service
+Before=systemd-modules-load.service systemd-binfmt.service apparmor.service
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/cp -a --update=none /usr/share/factory/etc/. /etc/
+
+[Install]
+WantedBy=sysinit.target

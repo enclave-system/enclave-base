@@ -1,0 +1,93 @@
+#!/bin/bash
+# Last step before the disk image is assembled ($BUILDROOT = image root):
+#  1. remove the package manager, interpreters and compilers
+#  2. move unit enablement/masks from /etc/systemd/system into /usr (the root
+#     file system is a tmpfs, so /etc starts empty and is populated only after
+#     PID 1 has loaded its units)
+#  3. snapshot /etc into /usr/share/factory/etc (enklave-etc.service)
+#  4. sanity checks; any failure aborts the build
+set -euo pipefail
+shopt -s nullglob
+root="${BUILDROOT:?}"
+die() { echo "mkosi.finalize: $*" >&2; exit 1; }
+
+# 1. package manager, interpreters, compilers
+rm -f "$root"/usr/bin/{apt,apt-get,apt-cache,apt-mark,apt-config,apt-cdrom,apt-key} \
+      "$root"/usr/bin/{apt-extracttemplates,apt-ftparchive,apt-sortpkgs} \
+      "$root"/usr/bin/dpkg "$root"/usr/bin/dpkg-* "$root"/usr/sbin/dpkg-*
+rm -rf "$root"/usr/lib/apt "$root"/usr/lib/dpkg "$root"/var/lib/dpkg "$root"/var/lib/apt \
+       "$root"/var/cache/apt "$root"/etc/apt "$root"/etc/dpkg
+rm -f "$root"/usr/bin/perl* "$root"/usr/bin/python3*
+rm -f "$root"/usr/bin/gcc* "$root"/usr/bin/g++* "$root"/usr/bin/cc "$root"/usr/bin/c++ \
+      "$root"/usr/bin/x86_64-linux-gnu-gcc* "$root"/usr/bin/x86_64-linux-gnu-g++*
+
+[ -e "$root/usr/bin/sh" ] || die "/usr/bin/sh is missing (needed by Debian scripts)"
+for p in usr/bin/apt usr/bin/apt-get usr/bin/dpkg var/lib/dpkg usr/bin/perl usr/bin/python3 usr/bin/gcc usr/bin/cc; do
+    [ ! -e "$root/$p" ] && [ ! -L "$root/$p" ] || die "/$p still present"
+done
+
+# 2. /etc/systemd/system -> /usr/lib/systemd/system
+src="$root/etc/systemd/system"
+dst="$root/usr/lib/systemd/system"
+if [ -d "$src" ]; then
+    for e in "$src"/*; do
+        n="${e##*/}"
+        if [ -L "$e" ]; then
+            t="$(readlink "$e")"
+            rm -rf "${dst:?}/$n"
+            if [ "$t" = /dev/null ]; then
+                ln -s /dev/null "$dst/$n"            # mask
+            else
+                ln -s "${t##*/}" "$dst/$n"           # alias
+            fi
+        elif [ -d "$e" ]; then
+            case "$n" in
+                *.wants|*.requires|*.upholds)
+                    mkdir -p "$dst/$n"
+                    for l in "$e"/*; do
+                        [ -L "$l" ] || die "unexpected non-symlink $l"
+                        t="$(readlink "$l")"
+                        ln -sfn "../${t##*/}" "$dst/$n/${l##*/}"
+                    done ;;
+                *.d)
+                    mkdir -p "$dst/$n"
+                    cp -a "$e/." "$dst/$n/" ;;
+                *) die "unexpected directory $e" ;;
+            esac
+        else
+            cp -a "$e" "$dst/$n"                     # full unit override
+        fi
+    done
+    rm -rf "${src:?}"
+    mkdir -p "$src"
+fi
+
+# 3. /etc snapshot (machine-id is generated per boot by PID 1)
+fac="$root/usr/share/factory/etc"
+mkdir -p "$fac"
+cp -a "$root/etc/." "$fac/"
+rm -f "$fac/machine-id"
+
+# 4. sanity checks
+pw="$(awk -F: '$1 == "root" { print $2 }' "$fac/shadow")"
+case "$pw" in
+    '!'*|'*'*) ;;
+    *) die "root password is not locked" ;;
+esac
+for u in getty@.service serial-getty@.service console-getty.service autovt@.service \
+         container-getty@.service getty.target debug-shell.service; do
+    [ "$(readlink "$dst/$u")" = /dev/null ] || die "$u is not masked in /usr"
+done
+role="$(cat "$root/usr/lib/enklave/role" 2>/dev/null || true)"
+case "$role" in
+    ref|client|gateway|terminal|console|sluice|backup|fileserver) ;;
+    *) die "/usr/lib/enklave/role missing or invalid: '$role'" ;;
+esac
+[ "$(stat -c %s "$root/usr/share/enklave/keys/config-signing.pub")" = 32 ] \
+    || die "config-signing.pub missing or not 32 bytes"
+for b in enklave-cfg enklave-selftest; do
+    [ -x "$root/usr/lib/enklave/$b" ] || die "/usr/lib/enklave/$b missing"
+done
+[ "$(readlink "$root/usr/lib/enklave/require-secureboot")" = enklave-selftest ] \
+    || die "require-secureboot symlink missing"
+[ -d "$root/usr/lib/enklave/nft.d" ] || die "/usr/lib/enklave/nft.d missing"

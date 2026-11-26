@@ -12,11 +12,11 @@ export DEBIAN_FRONTEND=noninteractive
 $SUDO apt-get update
 $SUDO apt-get install -y --no-install-recommends \
     qemu-system-x86 ovmf swtpm swtpm-tools sbsigntool efitools openssl \
-    python3-pytest python3-virt-firmware systemd-repart systemd-ukify \
+    python3-pytest python3-virt-firmware systemd-repart systemd-ukify systemd-boot-tools \
     cryptsetup-bin golang git ca-certificates \
     bubblewrap debian-archive-keyring dosfstools mtools e2fsprogs \
     squashfs-tools erofs-utils systemd-container apt zstd xz-utils kmod \
-    cpio uidmap python3 gnupg efi-shell-x64 \
+    cpio uidmap python3 gnupg efi-shell-x64 tpm2-tools \
     build-essential flex bison bc libelf-dev libssl-dev dwarves rsync debhelper dpkg-dev
 
 if [ -d /opt/mkosi/.git ]; then

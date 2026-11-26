@@ -1,0 +1,5 @@
+# Test profile additions; sorts before 10-enklave.preset ("disable *").
+enable enklave-selftest.service
+enable enklave-test-marker.service
+enable systemd-networkd.service
+enable systemd-networkd.socket

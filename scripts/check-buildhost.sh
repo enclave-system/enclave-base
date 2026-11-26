@@ -33,9 +33,13 @@ fi
 
 for c in qemu-system-x86_64 swtpm sbsign sbverify cert-to-efi-sig-list \
          sign-efi-sig-list openssl pytest systemd-repart ukify veritysetup \
-         cryptsetup virt-fw-vars gpg mcopy mkfs.vfat git; do
+         cryptsetup virt-fw-vars gpg mcopy mkfs.vfat git tpm2_pcrread bootctl; do
     have "$c" || missing "$c"
 done
+
+# mkosi/ukify sign the PCR 11 policy with systemd-measure, which dlopens
+# libtss2 (pulled in by tpm2-tools).
+[ -x /usr/lib/systemd/systemd-measure ] || missing systemd-measure
 
 [ -e /usr/share/OVMF/OVMF_CODE_4M.secboot.fd ] || missing OVMF_CODE_4M.secboot.fd
 [ -e /dev/kvm ] || missing /dev/kvm
