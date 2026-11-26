@@ -27,76 +27,107 @@ directory is the operator's job:
 - Never copy secret keys to the build host or into the repo.
 - The dev PKI (`~/enklave-pki-dev` on the build host) is for development only.
 
-## Encrypted /var and the TPM
+- `enklave-pki init --dev <dir>` marks a development PKI (`DEV-KEYS`). Test-profile
+  images are signed only with a dev PKI, production images never (the build
+  refuses; `ENKLAVE_DEV_PROD=1` allows unshippable development builds).
 
-`/var` is the only persistent state.
+## Persistent state, /var and the TPM
 
-**Volume.** On first boot it is created on the disk that carries `/usr` as LUKS2:
-- `aes-xts-plain64`, 512-bit key
-- `hmac-sha256` integrity, so tampered sectors fail to read
-- argon2id keyslot
+The root file system is a tmpfs; `/var` is volatile. The **only persistent
+storage** is the state volume mounted at `/var/lib/enklave` (1 GiB partition
+`enklave-var` on the disk that carries `/usr`):
 
-**Key.** The 64-byte key lives only in TPM NV index `0x01800E02`. That index can be read only with policy P:
+- LUKS2 `aes-xts-plain64` (512-bit), `hmac-sha256` integrity, argon2id keyslot.
+- The 64-byte volume key lives only in TPM NV index `0x01800E02`, read once per
+  boot and then read-locked.
+- State lives in `/var/lib/enklave/data` and is written only through
+  `enklave-varauth state-exec -- CMD ...` (CMD works on a staged copy,
+  `$ENKLAVE_STATE_DIR`; the result is committed atomically). Every commit
+  updates an HMAC manifest (path, type, mode, owner, hash of every entry; key
+  derived from the volume key) whose version is bound to the TPM NV counter
+  `0x01800E03`. Boot fails closed on any spliced, older or foreign content
+  (dm-integrity authenticates sectors but not their version). A crash during a
+  commit is rolled forward or back at the next boot.
+  Example: `enklave-varauth state-exec -- enklave-cfg apply --root '{}/config' ...`.
 
-    P = PolicyAuthorize(PCR signing key, "enklave-var-v1") + PolicyPCR(7 = current, 12 = 0)
+### TPM policy and ownership
 
-The authorized part must be a policy signed at build time by `enklave-sign-policy`. It binds:
-- PCR 11 to this UKI's value in the phase `enter-initrd:leave-initrd`;
-- the UKI's **security epoch** (`SECURITY_EPOCH`) to "not revoked" in the bits index `0x01800E04`.
+Every enklave TPM object and the owner, endorsement and lockout hierarchies are
+governed by
 
-The signed policy ships on the ESP as `/EFI/enklave/policy/<uki>.json`. Updates must ship it together with the UKI.
+    P = PolicyAuthorize(PCR key, "enklave-var-v1:<role>:<profile>") + PolicyPCR(7 = current, 12 = 0)
 
-**Every boot.**
-- The key is read once and then read-locked.
-- The volume key measurement (PCR 15) must equal the write-locked record `0x01800E01`.
-- The anti-rollback value in `/var/lib/enklave/rollback-counter` must equal the NV counter `0x01800E03`. Both are then advanced.
+The authorized part is the release's signed approved policy
+(`/EFI/enklave/policy/<uki>.json` on the ESP, made by `enklave-sign-policy`):
+PCR 11 of exactly that UKI in the phase `enter-initrd:leave-initrd`, and its
+**security epoch** not revoked in the bits index `0x01800E04`. Role and profile
+are part of the policyRef, so a test-profile UKI cannot open a production
+volume and one role cannot open another's.
 
-**After provisioning.** On the first boot only, once every index has been written and locked:
-- owner, endorsement and lockout get random, discarded authorization values;
-- `TPM2_Clear` is disabled.
+There is no administrative secret: on the first boot the hierarchies get
+policy P, random discarded authValues and `TPM2_Clear` is disabled, *before*
+any index that protects data exists. A platform hierarchy usable from the OS
+is disabled on every boot. All commands that carry secrets (volume key,
+authValues) use salted sessions with parameter encryption; the salt key
+(`0x81000E01`) is pinned by Name in record `0x01800E01`. Any partial or
+unexpected TPM state fails closed (power off).
 
-The indices can therefore not be deleted or re-created from the OS.
+Limit: an active TPM-bus attacker present already at provisioning could
+substitute the salt key; detecting that needs TPM endorsement-certificate
+validation against the TPM vendor CA (not included). Provision devices in a
+trusted environment.
 
-Every failure powers the machine off. There is no emergency or rescue shell.
+### Security epochs: revoking a vulnerable release
 
-### Revoking a vulnerable release
+Rules:
 
-A UKI with a security bug in the window before `sysinit` could otherwise keep satisfying the policies, because it is signed with the same PCR key. To revoke it:
+1. **Every security fix raises `SECURITY_EPOCH`.** Any older release of the
+   same epoch can read the state volume, so a fixed release with an unchanged
+   epoch revokes nothing.
+2. Revocation takes effect when the new release first boots on a device: it
+   sets the bits of all older epochs (set-only, irreversible). Until then — and
+   on devices whose TPM gets cleared physically — old UKIs still boot. Close
+   that gap with a UEFI dbx update: `scripts/revoke-release.sh <pki> dbx.auth
+   <old-uki.efi>...` produces a KEK-signed dbx append (delivery: Task 7 /
+   `efi-updatevar -a -f dbx.auth dbx`). A dbx change alters PCR 7, so ship it
+   in a release with `HEAL_BELOW` set (the state volume is re-provisioned).
+3. If a vulnerable epoch may have leaked the volume key or TPM authorization,
+   also set `HEAL_BELOW` (see below).
+4. Epoch budget: 64 epochs (0–63). When it is exhausted, re-provision the
+   fleet (factory reset clears the epoch index); plan epochs per security
+   release, not per build.
 
-1. Fix the bug and raise `SECURITY_EPOCH` (e.g. `0` → `1`).
-2. Build and sign the release. `make ref` signs its approved policy for the new epoch.
-3. Ship it. On its first boot `enklave-varauth` sets the bits of all older epochs in `0x01800E04` (TPM_NT_BITS, set-only).
-   - From then on, UKIs of an older epoch can no longer read the `/var` key, write any enklave index or advance the counter.
-   - UKIs from before this scheme (empty policyRef, e.g. builds ≤ 2fd8d34) never could.
-4. Optionally also remove the vulnerable UKI from the ESP / sysupdate source.
+Pre-scheme UKIs (empty policyRef, builds ≤ 2fd8d34) never satisfy P.
 
-Epochs 0–63 are available. Raising the epoch does not touch `/var` data.
+### Healing after a compromise
+
+`HEAL_BELOW=N` (baked into the verity-protected `release.json`) makes a
+release re-provision every state volume provisioned under an epoch < N on its
+first boot: hierarchy policies and authValues are rotated, the salt key is
+re-created, the volume key, record and counter are destroyed and recreated,
+and the state volume is wiped (clients re-enroll via the console). A key or
+authorization obtained under a revoked epoch is useless afterwards.
 
 ### Recovery: tainted PCR 12
 
-systemd-stub measures credentials (`*.cred`), addons and command line overrides found on the (unauthenticated) ESP into PCR 12.
-
-`/var` is bound to PCR 12 = 0. A stray or planted file such as `\loader\credentials\*.cred` or `\EFI\Linux\<uki>.efi.extra.d\*` therefore makes `/var` unreadable, and the machine powers off at every boot.
-
-To recover:
-1. Remove the ESP disk or boot another trusted system.
-2. Delete the extra files from the ESP.
-3. Boot again. Nothing else changes.
+systemd-stub measures credentials (`*.cred`), addons and command line
+overrides found on the (unauthenticated) ESP into PCR 12; the state volume is
+bound to PCR 12 = 0, so a stray or planted file such as
+`\loader\credentials\*.cred` or `\EFI\Linux\<uki>.efi.extra.d\*` makes the
+machine power off at every boot. Remove the files from the ESP (from another
+system) and boot again.
 
 ### Impact of key and firmware changes
 
-- **New PCR signing key.** The NV policies are pinned to the PCR signing key through PolicyAuthorize. A UKI signed with a different key cannot open an existing `/var`. A key change therefore means re-provisioning (factory reset). Use epochs, not new keys, to revoke releases.
-- **Secure Boot db/dbx/KEK/PK changes.** These change PCR 7, and P binds the current PCR 7. They also need a factory reset, unless they are applied before the first boot.
-- **Firmware updates** that change PCR 7 (rare; SB variables only) have the same effect.
+- **PCR signing key:** the hierarchies and indices are bound to it. A new key
+  requires a factory reset; revoke releases with epochs, not new keys.
+- **Secure Boot db/dbx/KEK/PK or firmware changes affecting PCR 7:** the
+  policies bind the current PCR 7, so they require re-provisioning: ship them
+  with a healing release, or apply them before the first boot.
 
 ### Factory reset
 
-Factory reset is a deliberate, physical-presence operation:
-1. Clear the TPM in the firmware setup. This also wipes the owner hierarchy and the enklave indices.
-2. Delete the `enklave-var` partition.
-
-The next boot provisions a fresh, empty `/var`. `systemd-repart` never honours factory-reset requests (`--factory-reset=no`, `FactoryReset=no`).
-
-An interrupted first boot fails closed and needs the same procedure:
-- interrupted before the indices were written: delete the partition, and undefine the indices with the still-empty owner auth;
-- interrupted after the indices were written but before the hierarchy lock-down: the next boot completes the lock-down.
+Clear the TPM in the firmware setup (physical presence; this wipes all owner
+objects and re-enables Clear) and delete the `enklave-var` partition; the next
+boot provisions a fresh state volume. An interrupted provisioning fails closed
+and needs the same procedure (or a release with `HEAL_BELOW` > 0).
