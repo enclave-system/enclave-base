@@ -1,16 +1,15 @@
-# Test profile only: after boot, try to unseal the /var key again with the
-# TPM2 token (as root, from the running system, through libcryptsetup's
-# systemd-tpm2 token plugin). The signed PCR 11 policy only covers
-# enter-initrd:leave-initrd, so this must be refused.
+# Test profile only: after boot, try to read the /var key from the TPM the way
+# root in the running system would (signed approved policy, authorized
+# session). Must be refused: PCR 11 has left the signed phase and the NV
+# secret is read-locked.
 [Unit]
-Description=Probe: /var key must not be unsealable after boot (test profile)
+Description=Probe: /var key must not be readable after boot (test profile)
 After=enklave-selftest.service
 Before=enklave-test-marker.service
-RequiresMountsFor=/var
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'dm=$(basename "$(readlink -f /dev/mapper/var)"); dev=/dev/$(ls /sys/block/$dm/slaves); if out=$(cryptsetup -v open --test-passphrase --token-only --token-type systemd-tpm2 "$dev" 2>&1); then echo "enklave-test-unseal-probe: $dev UNSEALED after boot (BAD)"; else echo "enklave-test-unseal-probe: $dev refused after boot (ok): $(echo "$out" | tr "\n" " ")"; fi > /dev/ttyS0'
+ExecStart=/bin/sh -c 'last=$(/usr/lib/enklave/enklave-varauth probe 2>/dev/null | tail -n 1); case "$last" in refused:*) r=ok ;; *) r=BAD ;; esac; echo "enklave-test-unseal-probe: $r: $last" > /dev/ttyS0'
 
 [Install]
 WantedBy=graphical.target

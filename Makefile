@@ -17,6 +17,9 @@ OUT         := $(CURDIR)/out
 STAGE       := $(OUT)/stage
 REF_VERSION ?= $(shell tr -d '[:space:]' < ref/VERSION)
 REF_KERNEL_FLAVOR := server
+# Security epoch of this release line: raise it to revoke every older UKI
+# (README "Revoking a vulnerable release").
+SECURITY_EPOCH ?= $(shell tr -d '[:space:]' < SECURITY_EPOCH)
 
 export ENKLAVE_PKI_DIR
 # PCR signing public key, plus a self-signed X.509 wrapper of the same key:
@@ -42,7 +45,7 @@ $(KERNEL_OUT)/linux-image-enklave-%_$(KVER)_amd64.deb:
 
 go:
 	mkdir -p $(OUT)/bin
-	cd go && CGO_ENABLED=0 go build -trimpath -o $(OUT)/bin/ ./cmd/enklave-cfg ./cmd/enklave-selftest ./cmd/enklave-varauth
+	cd go && CGO_ENABLED=0 go build -trimpath -o $(OUT)/bin/ ./cmd/enklave-cfg ./cmd/enklave-selftest ./cmd/enklave-varauth ./cmd/enklave-sign-policy
 
 check-pki:
 	@for f in $(PKI_FILES); do \
@@ -87,6 +90,12 @@ define mkosi_build
 	    --sign-expected-pcr-key=$(ENKLAVE_PKI_DIR)/pcr/pcr-signing.key \
 	    --sign-expected-pcr-certificate=$(ENKLAVE_PCR_CERT) \
 	    $(5) build
+	PATH="$$PATH:/usr/sbin:/sbin" $(OUT)/bin/enklave-sign-policy \
+	    --uki $(OUT)/$(2)/enklave-$(1)_$(3).efi \
+	    --key $(ENKLAVE_PKI_DIR)/pcr/pcr-signing.key --pub $(ENKLAVE_PKI_DIR)/pcr/pcr-signing.pub \
+	    --epoch $(SECURITY_EPOCH) \
+	    --out $(OUT)/$(2)/enklave-$(1)_$(3).policy.json \
+	    --image $(OUT)/$(2)/enklave-$(1)_$(3).raw
 endef
 
 ref: kernel-$(REF_KERNEL_FLAVOR) stage pcr-cert

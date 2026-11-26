@@ -1,18 +1,17 @@
-# Unlock /var with the TPM2 token only (headless: never ask for a passphrase).
-# The partition is looked up only on the disk that backs /dev/mapper/usr
-# (/usr/lib/enklave/var-unlock). The volume key is measured into PCR 15
-# (tpm2-measure-pcr=yes) before anything else extends PCR 15, which
-# enklave-var-auth.service then authenticates. Production: any failure powers
-# the machine off.
+# Open /var with the key from the TPM NV secret (enklave-varauth): readable
+# only by an unrevoked, signed enklave UKI in the phase enter-initrd:leave-initrd
+# with Secure Boot (PCR 7) and a clean PCR 12; read-locked afterwards. The
+# volume key is measured into PCR 15. First boot: format and provision.
+# Production: any failure powers the machine off.
 [Unit]
-Description=Unlock TPM2-bound /var
+Description=Unlock /var
 DefaultDependencies=no
 IgnoreOnIsolate=true
 Requires=enklave-var-repart.service
 After=enklave-var-repart.service cryptsetup-pre.target systemd-udevd-kernel.socket systemd-udev-trigger.service
 Wants=tpm2.target
 After=tpm2.target
-Before=cryptsetup.target blockdev@dev-mapper-var.target umount.target systemd-pcrmachine.service
+Before=cryptsetup.target blockdev@dev-mapper-var.target umount.target systemd-pcrmachine.service systemd-pcrphase-sysinit.service
 Wants=blockdev@dev-mapper-var.target
 Conflicts=umount.target
 FailureAction=poweroff-force
@@ -22,6 +21,8 @@ Type=oneshot
 RemainAfterExit=yes
 KeyringMode=shared
 OOMScoreAdjust=500
-TimeoutSec=300
+# first boot formats with integrity (device wipe)
+TimeoutSec=infinity
+StandardError=journal+console
 ExecStart=/usr/lib/enklave/var-unlock
 ExecStop=/usr/lib/systemd/systemd-cryptsetup detach var

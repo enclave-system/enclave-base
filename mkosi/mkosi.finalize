@@ -107,12 +107,35 @@ for l in "$dst"/*.wants/getty* "$dst"/*.wants/systemd-logind.service \
          "$dst"/*.wants/systemd-user-sessions.service; do
     die "login-related wants link left in /usr: ${l#"$root"}"
 done
+# unit_value FILE SECTION KEY: last value of KEY in [SECTION] (systemd semantics:
+# the last assignment wins, an empty assignment resets).
+unit_value() {
+    awk -v sec="[$2]" -v key="$3" '
+        /^[[:space:]]*\[/ { in_sec = ($0 == sec); next }
+        in_sec && index($0, key "=") == 1 { v = substr($0, length(key) + 2) }
+        END { print v }' "$1"
+}
+# The production value must be in [Unit] of the unit itself or of a drop-in
+# (drop-ins are applied after the unit file, in lexical order).
 for u in enklave-var-repart.service enklave-var-unlock.service enklave-var-auth.service var.mount \
-         enklave-require-secureboot.service; do
-    grep -qx 'FailureAction=poweroff-force' "$dst/$u" || die "$u lacks FailureAction=poweroff-force"
+         enklave-require-secureboot.service systemd-pcrphase-sysinit.service; do
+    v=""
+    for f in "$dst/$u" "$dst/$u.d"/*.conf; do
+        [ -f "$f" ] || continue
+        all="$(grep -c '^FailureAction=' "$f" || true)"
+        in_unit="$(awk '/^[[:space:]]*\[/ { s = $0; next } s == "[Unit]" && /^FailureAction=/ { c++ } END { print c + 0 }' "$f")"
+        [ "$all" = "$in_unit" ] || die "${f#"$root"}: FailureAction= outside [Unit] (ignored by systemd)"
+        [ "$in_unit" = 0 ] || v="$(unit_value "$f" Unit FailureAction)"
+    done
+    want=poweroff-force
+    [ ! -e "$root/usr/lib/enklave/test-profile" ] || want=none   # test profile: log only
+    [ "$v" = "$want" ] || die "$u: effective [Unit] FailureAction is '$v', want $want"
 done
-grep -q 'tpm2-measure-pcr=yes' "$root/usr/lib/enklave/var-unlock" || die "var-unlock does not measure the volume key"
 grep -q -- '--factory-reset=no' "$dst/enklave-var-repart.service" || die "repart may honour factory reset"
+r="$root/usr/lib/enklave/repart.d/30-var.conf"
+[ "$(unit_value "$r" Partition FactoryReset)" = no ] || die "30-var.conf: FactoryReset must be no"
+[ -z "$(unit_value "$r" Partition Encrypt)" ] || die "30-var.conf: Encrypt= must not be used (varauth formats /var)"
+[ ! -e "$root/usr/lib/enklave/enklave-sign-policy" ] || die "build-time signer must not be shipped"
 [ -z "$(ls -A "$root/boot" | grep -E '^(vmlinuz|System\.map|config|initrd)')" ] || die "kernel files left in /boot (ESP)"
 for d in boot efi; do
     cmp -s "$root/$d/loader/loader.conf" <(printf '%s\n' "${loader_conf[@]}") \
