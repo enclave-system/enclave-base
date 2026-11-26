@@ -1,0 +1,9 @@
+.superpowers/
+out/
+mkosi.cache/
+mkosi.builddir/
+*.raw
+*.key
+*.pem
+__pycache__/
+.pytest_cache/

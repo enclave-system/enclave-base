@@ -1,0 +1,3 @@
+MKOSI_TAG=v27.1
+GO_MIN=1.23
+DEBIAN=trixie
