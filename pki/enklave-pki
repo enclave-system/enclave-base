@@ -12,6 +12,13 @@ umask 077
 DAYS=3650
 OVMF_VARS_TEMPLATE="${OVMF_VARS_TEMPLATE:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
 
+tmp=""
+cleanup() {
+    if [ -n "$tmp" ] && [ -d "$tmp" ]; then
+        gpgconf --homedir "$tmp/gnupg" --kill all 2>/dev/null || true
+        rm -rf "$tmp"
+    fi
+}
 die() { echo "enklave-pki: $*" >&2; exit 1; }
 usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
@@ -45,10 +52,10 @@ cmd_init() {
     mkdir -p "$(dirname "$dir")"
     mkdir -m 700 "$dir"
     cd "$dir"
-    local d tmp
+    local d
     for d in sb verity modsign config ca update pcr; do mkdir -m 700 "$d"; done
     tmp="$(mktemp -d)"
-    trap 'if [ -n "${tmp:-}" ]; then GNUPGHOME="$tmp/gnupg" gpgconf --kill all 2>/dev/null || true; rm -rf "$tmp"; fi' EXIT
+    trap cleanup EXIT
 
     # Secure Boot: GUID once, then PK / KEK / db
     if [ -r /proc/sys/kernel/random/uuid ]; then
@@ -94,7 +101,7 @@ cmd_init() {
     mkdir -m 700 "$tmp/gnupg"
     export GNUPGHOME="$tmp/gnupg"
     gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
-        --quick-generate-key "enklave update signing <update@enklave.invalid>" ed25519 sign never 2>/dev/null
+        --quick-generate-key "enklave update signing <update@enklave.invalid>" ed25519 sign never
     gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
         --export-secret-keys > update/update.gpg
     gpg --batch --quiet --export > update/update.pub.gpg

@@ -156,3 +156,12 @@ def test_ovmf_vars_secureboot_user_mode(tmp_path):
 
     assert "ENKLAVE-SHELL-RAN" in results["signed"], results["signed"][-2000:]
     assert "ENKLAVE-SHELL-RAN" not in results["unsigned"], results["unsigned"][-2000:]
+
+
+def test_init_leaves_no_temp_files(tmp_path):
+    tdir = tmp_path / "tmp"
+    tdir.mkdir()
+    run(TOOL, "init", tmp_path / "k", env={**os.environ, "TMPDIR": str(tdir)})
+    assert list(tdir.iterdir()) == []
+    ps = run("ps", "-eo", "args").stdout
+    assert not [l for l in ps.splitlines() if "gpg-agent" in l and str(tdir) in l]
