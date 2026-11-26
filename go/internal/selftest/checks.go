@@ -269,6 +269,11 @@ func checkNoPkg(root string, _ Runner) (string, error) {
 	return "", nil
 }
 
+// nftFamily is the family of the base "enklave" table. The enklave kernels are
+// built without IPv6, and "inet" tables need CONFIG_NF_TABLES_INET (depends on
+// IPV6), so the ruleset uses an "ip" table.
+const nftFamily = "ip"
+
 func checkNft(_ string, r Runner) (string, error) {
 	out, err := r.Run("nft", "-j", "list", "ruleset")
 	if err != nil {
@@ -289,13 +294,13 @@ func checkNft(_ string, r Runner) (string, error) {
 	}
 	pol := map[string]string{}
 	for _, e := range doc.Nftables {
-		if c := e.Chain; c != nil && c.Family == "inet" && c.Table == "enklave" {
+		if c := e.Chain; c != nil && c.Family == nftFamily && c.Table == "enklave" {
 			pol[c.Name] = c.Policy
 		}
 	}
 	for _, n := range []string{"input", "forward", "output"} {
 		if pol[n] != "drop" {
-			return "", fmt.Errorf("inet enklave chain %s policy %q, want drop", n, pol[n])
+			return "", fmt.Errorf("%s enklave chain %s policy %q, want drop", nftFamily, n, pol[n])
 		}
 	}
 	return "input/forward/output drop", nil

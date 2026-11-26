@@ -43,10 +43,12 @@ const (
 	smPath = "sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 )
 
-const goodNft = `{"nftables":[{"metainfo":{}},{"table":{"family":"inet","name":"enklave"}},
-{"chain":{"family":"inet","table":"enklave","name":"input","policy":"drop"}},
-{"chain":{"family":"inet","table":"enklave","name":"forward","policy":"drop"}},
-{"chain":{"family":"inet","table":"enklave","name":"output","policy":"drop"}}]}`
+// The enklave kernels are built without IPv6, so the base ruleset is an
+// "ip" table (an "inet" table needs CONFIG_NF_TABLES_INET, which needs IPV6).
+const goodNft = `{"nftables":[{"metainfo":{}},{"table":{"family":"ip","name":"enklave"}},
+{"chain":{"family":"ip","table":"enklave","name":"input","policy":"drop"}},
+{"chain":{"family":"ip","table":"enklave","name":"forward","policy":"drop"}},
+{"chain":{"family":"ip","table":"enklave","name":"output","policy":"drop"}}]}`
 
 const unitsCmd = "systemctl list-units --all --plain --no-legend --state=active"
 
@@ -207,6 +209,20 @@ func TestNftChainMissingAndWrongTable(t *testing.T) {
 	r.out["nft -j list ruleset"] = "not json"
 	if find(t, RunChecks(root, r), "nft_default_drop").OK {
 		t.Error("bad json accepted")
+	}
+}
+
+func TestNftRequiresIPFamily(t *testing.T) {
+	root, r := goodRoot(t)
+	r.out["nft -j list ruleset"] = strings.ReplaceAll(goodNft, `"family":"ip"`, `"family":"inet"`)
+	if x := find(t, RunChecks(root, r), "nft_default_drop"); x.OK {
+		t.Errorf("inet enklave table accepted: %+v", x)
+	}
+	// An unrelated inet chain next to the ip table does not change the result.
+	r.out["nft -j list ruleset"] = strings.Replace(goodNft, `]}`,
+		`,{"chain":{"family":"inet","table":"enklave","name":"input","policy":"accept"}}]}`, 1)
+	if x := find(t, RunChecks(root, r), "nft_default_drop"); !x.OK {
+		t.Errorf("ip table with extra inet chain rejected: %+v", x)
 	}
 }
 

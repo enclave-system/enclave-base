@@ -19,6 +19,12 @@ $SUDO apt-get install -y --no-install-recommends \
     cpio uidmap python3 gnupg efi-shell-x64 tpm2-tools \
     build-essential flex bison bc libelf-dev libssl-dev dwarves rsync debhelper dpkg-dev
 
+# VM tests run QEMU with KVM as the build user (takes effect on next login).
+build_user="${SUDO_USER:-$(id -un)}"
+if [ "$build_user" != root ]; then
+    $SUDO usermod -aG kvm "$build_user"
+fi
+
 if [ -d /opt/mkosi/.git ]; then
     $SUDO git -C /opt/mkosi fetch --tags --quiet
 else

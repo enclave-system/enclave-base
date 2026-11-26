@@ -43,6 +43,8 @@ done
 
 [ -e /usr/share/OVMF/OVMF_CODE_4M.secboot.fd ] || missing OVMF_CODE_4M.secboot.fd
 [ -e /dev/kvm ] || missing /dev/kvm
+# group database, not the current session (usermod applies on next login)
+id -nG "$(id -un)" | tr ' ' '\n' | grep -qx kvm || missing "group:kvm for $(id -un)"
 [ -e /usr/share/efi-shell-x64/shellx64.efi ] || missing efi-shell-x64
 
 # kernel bindeb-pkg build dependencies
