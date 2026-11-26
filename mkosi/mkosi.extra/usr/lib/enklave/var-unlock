@@ -1,0 +1,50 @@
+#!/bin/sh
+# Unlock /var (TPM2 token only, never a passphrase) from the "enklave-var"
+# partition on the disk that carries the verity-protected /usr. Partitions
+# with that label on any other disk are ignored. Fails (closed) unless exactly
+# one matching partition exists on that disk.
+set -eu
+VAR_TYPE=4d21b016-b534-45c2-a9fb-5c16e091fd2d   # GPT type "var" (x86-64 independent)
+LABEL=enklave-var
+die() { echo "enklave-var-unlock: $*" >&2; exit 1; }
+
+# 1. disk behind /dev/mapper/usr (all verity slaves must be on that one disk)
+usr_dm=""
+for d in /sys/class/block/dm-*; do
+    [ "$(cat "$d/dm/name" 2>/dev/null)" = usr ] && { usr_dm="$d"; break; }
+done
+[ -n "$usr_dm" ] || die "no device-mapper device 'usr'"
+disk=""
+for s in "$usr_dm"/slaves/*; do
+    [ -e "$s" ] || die "/dev/mapper/usr has no backing devices"
+    part="$(readlink -f "$s")"
+    [ -e "$part/partition" ] || die "${part##*/} is not a partition"
+    d="$(basename "$(dirname "$part")")"
+    [ -z "$disk" ] || [ "$disk" = "$d" ] || die "/usr spans several disks ($disk, $d)"
+    disk="$d"
+done
+
+# 2. the enklave-var partition on exactly that disk (repart may have just
+#    created it, so give udev time to process it)
+dev=""
+for _ in $(seq 60); do
+    udevadm settle --timeout=5 || true
+    dev=""; n=0
+    for p in /sys/class/block/"$disk"/*/partition; do
+        [ -e "$p" ] || continue
+        name="$(basename "$(dirname "$p")")"
+        props="$(udevadm info --query=property --name="/dev/$name" 2>/dev/null || true)"
+        plabel="$(printf '%s\n' "$props" | sed -n 's/^ID_PART_ENTRY_NAME=//p')"
+        ptype="$(printf '%s\n' "$props" | sed -n 's/^ID_PART_ENTRY_TYPE=//p' | tr 'A-F' 'a-f')"
+        if [ "$plabel" = "$LABEL" ] && [ "$ptype" = "$VAR_TYPE" ]; then
+            dev="/dev/$name"; n=$((n + 1))
+        fi
+    done
+    [ "$n" -le 1 ] || die "$n partitions labelled $LABEL on /dev/$disk"
+    [ -z "$dev" ] || break
+    sleep 1
+done
+[ -n "$dev" ] || die "no $LABEL partition on /dev/$disk"
+
+echo "enklave-var-unlock: using $dev on /dev/$disk"
+exec /usr/lib/systemd/systemd-cryptsetup attach var "$dev" - tpm2-device=auto,headless=true,tpm2-measure-pcr=yes

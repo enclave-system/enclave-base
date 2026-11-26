@@ -6,14 +6,14 @@ Before=sysinit.target shutdown.target
 Conflicts=shutdown.target
 # The test profile replaces this condition and the command (log only).
 ConditionPathExists=!/usr/lib/enklave/test-profile
+# require-secureboot powers off itself if SecureBoot != 1 (and retries
+# forever); FailureAction is the second line of defense.
+FailureAction=poweroff-force
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# require-secureboot powers off itself if SecureBoot != 1 (and retries
-# forever); FailureAction is the second line of defense.
 ExecStart=/usr/lib/enklave/require-secureboot
-FailureAction=poweroff-force
 
 [Install]
 WantedBy=sysinit.target

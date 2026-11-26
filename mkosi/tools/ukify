@@ -1,0 +1,23 @@
+#!/usr/bin/python3
+# enklave wrapper around the real ukify (found first via ExtraSearchPaths= in
+# mkosi.conf). mkosi 27.1 cannot pass --phases= to ukify, so this adds it:
+# the signed PCR 11 policy is restricted to the phase in which /var is
+# unlocked and authenticated (enter-initrd:leave-initrd, i.e. after the initrd
+# and before sysinit). After that phase no signature exists, so neither root
+# nor anything else in the running system can unseal the /var key or satisfy
+# the /var NV index write policy again. mkosi.postoutput verifies the result.
+import runpy
+import sys
+
+REAL = "/usr/bin/ukify"
+PHASES = "--phases=enter-initrd:leave-initrd"
+
+args = sys.argv[1:]
+if (
+    args[:1] == ["build"]
+    and any(a.startswith("--pcr-private-key") for a in args)
+    and not any(a.startswith("--phases") for a in args)
+):
+    args.append(PHASES)
+sys.argv = [REAL] + args
+runpy.run_path(REAL, run_name="__main__")

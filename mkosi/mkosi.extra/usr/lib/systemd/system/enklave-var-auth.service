@@ -1,0 +1,18 @@
+# Authenticate the unlocked /var before it is mounted: PCR 15 (volume key
+# measurement) must match the write-locked TPM NV index 0x01800E01, which is
+# provisioned only on the boot that created /var. An attacker-made LUKS volume
+# that this TPM can unseal is therefore never mounted.
+[Unit]
+Description=Authenticate /var against the TPM NV record
+DefaultDependencies=no
+Requires=enklave-var-unlock.service
+After=enklave-var-unlock.service enklave-var-repart.service tpm2.target
+Before=var.mount local-fs.target systemd-pcrmachine.service shutdown.target
+Conflicts=shutdown.target
+FailureAction=poweroff-force
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardError=journal+console
+ExecStart=/usr/lib/enklave/enklave-varauth verify

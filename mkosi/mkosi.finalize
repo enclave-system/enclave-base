@@ -62,6 +62,30 @@ if [ -d "$src" ]; then
     mkdir -p "$src"
 fi
 
+# 2b. no login stack: drop the static wants links shipped by systemd
+#     (getty@tty1, getty.target, systemd-logind, systemd-user-sessions).
+#     Nothing in the image needs logind (no sessions, no seats).
+rm -f "$dst"/*.wants/getty* "$dst"/*.wants/systemd-logind.service \
+      "$dst"/*.wants/systemd-user-sessions.service
+
+# 2c. ESP: only systemd-boot and the signed UKIs. The kernel package's
+#     unsigned vmlinuz, System.map and config are not needed (the UKI carries
+#     the kernel); loader.conf hardens systemd-boot.
+rm -f "$root"/boot/vmlinuz* "$root"/boot/System.map* "$root"/boot/config* "$root"/boot/initrd*
+loader_conf=(
+    "timeout 0"
+    "editor no"
+    "auto-entries no"
+    "auto-firmware no"
+    "secure-boot-enroll off"
+)
+# Both /boot and /efi are copied into the ESP (00-esp.conf); bootctl puts
+# its default loader.conf under /efi, so write ours to both.
+for d in boot efi; do
+    mkdir -p "$root/$d/loader"
+    printf '%s\n' "${loader_conf[@]}" > "$root/$d/loader/loader.conf"
+done
+
 # 3. /etc snapshot (machine-id is generated per boot by PID 1)
 fac="$root/usr/share/factory/etc"
 mkdir -p "$fac"
@@ -75,9 +99,26 @@ case "$pw" in
     *) die "root password is not locked" ;;
 esac
 for u in getty@.service serial-getty@.service console-getty.service autovt@.service \
-         container-getty@.service getty.target debug-shell.service; do
+         container-getty@.service getty.target debug-shell.service systemd-firstboot.service \
+         emergency.service rescue.service emergency.target rescue.target; do
     [ "$(readlink "$dst/$u")" = /dev/null ] || die "$u is not masked in /usr"
 done
+for l in "$dst"/*.wants/getty* "$dst"/*.wants/systemd-logind.service \
+         "$dst"/*.wants/systemd-user-sessions.service; do
+    die "login-related wants link left in /usr: ${l#"$root"}"
+done
+for u in enklave-var-repart.service enklave-var-unlock.service enklave-var-auth.service var.mount \
+         enklave-require-secureboot.service; do
+    grep -qx 'FailureAction=poweroff-force' "$dst/$u" || die "$u lacks FailureAction=poweroff-force"
+done
+grep -q 'tpm2-measure-pcr=yes' "$root/usr/lib/enklave/var-unlock" || die "var-unlock does not measure the volume key"
+grep -q -- '--factory-reset=no' "$dst/enklave-var-repart.service" || die "repart may honour factory reset"
+[ -z "$(ls -A "$root/boot" | grep -E '^(vmlinuz|System\.map|config|initrd)')" ] || die "kernel files left in /boot (ESP)"
+for d in boot efi; do
+    cmp -s "$root/$d/loader/loader.conf" <(printf '%s\n' "${loader_conf[@]}") \
+        || die "/$d/loader/loader.conf not enforced"
+done
+[ -z "$(ls -A "$root/efi" | grep -E '^(vmlinuz|System\.map|config|initrd)')" ] || die "kernel files left in /efi (ESP)"
 role="$(cat "$root/usr/lib/enklave/role" 2>/dev/null || true)"
 case "$role" in
     ref|client|gateway|terminal|console|sluice|backup|fileserver) ;;
@@ -85,7 +126,7 @@ case "$role" in
 esac
 [ "$(stat -c %s "$root/usr/share/enklave/keys/config-signing.pub")" = 32 ] \
     || die "config-signing.pub missing or not 32 bytes"
-for b in enklave-cfg enklave-selftest; do
+for b in enklave-cfg enklave-selftest enklave-varauth var-unlock; do
     [ -x "$root/usr/lib/enklave/$b" ] || die "/usr/lib/enklave/$b missing"
 done
 [ "$(readlink "$root/usr/lib/enklave/require-secureboot")" = enklave-selftest ] \

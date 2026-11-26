@@ -1,0 +1,22 @@
+#!/bin/bash
+# Build-time assertions on the finished UKI ($OUTPUTDIR): fixed command line
+# incl. systemd.import_credentials=no, and exactly one signed PCR 11 policy
+# (phase enter-initrd:leave-initrd, see tools/ukify).
+set -euo pipefail
+die() { echo "mkosi.postoutput: $*" >&2; exit 1; }
+shopt -s nullglob
+ukis=("${OUTPUTDIR:?}"/*.efi)
+[ "${#ukis[@]}" -eq 1 ] || die "expected one UKI in $OUTPUTDIR, found ${#ukis[@]}"
+uki="${ukis[0]}"
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+objcopy -O binary --only-section=.cmdline "$uki" "$tmp/cmdline"
+objcopy -O binary --only-section=.pcrsig "$uki" "$tmp/pcrsig"
+cmdline="$(tr -d '\0' < "$tmp/cmdline")"
+fixed="lockdown=confidentiality module.sig_enforce=1 apparmor=1 security=apparmor init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1 slab_nomerge pti=on vsyscall=none debugfs=off oops=panic iommu=force intel_iommu=on amd_iommu=force_isolation ipv6.disable=1"
+case " $cmdline " in *" $fixed "*) ;; *) die "fixed kernel command line missing: $cmdline" ;; esac
+for t in systemd.import_credentials=no root=tmpfs; do
+    case " $cmdline " in *" $t "*) ;; *) die "$t missing from command line: $cmdline" ;; esac
+done
+n="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); e=d.get("sha256", []); print(len(e) if all(x.get("pcrs")==[11] for x in e) else -1)' "$tmp/pcrsig")"
+[ "$n" = 1 ] || die ".pcrsig must hold exactly one PCR 11 policy (one phase), found $n"
+echo "mkosi.postoutput: $(basename "$uki"): command line and single-phase PCR signature OK"

@@ -3,11 +3,14 @@
 set -euo pipefail
 root="${BUILDROOT:?}"
 
-# No interactive login: lock root, mask every getty and the debug shell.
+# No interactive login: lock root, mask every getty, the debug shell and the
+# emergency/rescue shells (a failed boot powers off instead, see the
+# FailureAction= of the /var units).
 mkosi-chroot passwd -l root
 systemctl --root="$root" mask \
     getty@.service serial-getty@.service console-getty.service autovt@.service \
-    container-getty@.service getty.target debug-shell.service systemd-firstboot.service
+    container-getty@.service getty.target debug-shell.service systemd-firstboot.service \
+    emergency.service rescue.service emergency.target rescue.target
 
 # Firewall and AppArmor.
 systemctl --root="$root" enable apparmor.service nftables.service

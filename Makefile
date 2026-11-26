@@ -42,7 +42,7 @@ $(KERNEL_OUT)/linux-image-enklave-%_$(KVER)_amd64.deb:
 
 go:
 	mkdir -p $(OUT)/bin
-	cd go && CGO_ENABLED=0 go build -trimpath -o $(OUT)/bin/ ./cmd/enklave-cfg ./cmd/enklave-selftest
+	cd go && CGO_ENABLED=0 go build -trimpath -o $(OUT)/bin/ ./cmd/enklave-cfg ./cmd/enklave-selftest ./cmd/enklave-varauth
 
 check-pki:
 	@for f in $(PKI_FILES); do \
@@ -54,6 +54,7 @@ stage: go check-pki
 	rm -rf $(STAGE)
 	install -D -m 0755 $(OUT)/bin/enklave-cfg $(STAGE)/usr/lib/enklave/enklave-cfg
 	install -D -m 0755 $(OUT)/bin/enklave-selftest $(STAGE)/usr/lib/enklave/enklave-selftest
+	install -D -m 0755 $(OUT)/bin/enklave-varauth $(STAGE)/usr/lib/enklave/enklave-varauth
 	install -D -m 0644 $(ENKLAVE_PKI_DIR)/config/config-signing.pub $(STAGE)/usr/share/enklave/keys/config-signing.pub
 
 pcr-cert: check-pki

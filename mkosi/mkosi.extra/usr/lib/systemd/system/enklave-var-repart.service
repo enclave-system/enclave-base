@@ -1,6 +1,14 @@
-# First boot: create the /var partition on the disk that carries /usr
-# (LUKS2, bound to TPM2 PCR 7 and to the PCR 11 policy signed with the
-# key embedded in the UKI). Later boots: no-op.
+# First boot: create the /var partition on the disk that carries /usr.
+# LUKS2, bound to TPM2
+#  - PCR 7: Secure Boot policy/state
+#  - PCR 12: systemd-stub measurements of credentials, addons and command line
+#    overrides; not extended on a clean boot, so any planted ESP credential
+#    or addon makes /var unlockable no more
+#  - the PCR 11 policy signed with the key embedded in the UKI, restricted to
+#    the phase enter-initrd:leave-initrd (survives signed updates)
+# enklave-varauth records whether the partition was created in this boot
+# (/run/enklave/var-created); only then may the /var authentication record be
+# provisioned. Later boots: no-op. Factory reset is never honoured here.
 [Unit]
 Description=Create TPM2-bound encrypted /var partition
 DefaultDependencies=no
@@ -12,10 +20,12 @@ Wants=tpm2.target
 After=tpm2.target systemd-tpm2-setup-early.service systemd-udevd-kernel.socket
 Before=enklave-var-unlock.service shutdown.target
 Conflicts=shutdown.target
+FailureAction=poweroff-force
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/systemd-repart --dry-run=no --definitions=/usr/lib/enklave/repart.d \
-          --tpm2-device=auto --tpm2-pcrs=7 \
+ExecStart=/usr/lib/enklave/enklave-varauth repart --dry-run=no --factory-reset=no \
+          --definitions=/usr/lib/enklave/repart.d \
+          --tpm2-device=auto --tpm2-pcrs=7+12 \
           --tpm2-public-key=/run/systemd/tpm2-pcr-public-key.pem --tpm2-public-key-pcrs=11
