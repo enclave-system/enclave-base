@@ -4,7 +4,8 @@
 # before this one (e.g. 05-enklave-test.preset).
 enable enklave-etc.service
 enable enklave-require-secureboot.service
-enable var.mount
+enable var-lib-enklave.mount
+enable enklave-pcr11-sealed.service
 enable nftables.service
 enable apparmor.service
 disable *

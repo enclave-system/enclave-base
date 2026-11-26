@@ -1,13 +1,15 @@
-# Creates /var/lib/enklave/marker AFTER the selftest ran, so the first boot
-# reports marker=false and every later boot (same TPM) marker=true.
+# Test profile: records this boot in the authenticated state store AFTER the
+# selftest ran (marker: boot 1 false, later boots true; bootlog changes on
+# every boot for the splice/rollback proofs). ESP:/EFI/enklave/test-pause-state
+# may name a commit phase at which state-exec pauses (crash proofs).
 [Unit]
-Description=Create /var/lib/enklave/marker (test profile)
+Description=Record this boot in the enklave state (test profile)
 After=enklave-selftest.service
 RequiresMountsFor=/var/lib/enklave
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'mkdir -p /var/lib/enklave && { [ -e /var/lib/enklave/marker ] || : > /var/lib/enklave/marker; } && sync && echo "enklave-test-marker: present" > /dev/ttyS0'
+ExecStart=/usr/lib/enklave/test-record-boot
 
 [Install]
 # Not multi-user.target: a target is ordered after the units it wants, which

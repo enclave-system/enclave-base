@@ -21,8 +21,9 @@ Type=oneshot
 RemainAfterExit=yes
 KeyringMode=shared
 OOMScoreAdjust=500
-# first boot formats with integrity (device wipe)
-TimeoutSec=infinity
+# first boot formats a 1 GiB volume with integrity (device wipe, ~15 s); a
+# hang powers the machine off instead of waiting forever
+TimeoutSec=600
 StandardError=journal+console
 ExecStart=/usr/lib/enklave/var-unlock
 ExecStop=/usr/lib/systemd/systemd-cryptsetup detach var

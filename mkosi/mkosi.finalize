@@ -109,28 +109,59 @@ for l in "$dst"/*.wants/getty* "$dst"/*.wants/systemd-logind.service \
 done
 # unit_value FILE SECTION KEY: last value of KEY in [SECTION] (systemd semantics:
 # the last assignment wins, an empty assignment resets).
+# Keys and section headers may carry surrounding whitespace ("  Key = v").
 unit_value() {
     awk -v sec="[$2]" -v key="$3" '
-        /^[[:space:]]*\[/ { in_sec = ($0 == sec); next }
-        in_sec && index($0, key "=") == 1 { v = substr($0, length(key) + 2) }
+        { line = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", line) }
+        line ~ /^\[/ { in_sec = (line == sec); next }
+        in_sec {
+            k = line; sub(/[[:space:]]*=.*$/, "", k)
+            if (k == key && index(line, "=") > 0) { v = line; sub(/^[^=]*=[[:space:]]*/, "", v) }
+        }
         END { print v }' "$1"
 }
-# The production value must be in [Unit] of the unit itself or of a drop-in
-# (drop-ins are applied after the unit file, in lexical order).
-for u in enklave-var-repart.service enklave-var-unlock.service enklave-var-auth.service var.mount \
-         enklave-require-secureboot.service systemd-pcrphase-sysinit.service; do
+# key_count FILE KEY [SECTION]: occurrences of KEY (in SECTION, or anywhere).
+key_count() {
+    awk -v key="$2" -v sec="${3:+[$3]}" '
+        { line = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", line) }
+        line ~ /^\[/ { s = line; next }
+        { k = line; sub(/[[:space:]]*=.*$/, "", k) }
+        k == key && index(line, "=") > 0 && (sec == "" || s == sec) { c++ }
+        END { print c + 0 }' "$1"
+}
+# Drop-in directories systemd applies to a unit: type-level (service.d),
+# dash-prefix levels (enklave-.service.d, enklave-var-.service.d, ...) and
+# the unit's own. A FailureAction in a shared directory would be ambiguous.
+shared_dropin_dirs() {
+    local u="$1" type="${1##*.}" base="${1%.*}" pfx=""
+    echo "$dst/$type.d"
+    while [ "${base#*-}" != "$base" ]; do
+        pfx="$pfx${base%%-*}-"; base="${base#*-}"
+        echo "$dst/$pfx.$type.d"
+    done
+}
+for u in enklave-var-repart.service enklave-var-unlock.service enklave-var-auth.service var-lib-enklave.mount \
+         enklave-require-secureboot.service systemd-pcrphase-sysinit.service enklave-pcr11-sealed.service; do
+    [ -f "$dst/$u" ] || die "$u missing"
+    for d in $(shared_dropin_dirs "$u"); do
+        for f in "$d"/*.conf; do
+            [ -f "$f" ] || continue
+            [ "$(key_count "$f" FailureAction)" = 0 ] || die "${f#"$root"}: FailureAction in a shared drop-in directory"
+        done
+    done
     v=""
     for f in "$dst/$u" "$dst/$u.d"/*.conf; do
         [ -f "$f" ] || continue
-        all="$(grep -c '^FailureAction=' "$f" || true)"
-        in_unit="$(awk '/^[[:space:]]*\[/ { s = $0; next } s == "[Unit]" && /^FailureAction=/ { c++ } END { print c + 0 }' "$f")"
-        [ "$all" = "$in_unit" ] || die "${f#"$root"}: FailureAction= outside [Unit] (ignored by systemd)"
-        [ "$in_unit" = 0 ] || v="$(unit_value "$f" Unit FailureAction)"
+        [ "$(key_count "$f" FailureAction)" = "$(key_count "$f" FailureAction Unit)" ] \
+            || die "${f#"$root"}: FailureAction= outside [Unit] (ignored by systemd)"
+        [ "$(key_count "$f" FailureAction Unit)" = 0 ] || v="$(unit_value "$f" Unit FailureAction)"
     done
     want=poweroff-force
     [ ! -e "$root/usr/lib/enklave/test-profile" ] || want=none   # test profile: log only
     [ "$v" = "$want" ] || die "$u: effective [Unit] FailureAction is '$v', want $want"
 done
+grep -qx 'TimeoutSec=600' "$dst/enklave-var-unlock.service" || die "enklave-var-unlock needs a finite timeout"
+[ -s "$root/usr/lib/enklave/release.json" ] || die "release.json missing"
 grep -q -- '--factory-reset=no' "$dst/enklave-var-repart.service" || die "repart may honour factory reset"
 r="$root/usr/lib/enklave/repart.d/30-var.conf"
 [ "$(unit_value "$r" Partition FactoryReset)" = no ] || die "30-var.conf: FactoryReset must be no"

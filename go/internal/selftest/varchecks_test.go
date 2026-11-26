@@ -13,8 +13,7 @@ import (
 
 const (
 	luksDumpCmd   = "cryptsetup luksDump /dev/vda8"
-	recordReadCmd = "tpm2_nvread 0x01800E01 -C 0x01800E01 -s 32"
-	counterRead   = "tpm2_nvread 0x01800E03 -C 0x01800E03 -s 8"
+	recordReadCmd = "tpm2_nvread 0x01800E01 -C 0x01800E01 -s 74"
 	hierCmd       = "tpm2_getcap properties-variable"
 	luksUUID      = "6f2fbea9-8c8b-4fd0-afd1-ce8615ab7632"
 
@@ -29,8 +28,11 @@ const (
 var (
 	fakeP     = strings.Repeat("aa", 32)
 	fakePE    = strings.Repeat("bb", 32)
+	fakePC    = strings.Repeat("c0", 32)
 	fakePol11 = strings.Repeat("cc", 32) // current PCR 11 policy (after boot)
-	recordVal = strings.Repeat("\x15", 32)
+	saltName  = "\x00\x0b" + strings.Repeat("\x5a", 32)
+	recordVal = strings.Repeat("\x15", 32) + "\x00\x00\x00\x00\x00\x00\x00\x00" + saltName
+	counter42 = "\x00\x00\x00\x00\x00\x00\x00\x2a"
 )
 
 func nvPublic(handle string, attrs uint32, size int, policy string) string {
@@ -64,10 +66,10 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 	put(t, root, "sys/module/module/parameters/sig_enforce", "Y\n")
 	put(t, root, "proc/self/mountinfo",
 		"20 1 253:0 / /usr ro,relatime shared:1 - erofs /dev/mapper/usr ro\n"+
-			"21 1 253:1 / /var rw,relatime shared:2 - ext4 /dev/mapper/var rw\n")
+			"21 1 253:1 / /var/lib/enklave rw,nosuid,nodev,noexec,relatime shared:2 - ext4 /dev/mapper/var rw\n")
 	put(t, root, "sys/dev/block/253:0/dm/uuid", "CRYPT-VERITY-abc-usr\n")
 	put(t, root, "sys/dev/block/253:1/dm/uuid", "CRYPT-LUKS2-"+strings.ReplaceAll(luksUUID, "-", "")+"-var\n")
-	// /var (dm-crypt 253:1) -> dm-integrity dm-2 -> vda8, as with LUKS2 integrity
+	// state volume (dm-crypt 253:1) -> dm-integrity dm-2 -> vda8, as with LUKS2 integrity
 	for _, d := range []string{"sys/dev/block/253:1/slaves/dm-2", "sys/block/dm-2/slaves/vda8"} {
 		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
 			t.Fatal(err)
@@ -75,23 +77,25 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 	}
 	put(t, root, "sys/module/apparmor/parameters/enabled", "Y\n")
 	put(t, root, "usr/lib/enklave/role", " ref\n")
+	put(t, root, "usr/lib/enklave/release.json", `{"epoch":0,"heal_below":0}`)
 	put(t, root, "usr/lib/os-release", "NAME=Enklave\nIMAGE_VERSION=1.2.3\n")
 	put(t, root, "proc/cmdline", "usrhash=ab lockdown=confidentiality systemd.import_credentials=no root=tmpfs\n")
 	put(t, root, "run/enklave/var-authenticated", strings.Repeat("15", 32)+"\n")
 	put(t, root, "run/enklave/var-counter", "42\n")
-	put(t, root, "var/lib/enklave/rollback-counter", "42\n")
+	put(t, root, "run/enklave/platform", "firmware-auth\n")
+	put(t, root, "run/enklave/state.key", strings.Repeat("k", 64))
+	put(t, root, "var/lib/enklave/.manifest", `{"version":42,"entries":[],"mac":"00"}`)
 	put(t, root, "run/systemd/tpm2-pcr-signature.json", `{"sha256":[{"pcrs":[11],"pol":"`+strings.Repeat("dd", 32)+`"}]}`)
-	put(t, root, "run/enklave/policy.json", `{"version":1,"pcr11_policy":"`+strings.Repeat("ee", 32)+`"}`)
+	put(t, root, "run/enklave/policy.json", `{"version":2,"pcr11_policy":"`+strings.Repeat("ee", 32)+`"}`)
 	log, pcr15 := measureLog("cryptsetup:var:"+luksUUID, "machine-id:0123")
 	put(t, root, "run/log/systemd/tpm2-measure.log", log)
 	r := &fakeRunner{out: map[string]string{
 		luksDumpCmd:                    goodLuksDump,
-		"tpm2_nvreadpublic 0x01800E01": nvPublic("0x01800E01", 0x22042808, 32, fakeP),
+		"tpm2_nvreadpublic 0x01800E01": nvPublic("0x01800E01", 0x22042808, 74, fakeP),
 		"tpm2_nvreadpublic 0x01800E02": nvPublic("0x01800E02", 0xB2082808, 64, fakeP),
-		"tpm2_nvreadpublic 0x01800E03": nvPublic("0x01800E03", 0x22040018, 8, fakeP),
+		"tpm2_nvreadpublic 0x01800E03": nvPublic("0x01800E03", 0x22080018, 8, fakePC),
 		"tpm2_nvreadpublic 0x01800E04": nvPublic("0x01800E04", 0x22040028, 8, fakePE),
 		recordReadCmd:                  recordVal,
-		counterRead:                    "\x00\x00\x00\x00\x00\x00\x00\x2a",
 		hierCmd:                        lockedHier,
 		"tpm2_pcrread sha256:7":        "  sha256:\n    7 : 0x" + strings.Repeat("07", 32) + "\n",
 		"tpm2_pcrread sha256:15":       "  sha256:\n    15: 0x" + strings.ToUpper(hex.EncodeToString(pcr15)) + "\n",
@@ -100,14 +104,21 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 	}}
 	r.fn = func(name string, args []string) ([]byte, bool) {
 		switch name {
-		case "tpm2_loadexternal", "tpm2_startauthsession", "tpm2_flushcontext", "tpm2_policycommandcode":
+		case "tpm2_loadexternal", "tpm2_startauthsession", "tpm2_flushcontext":
 			return nil, true
+		case "tpm2_policycommandcode":
+			return []byte(strings.Repeat("dc", 32) + "\n"), true
 		case "tpm2_policyauthorize":
 			return []byte(strings.Repeat("11", 32) + "\n"), true
 		case "tpm2_policynvwritten":
 			return []byte(strings.Repeat("22", 32) + "\n"), true
+		case "tpm2_policyauthvalue":
+			return []byte(strings.Repeat("33", 32) + "\n"), true
 		case "tpm2_policyor":
-			return []byte(fakePE + "\n"), true
+			if strings.Contains(strings.Join(args, " "), "b1.bin") {
+				return []byte(fakePE + "\n"), true
+			}
+			return []byte(fakePC + "\n"), true
 		case "tpm2_policypcr":
 			for _, a := range args {
 				if a == "sha256:7,12" {
@@ -117,10 +128,34 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 					return []byte(fakePol11 + "\n"), true
 				}
 			}
+		case "tpm2_nvread": // counter via PolicyAuthValue session
+			if len(args) > 0 && args[0] == "0x01800E03" {
+				if c, ok := r.out["counter"]; ok {
+					return []byte(c), true
+				}
+				return []byte(counter42), true
+			}
+		case "tpm2_readpublic": // salt key Name
+			if p := argAfter(args, "-n"); p != "" {
+				n := saltName
+				if s, ok := r.out["salt"]; ok {
+					n = s
+				}
+				return nil, os.WriteFile(p, []byte(n), 0o600) == nil
+			}
 		}
 		return nil, false
 	}
 	return root, r
+}
+
+func argAfter(args []string, flag string) string {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
 }
 
 func TestVarChecksNotOk(t *testing.T) {
@@ -142,10 +177,10 @@ func TestVarChecksNotOk(t *testing.T) {
 			r.out["tpm2_nvreadpublic 0x01800E02"] = nvPublic("0x01800E02", 0xA2082808, 64, fakeP)
 		}},
 		{"var_authenticated", "record policy pinned", func(t *testing.T, root string, r *fakeRunner) {
-			r.out["tpm2_nvreadpublic 0x01800E01"] = nvPublic("0x01800E01", 0x22042808, 32, strings.Repeat("99", 32))
+			r.out["tpm2_nvreadpublic 0x01800E01"] = nvPublic("0x01800E01", 0x22042808, 74, strings.Repeat("99", 32))
 		}},
 		{"var_authenticated", "record not write-locked", func(t *testing.T, root string, r *fakeRunner) {
-			r.out["tpm2_nvreadpublic 0x01800E01"] = nvPublic("0x01800E01", 0x22042008, 32, fakeP)
+			r.out["tpm2_nvreadpublic 0x01800E01"] = nvPublic("0x01800E01", 0x22042008, 74, fakeP)
 		}},
 		{"var_authenticated", "epoch policy pinned", func(t *testing.T, root string, r *fakeRunner) {
 			r.out["tpm2_nvreadpublic 0x01800E04"] = nvPublic("0x01800E04", 0x22040028, 8, fakeP)
@@ -179,10 +214,16 @@ func TestVarChecksNotOk(t *testing.T) {
 			r.out[luksDumpCmd] = strings.Replace(goodLuksDump, "cipher: aes-xts-plain64", "cipher: aes-cbc-essiv:sha256", 1)
 		}},
 		{"var_rollback", "counter ahead", func(t *testing.T, root string, r *fakeRunner) {
-			r.out[counterRead] = "\x00\x00\x00\x00\x00\x00\x00\x2b"
+			r.out["counter"] = "\x00\x00\x00\x00\x00\x00\x00\x2b"
+		}},
+		{"var_authenticated", "salt key substituted", func(t *testing.T, root string, r *fakeRunner) {
+			r.out["salt"] = "\x00\x0b" + strings.Repeat("\x66", 32)
+		}},
+		{"tpm_locked", "platform enabled without firmware auth", func(t *testing.T, root string, r *fakeRunner) {
+			put(t, root, "run/enklave/platform", "disabled\n")
 		}},
 		{"var_rollback", "no file", func(t *testing.T, root string, r *fakeRunner) {
-			os.Remove(filepath.Join(root, "var/lib/enklave/rollback-counter"))
+			os.Remove(filepath.Join(root, "var/lib/enklave/.manifest"))
 		}},
 		{"tpm_locked", "owner auth empty", func(t *testing.T, root string, r *fakeRunner) {
 			r.out[hierCmd] = strings.Replace(lockedHier, "ownerAuthSet:              1", "ownerAuthSet:              0", 1)
@@ -214,7 +255,7 @@ func TestVarChecksDetails(t *testing.T) {
 	for check, want := range map[string]string{
 		"var_tpm_bound":     "/dev/vda8",
 		"var_authenticated": "cryptsetup:var:" + luksUUID,
-		"var_rollback":      "counter 42",
+		"var_rollback":      "state version 42",
 		"pcr11_sealed":      "matches none of 2 signed",
 	} {
 		if x := find(t, rs, check); !x.OK || !strings.Contains(x.Detail, want) {

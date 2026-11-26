@@ -1,30 +1,27 @@
-// Package varauth creates, unlocks and authenticates the encrypted /var.
+// Package varauth creates, unlocks, authenticates and heals the encrypted
+// persistent state volume (mounted at /var/lib/enklave).
 //
-// /var is LUKS2 (aes-xts-plain64, 512-bit, argon2id keyslot, hmac-sha256
-// integrity). Its 64-byte key S lives in a TPM NV index that can only be read
-// with policy P:
+// The volume is LUKS2 (aes-xts-plain64 512-bit, hmac-sha256 integrity,
+// argon2id) with a 64-byte random key S held in TPM NV index S. All enklave
+// NV indices and the owner, endorsement and lockout hierarchies are governed
+// by policy P:
 //
-//	P   = PolicyAuthorize(PCR signing key, tpmpolicy.Ref) || PolicyPCR(7 = current, 12 = clean/zero)
+//	P = PolicyAuthorize(PCR signing key, Ref(role, profile)) || PolicyPCR(7 = current, 12 = 0)
 //
-// PolicyAuthorize needs a signed approved policy (see package tpmpolicy) that
-// binds PCR 11 to the signed UKI's value in the phase enter-initrd:leave-initrd
-// and requires the UKI's security epoch to be unrevoked in the epoch index E.
-// Hence S is readable only by an unrevoked enklave UKI, under Secure Boot,
-// without ESP credentials/addons, before sysinit; it is read-locked right
-// after use. All NV indices (record A, secret S, counter C, epoch E) are
-// created only on the genuine first boot (systemd-repart created the
-// partition during this boot, see Repart); afterwards the owner, lockout and
-// endorsement hierarchies get random, discarded authorization values and
-// TPM2_Clear is disabled, so the indices cannot be deleted or re-created.
-//
-// Every boot also checks that PCR 15 (systemd-cryptsetup's volume key
-// measurement) equals the write-locked record A, and that the anti-rollback
-// file in /var equals the NV counter C (accepting C+1 after a crash between
-// the two updates), then advances both.
+// PolicyAuthorize needs the release's signed approved policy (package
+// tpmpolicy): PCR 11 in enter-initrd:leave-initrd of that very UKI and its
+// security epoch not revoked in the bits index E. So only an unrevoked
+// enklave UKI of the same role and profile, under Secure Boot, without ESP
+// credentials, before sysinit, can read S or administer the TPM. No
+// administrative secret exists: hierarchy authValues are random and
+// discarded, the platform hierarchy is disabled from the OS, Clear is
+// disabled. Every command that carries a secret uses a salted session with
+// parameter encryption; the salt key's Name is pinned in record A.
 package varauth
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -39,17 +36,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	"enklave.local/base/internal/statefs"
 	"enklave.local/base/internal/tpmpolicy"
 )
 
-// Runner runs external commands (systemd-repart, cryptsetup, tpm2-tools,
-// mount) and returns stdout.
+// Runner runs external commands and returns stdout.
 type Runner interface {
 	Run(name string, args ...string) ([]byte, error)
 }
 
-// TPMA_NV bits and NV types used below.
+// TPMA_NV bits and NV types.
 const (
 	attrPolicyWrite = 0x00000008
 	ntCounter       = 0x00000010
@@ -65,10 +63,14 @@ const (
 
 	// NameAlgSHA256 is TPM_ALG_SHA256.
 	NameAlgSHA256 = 0x000B
+	// SaltHandle is the persistent salt key (ECC P-256 primary, SRK template).
+	SaltHandle = "0x81000E01"
+
+	saltTemplateAttrs = "restricted|decrypt|fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda"
+	recordSize        = 32 + 8 + 34 // PCR 15 || provisioning epoch || salt key Name
 )
 
-// Index describes one NV index: handle, size, attributes at definition and
-// in the expected steady state.
+// Index describes one NV index.
 type Index struct {
 	Name   string
 	Handle string
@@ -77,20 +79,20 @@ type Index struct {
 	Final  uint32
 }
 
-// The NV indices (owner range 0x01800000-0x01BFFFFF; "E" for enklave).
+// The NV indices (owner range; "E" for enklave).
 var (
-	// Record: PCR 15 value of the authentic /var, written once and locked.
-	Record = Index{"record", "0x01800E01", 32,
+	// Record: PCR 15 of the authentic volume, provisioning epoch, salt key Name.
+	Record = Index{"record", "0x01800E01", recordSize,
 		attrPolicyWrite | attrWriteDefine | attrAuthRead | attrNoDA,
 		attrPolicyWrite | attrWriteDefine | attrAuthRead | attrNoDA | attrWritten | attrWriteLocked}
-	// Secret: the /var LUKS key; write-locked, read-locked after use each boot.
+	// Secret: the volume key; write-locked, read-locked after use each boot.
 	Secret = Index{"secret", "0x01800E02", 64,
 		attrPolicyRead | attrPolicyWrite | attrWriteDefine | attrReadSTClear | attrNoDA,
 		attrPolicyRead | attrPolicyWrite | attrWriteDefine | attrReadSTClear | attrNoDA | attrWritten | attrWriteLocked | attrReadLocked}
-	// Counter: monotonic anti-rollback counter for /var.
+	// Counter: state version (anti-rollback); policy OR(P, PolicyAuthValue).
 	Counter = Index{"counter", "0x01800E03", 8,
-		ntCounter | attrPolicyWrite | attrAuthRead | attrNoDA,
-		ntCounter | attrPolicyWrite | attrAuthRead | attrNoDA | attrWritten}
+		ntCounter | attrPolicyWrite | attrPolicyRead | attrNoDA,
+		ntCounter | attrPolicyWrite | attrPolicyRead | attrNoDA | attrWritten}
 	// Epoch: revocation bits; bit k set = UKIs of security epoch k revoked.
 	Epoch = Index{"epoch", "0x01800E04", 8,
 		ntBits | attrPolicyWrite | attrAuthRead | attrNoDA,
@@ -103,8 +105,12 @@ var (
 type Config struct {
 	RunDir      string // private state on tmpfs
 	PubKey      string // PCR signing public key from the UKI (.pcrpkey)
-	PolicyDir   string // directory with signed approved policies, relative to the ESP root
-	RollbackRel string // anti-rollback file, relative to the /var file system
+	PolicyDir   string // signed approved policies, relative to the ESP root
+	RoleFile    string
+	TestMarker  string
+	ReleaseFile string
+	StateRoot   string // mounted state volume at runtime
+	Work        string // per-process scratch dir (default RunDir/work)
 }
 
 // DefaultConfig returns the paths used on the image.
@@ -113,19 +119,77 @@ func DefaultConfig() Config {
 		RunDir:      "/run/enklave",
 		PubKey:      "/run/systemd/tpm2-pcr-public-key.pem",
 		PolicyDir:   "EFI/enklave/policy",
-		RollbackRel: "lib/enklave/rollback-counter",
+		RoleFile:    "/usr/lib/enklave/role",
+		TestMarker:  "/usr/lib/enklave/test-profile",
+		ReleaseFile: "/usr/lib/enklave/release.json",
+		StateRoot:   "/var/lib/enklave",
 	}
 }
 
-func (c Config) work() string        { return filepath.Join(c.RunDir, "work") }
+func (c Config) work() string {
+	if c.Work != "" {
+		return c.Work
+	}
+	return filepath.Join(c.RunDir, "work")
+}
 func (c Config) espMount() string    { return filepath.Join(c.RunDir, "esp") }
-func (c Config) varMount() string    { return filepath.Join(c.RunDir, "varcheck") }
+func (c Config) stateMount() string  { return filepath.Join(c.RunDir, "statecheck") }
 func (c Config) keyFile() string     { return filepath.Join(c.RunDir, "var.key") }
 func (c Config) policyCache() string { return filepath.Join(c.RunDir, "policy.json") }
+
+// CreatedFlag is written by Repart when systemd-repart created the partition.
 func (c Config) CreatedFlag() string { return filepath.Join(c.RunDir, "var-created") }
-func (c Config) ResultFile() string  { return filepath.Join(c.RunDir, "var-authenticated") }
+
+// ProvisionedFlag is written by Unlock after (re-)provisioning in this boot.
+func (c Config) ProvisionedFlag() string { return filepath.Join(c.RunDir, "var-provisioned") }
+
+// StateKeyFile holds the derived state MAC key and counter auth for runtime writers.
+func (c Config) StateKeyFile() string { return filepath.Join(c.RunDir, "state.key") }
+
+// ResultFile records the authenticated PCR 15 value (hex).
+func (c Config) ResultFile() string { return filepath.Join(c.RunDir, "var-authenticated") }
+
+// CounterFile records the verified state version.
 func (c Config) CounterFile() string { return filepath.Join(c.RunDir, "var-counter") }
-func (c Config) EpochFile() string   { return filepath.Join(c.RunDir, "epoch") }
+
+// PlatformFile records how the platform hierarchy was found/handled.
+func (c Config) PlatformFile() string { return filepath.Join(c.RunDir, "platform") }
+
+// ---------------------------------------------------------------- identity
+
+// Identity is the role/profile/release of the running image (all from the
+// verity-protected /usr).
+type Identity struct {
+	Role, Profile, Ref string
+	Release            tpmpolicy.Release
+}
+
+// LoadIdentity reads role, profile and release metadata.
+func LoadIdentity(c Config) (Identity, error) {
+	var id Identity
+	b, err := os.ReadFile(c.RoleFile)
+	if err != nil {
+		return id, err
+	}
+	id.Role = strings.TrimSpace(string(b))
+	id.Profile = "prod"
+	if _, err := os.Stat(c.TestMarker); err == nil {
+		id.Profile = "test"
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return id, err
+	}
+	if id.Ref, err = tpmpolicy.Ref(id.Role, id.Profile); err != nil {
+		return id, err
+	}
+	b, err = os.ReadFile(c.ReleaseFile)
+	if err != nil {
+		return id, err
+	}
+	if err := json.Unmarshal(b, &id.Release); err != nil {
+		return id, fmt.Errorf("release.json: %w", err)
+	}
+	return id, id.Release.Validate()
+}
 
 // ---------------------------------------------------------------- helpers
 
@@ -138,7 +202,6 @@ func handleNum(h string) uint64 {
 	return n
 }
 
-// lastDigest extracts the last 64-hex-digit token of a tpm2-tools output.
 func lastDigest(out []byte) ([]byte, error) {
 	f := strings.Fields(string(out))
 	for i := len(f) - 1; i >= 0; i-- {
@@ -152,7 +215,7 @@ func lastDigest(out []byte) ([]byte, error) {
 	return nil, fmt.Errorf("no sha256 digest in output %q", strings.TrimSpace(string(out)))
 }
 
-// ReadPCR returns a sha256 PCR value ("tpm2_pcrread sha256:N").
+// ReadPCR returns a sha256 PCR value.
 func ReadPCR(r Runner, n int) ([]byte, error) {
 	out, err := r.Run("tpm2_pcrread", fmt.Sprintf("sha256:%d", n))
 	if err != nil {
@@ -173,9 +236,8 @@ func ReadPCR(r Runner, n int) ([]byte, error) {
 
 var zero32 = make([]byte, 32)
 
-// RequireCleanPCR12 fails unless PCR 12 is all zero: systemd-stub extends it
-// only for credentials, addons and command line overrides, none of which a
-// genuine enklave boot has.
+// RequireCleanPCR12 fails unless PCR 12 is all zero (no ESP credentials,
+// addons or command line overrides).
 func RequireCleanPCR12(r Runner) error {
 	v, err := ReadPCR(r, 12)
 	if err != nil {
@@ -264,11 +326,10 @@ func CheckPublic(ix Index, p NVPublic, attrs uint32, policy []byte) error {
 	return nil
 }
 
-// DefinedIndices returns the defined NV handles (tpm2_getcap handles-nv-index).
-func DefinedIndices(r Runner) (map[uint64]bool, error) {
-	out, err := r.Run("tpm2_getcap", "handles-nv-index")
+func handles(r Runner, what string) (map[uint64]bool, error) {
+	out, err := r.Run("tpm2_getcap", what)
 	if err != nil {
-		return nil, fmt.Errorf("tpm2_getcap: %w", err)
+		return nil, fmt.Errorf("tpm2_getcap %s: %w", what, err)
 	}
 	m := map[uint64]bool{}
 	for _, line := range strings.Split(string(out), "\n") {
@@ -280,6 +341,9 @@ func DefinedIndices(r Runner) (map[uint64]bool, error) {
 	return m, nil
 }
 
+// DefinedIndices returns the defined NV handles.
+func DefinedIndices(r Runner) (map[uint64]bool, error) { return handles(r, "handles-nv-index") }
+
 // ReadPublic returns the parsed public area of an index.
 func ReadPublic(r Runner, ix Index) (NVPublic, error) {
 	out, err := r.Run("tpm2_nvreadpublic", ix.Handle)
@@ -289,7 +353,7 @@ func ReadPublic(r Runner, ix Index) (NVPublic, error) {
 	return ParseNVPublic(out)
 }
 
-// ReadNV reads an index with AUTHREAD and empty auth.
+// ReadNV reads an AUTHREAD index with empty auth.
 func ReadNV(r Runner, ix Index) ([]byte, error) {
 	out, err := r.Run("tpm2_nvread", ix.Handle, "-C", ix.Handle, "-s", strconv.Itoa(ix.Size))
 	if err != nil {
@@ -301,18 +365,32 @@ func ReadNV(r Runner, ix Index) ([]byte, error) {
 	return out, nil
 }
 
-// ReadUint64 reads an 8-byte counter or bits index.
-func ReadUint64(r Runner, ix Index) (uint64, error) {
-	b, err := ReadNV(r, ix)
-	if err != nil {
-		return 0, err
-	}
-	return binary.BigEndian.Uint64(b), nil
+// RecordData is the content of record A.
+type RecordData struct {
+	PCR15    []byte
+	Epoch    uint64
+	SaltName []byte
 }
 
-// Hierarchy is the TPM_PT_PERMANENT state relevant for the lock-down.
+// ParseRecord splits record A.
+func ParseRecord(b []byte) (RecordData, error) {
+	if len(b) != recordSize {
+		return RecordData{}, fmt.Errorf("record has %d bytes, want %d", len(b), recordSize)
+	}
+	return RecordData{PCR15: b[:32], Epoch: binary.BigEndian.Uint64(b[32:40]), SaltName: b[40:]}, nil
+}
+
+func (d RecordData) bytes() []byte {
+	b := append([]byte{}, d.PCR15...)
+	var e [8]byte
+	binary.BigEndian.PutUint64(e[:], d.Epoch)
+	b = append(b, e[:]...)
+	return append(b, d.SaltName...)
+}
+
+// Hierarchy is the relevant TPM state (TPM2_PT_PERMANENT, TPM2_PT_STARTUP_CLEAR).
 type Hierarchy struct {
-	OwnerAuthSet, EndorsementAuthSet, LockoutAuthSet, DisableClear bool
+	OwnerAuthSet, EndorsementAuthSet, LockoutAuthSet, DisableClear, PhEnable bool
 }
 
 // Locked reports whether all hierarchies are protected and Clear is disabled.
@@ -320,56 +398,107 @@ func (h Hierarchy) Locked() bool {
 	return h.OwnerAuthSet && h.EndorsementAuthSet && h.LockoutAuthSet && h.DisableClear
 }
 
-// ReadHierarchy parses "tpm2_getcap properties-variable" (TPM2_PT_PERMANENT).
+// Fresh reports an unprovisioned TPM (no authorization set, Clear allowed).
+func (h Hierarchy) Fresh() bool {
+	return !h.OwnerAuthSet && !h.EndorsementAuthSet && !h.LockoutAuthSet && !h.DisableClear
+}
+
+// ReadHierarchy parses "tpm2_getcap properties-variable".
 func ReadHierarchy(r Runner) (Hierarchy, error) {
 	out, err := r.Run("tpm2_getcap", "properties-variable")
 	if err != nil {
 		return Hierarchy{}, fmt.Errorf("tpm2_getcap: %w", err)
 	}
 	var h Hierarchy
-	in, seen := false, 0
+	sec, seen := "", 0
 	for _, line := range strings.Split(string(out), "\n") {
 		t := strings.TrimSpace(line)
 		if strings.HasSuffix(t, ":") && !strings.HasPrefix(line, " ") {
-			in = t == "TPM2_PT_PERMANENT:"
+			sec = t
 			continue
 		}
 		k, v, ok := strings.Cut(t, ":")
-		if !in || !ok {
+		if !ok {
 			continue
 		}
 		set := strings.TrimSpace(v) == "1"
-		switch k {
-		case "ownerAuthSet":
+		switch sec + k {
+		case "TPM2_PT_PERMANENT:ownerAuthSet":
 			h.OwnerAuthSet = set
-		case "endorsementAuthSet":
+		case "TPM2_PT_PERMANENT:endorsementAuthSet":
 			h.EndorsementAuthSet = set
-		case "lockoutAuthSet":
+		case "TPM2_PT_PERMANENT:lockoutAuthSet":
 			h.LockoutAuthSet = set
-		case "disableClear":
+		case "TPM2_PT_PERMANENT:disableClear":
 			h.DisableClear = set
+		case "TPM2_PT_STARTUP_CLEAR:phEnable":
+			h.PhEnable = set
 		default:
 			continue
 		}
 		seen++
 	}
-	if seen != 4 {
-		return h, errors.New("TPM2_PT_PERMANENT flags missing from tpm2_getcap output")
+	if seen != 5 {
+		return h, errors.New("TPM2_PT_PERMANENT/STARTUP_CLEAR flags missing from tpm2_getcap output")
 	}
 	return h, nil
+}
+
+// LockPlatform disables the platform hierarchy if the OS can use it (empty
+// platform auth). A platform hierarchy protected by firmware-held auth is
+// accepted; any other failure fails closed. Runs first on every boot.
+func LockPlatform(c Config, r Runner) (string, error) {
+	h, err := ReadHierarchy(r)
+	if err != nil {
+		return "", err
+	}
+	state := "disabled"
+	if h.PhEnable {
+		_, err := r.Run("tpm2_hierarchycontrol", "-C", "p", "phEnable", "clear")
+		switch {
+		case err == nil:
+			state = "disabled-by-enklave"
+		case isAuthFailure(err):
+			state = "firmware-auth" // platform auth set by firmware, unusable from the OS
+		default:
+			return "", fmt.Errorf("disabling the platform hierarchy: %w", err)
+		}
+	}
+	if err := os.MkdirAll(c.RunDir, 0o700); err != nil {
+		return "", err
+	}
+	return state, os.WriteFile(c.PlatformFile(), []byte(state+"\n"), 0o600)
+}
+
+func isAuthFailure(err error) bool {
+	s := strings.ToLower(err.Error())
+	for _, m := range []string{"0x9a2", "0x98e", "authorization failure", "bad_auth", "auth_fail"} {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------- sessions
 
 type tpm struct {
-	c Config
-	r Runner
+	c  Config
+	r  Runner
+	id Identity
 
-	pcr11  []byte // current PolicyPCR(sha256:11)
-	epoch  int
-	ready  bool // key loaded, policies, ticket
-	policy []byte
-	pe     []byte
+	pcr11, policy, pe, pc []byte
+	epoch                 int
+	ready, salted         bool
+	pauseAt               string
+}
+
+func newTPM(c Config, r Runner) (*tpm, error) {
+	id, err := LoadIdentity(c)
+	if err != nil {
+		return nil, err
+	}
+	return &tpm{c: c, r: r, id: id}, nil
 }
 
 func (t *tpm) w(name string) string { return filepath.Join(t.c.work(), name) }
@@ -382,11 +511,22 @@ func (t *tpm) run(name string, args ...string) ([]byte, error) {
 	return out, nil
 }
 
-func (t *tpm) put(name string, data []byte) error {
-	return os.WriteFile(t.w(name), data, 0o600)
+func (t *tpm) put(name string, data []byte) error { return os.WriteFile(t.w(name), data, 0o600) }
+
+// pause stops at a named provisioning step (test profile only).
+func (t *tpm) pause(step string) {
+	if t.id.Profile != "test" || t.pauseAt != step {
+		return
+	}
+	msg := "enklave-varauth: TEST PAUSE at " + step + "\n"
+	os.Stderr.WriteString(msg)
+	if f, err := os.OpenFile("/dev/ttyS0", os.O_WRONLY, 0); err == nil {
+		f.WriteString(msg)
+		f.Close()
+	}
+	pauseHook(step)
 }
 
-// trial runs steps in a trial session and returns the final digest.
 func (t *tpm) trial(steps ...[]string) ([]byte, error) {
 	if _, err := t.run("tpm2_startauthsession", "-S", t.w("trial.ctx")); err != nil {
 		return nil, err
@@ -394,8 +534,7 @@ func (t *tpm) trial(steps ...[]string) ([]byte, error) {
 	defer t.r.Run("tpm2_flushcontext", t.w("trial.ctx")) //nolint:errcheck
 	var out []byte
 	for _, st := range steps {
-		args := append([]string{"-S", t.w("trial.ctx")}, st[1:]...)
-		o, err := t.run(st[0], args...)
+		o, err := t.run(st[0], append([]string{"-S", t.w("trial.ctx")}, st[1:]...)...)
 		if err != nil {
 			return nil, err
 		}
@@ -404,13 +543,12 @@ func (t *tpm) trial(steps ...[]string) ([]byte, error) {
 	return lastDigest(out)
 }
 
-// prepare loads the PCR key, computes the expected policies and the current
-// PCR 11 policy. Signature/ticket handling is done by authorize.
+// prepare loads the PCR key and computes the expected policies.
 func (t *tpm) prepare() error {
 	if err := os.MkdirAll(t.c.work(), 0o700); err != nil {
 		return err
 	}
-	if err := t.put("ref.bin", []byte(tpmpolicy.Ref)); err != nil {
+	if err := t.put("ref.bin", []byte(t.id.Ref)); err != nil {
 		return err
 	}
 	if _, err := t.run("tpm2_loadexternal", "-C", "o", "-G", "rsa", "-u", t.c.PubKey,
@@ -424,50 +562,67 @@ func (t *tpm) prepare() error {
 	if err := t.put("pcrvals.bin", append(append([]byte{}, pcr7...), zero32...)); err != nil {
 		return err
 	}
-	if t.policy, err = t.trial(
-		[]string{"tpm2_policyauthorize", "-n", t.w("key.name"), "-q", t.w("ref.bin")},
-		[]string{"tpm2_policypcr", "-l", "sha256:7,12", "-f", t.w("pcrvals.bin")},
-	); err != nil {
+	auth := []string{"tpm2_policyauthorize", "-n", t.w("key.name"), "-q", t.w("ref.bin")}
+	if t.policy, err = t.trial(auth, []string{"tpm2_policypcr", "-l", "sha256:7,12", "-f", t.w("pcrvals.bin")}); err != nil {
 		return err
 	}
-	b1, err := t.trial([]string{"tpm2_policyauthorize", "-n", t.w("key.name"), "-q", t.w("ref.bin")})
+	b1, err := t.trial(auth)
 	if err != nil {
 		return err
 	}
-	b2, err := t.trial(
-		[]string{"tpm2_policycommandcode", "TPM2_CC_NV_SetBits"},
-		[]string{"tpm2_policynvwritten", "c"},
-	)
+	b2, err := t.trial([]string{"tpm2_policycommandcode", "TPM2_CC_NV_SetBits"}, []string{"tpm2_policynvwritten", "c"})
 	if err != nil {
 		return err
 	}
-	if err := t.put("b1.bin", b1); err != nil {
+	av, err := t.trial([]string{"tpm2_policyauthvalue"})
+	if err != nil {
 		return err
 	}
-	if err := t.put("b2.bin", b2); err != nil {
+	// Counter admin branch: NV_ChangeAuth needs the ADMIN role, which requires
+	// PolicyCommandCode in the session.
+	pca, err := t.trial(auth, []string{"tpm2_policypcr", "-l", "sha256:7,12", "-f", t.w("pcrvals.bin")},
+		[]string{"tpm2_policycommandcode", "TPM2_CC_NV_ChangeAuth"})
+	if err != nil {
 		return err
+	}
+	for n, d := range map[string][]byte{"p.bin": t.policy, "b1.bin": b1, "b2.bin": b2, "av.bin": av, "pca.bin": pca} {
+		if err := t.put(n, d); err != nil {
+			return err
+		}
 	}
 	if t.pe, err = t.trial([]string{"tpm2_policyor", "-l", "sha256:" + t.w("b1.bin") + "," + t.w("b2.bin")}); err != nil {
 		return err
 	}
-	if t.pcr11, err = t.trial([]string{"tpm2_policypcr", "-l", "sha256:11"}); err != nil {
+	if t.pc, err = t.trial([]string{"tpm2_policyor", "-l", "sha256:" + t.w("pca.bin") + "," + t.w("av.bin")}); err != nil {
 		return err
 	}
-	return nil
+	if err := t.put("pe.bin", t.pe); err != nil {
+		return err
+	}
+	if err := t.put("pc.bin", t.pc); err != nil {
+		return err
+	}
+	t.pcr11, err = t.trial([]string{"tpm2_policypcr", "-l", "sha256:11"})
+	return err
 }
 
-// ExpectedPolicies returns P (for A, S, C) and P_E (for E) for this boot.
-func ExpectedPolicies(c Config, r Runner) (p, pe []byte, err error) {
-	t := &tpm{c: c, r: r}
+// Policies are the expected policy digests for this boot.
+type Policies struct{ P, PE, PC []byte }
+
+// ExpectedPolicies returns the policies (P for A/S and the hierarchies, PE
+// for E, PC for the counter).
+func ExpectedPolicies(c Config, r Runner) (Policies, error) {
+	t, err := newTPM(c, r)
+	if err != nil {
+		return Policies{}, err
+	}
 	defer os.RemoveAll(c.work())
 	if err := t.prepare(); err != nil {
-		return nil, nil, err
+		return Policies{}, err
 	}
-	return t.policy, t.pe, nil
+	return Policies{t.policy, t.pe, t.pc}, nil
 }
 
-// selectPolicy reads the signed approved policies from the ESP and returns
-// the one for the running UKI (matching the current PCR 11 policy).
 func (t *tpm) selectPolicy(espDev string) (tpmpolicy.File, error) {
 	var f tpmpolicy.File
 	if err := os.MkdirAll(t.c.espMount(), 0o700); err != nil {
@@ -480,6 +635,11 @@ func (t *tpm) selectPolicy(espDev string) (tpmpolicy.File, error) {
 		return f, err
 	}
 	defer t.r.Run("umount", t.c.espMount()) //nolint:errcheck
+	if t.id.Profile == "test" {
+		if b, err := os.ReadFile(filepath.Join(t.c.espMount(), "EFI/enklave/test-pause")); err == nil {
+			t.pauseAt = strings.TrimSpace(string(b))
+		}
+	}
 	files, _ := filepath.Glob(filepath.Join(t.c.espMount(), t.c.PolicyDir, "*.json"))
 	sort.Strings(files)
 	want := hex.EncodeToString(t.pcr11)
@@ -505,21 +665,17 @@ func (t *tpm) cachedPolicy() (tpmpolicy.File, error) {
 	if err != nil {
 		return f, err
 	}
-	if err := json.Unmarshal(b, &f); err != nil {
-		return f, err
-	}
-	if !strings.EqualFold(f.PCR11Policy, hex.EncodeToString(t.pcr11)) {
-		return f, errors.New("cached approved policy does not belong to the running UKI")
-	}
-	return f, nil
+	return f, json.Unmarshal(b, &f)
 }
 
-// authorize checks E, recomputes the approved digest for the policy file and
-// obtains the TPM ticket for its signature.
+// authorize checks E, recomputes the approved digest and obtains the ticket.
 func (t *tpm) authorize(f tpmpolicy.File) error {
-	pcr11, approved, err := f.Decode()
+	pcr11, approved, err := f.Decode(t.id.Role, t.id.Profile)
 	if err != nil {
 		return err
+	}
+	if f.Epoch != t.id.Release.Epoch {
+		return fmt.Errorf("approved policy epoch %d != release epoch %d", f.Epoch, t.id.Release.Epoch)
 	}
 	if !bytes.Equal(pcr11, t.pcr11) {
 		return errors.New("approved policy is for another PCR 11 state")
@@ -544,7 +700,7 @@ func (t *tpm) authorize(f tpmpolicy.File) error {
 	}
 	op, _ := tpmpolicy.EpochOperand(f.Epoch)
 	for name, data := range map[string][]byte{
-		"approved.bin": approved, "msg.bin": tpmpolicy.SignedMessage(approved), "sig.bin": sig, "epochop.bin": op,
+		"approved.bin": approved, "msg.bin": tpmpolicy.SignedMessage(approved, t.id.Ref), "sig.bin": sig, "epochop.bin": op,
 	} {
 		if err := t.put(name, data); err != nil {
 			return err
@@ -554,27 +710,51 @@ func (t *tpm) authorize(f tpmpolicy.File) error {
 		"-s", t.w("sig.bin"), "-f", "rsassa", "-t", t.w("ticket.bin")); err != nil {
 		return fmt.Errorf("approved policy signature rejected: %w", err)
 	}
+	if _, err := t.run("tpm2_flushcontext", "-t"); err != nil {
+		return err
+	}
 	t.epoch, t.ready = f.Epoch, true
 	return nil
 }
 
-// session starts a policy session satisfying P (final = "pcr") or P_E
-// (final = "or"), runs cmd with it and flushes it.
-func (t *tpm) session(final string, cmd ...string) ([]byte, error) {
+// session kinds
+const (
+	sessP  = "P"  // policy P (A, S, hierarchies)
+	sessPE = "PE" // branch 1 of E's policy
+	sessPC = "PC" // admin branch of the counter policy (NV_ChangeAuth only)
+)
+
+// session runs cmd with a policy session of the given kind. enc is "",
+// "encrypt" (response) or "decrypt" (command) parameter encryption; any
+// encryption requires the verified salt key.
+func (t *tpm) session(kind, enc string, cmd ...string) ([]byte, error) {
 	if !t.ready {
 		return nil, errors.New("policy not authorized")
 	}
 	s := t.w("s.ctx")
-	steps := [][]string{
-		{"tpm2_startauthsession", "--policy-session", "-S", s},
-		{"tpm2_policypcr", "-S", s, "-l", "sha256:11"},
-		{"tpm2_policynv", "-S", s, "-i", t.w("epochop.bin"), Epoch.Handle, "bc"},
-		{"tpm2_policyauthorize", "-S", s, "-i", t.w("approved.bin"), "-q", t.w("ref.bin"), "-n", t.w("key.name"), "-t", t.w("ticket.bin")},
+	start := []string{"tpm2_startauthsession", "--policy-session", "-S", s}
+	if t.salted {
+		start = append(start, "-c", SaltHandle)
+	} else if enc != "" {
+		return nil, errors.New("parameter encryption requested without a verified salt key")
 	}
-	switch final {
-	case "pcr":
+	steps := [][]string{start}
+	if enc != "" {
+		steps = append(steps, []string{"tpm2_sessionconfig", s, "--enable-" + enc})
+	}
+	steps = append(steps,
+		[]string{"tpm2_policypcr", "-S", s, "-l", "sha256:11"},
+		[]string{"tpm2_policynv", "-S", s, "-i", t.w("epochop.bin"), Epoch.Handle, "bc"},
+		[]string{"tpm2_policyauthorize", "-S", s, "-i", t.w("approved.bin"), "-q", t.w("ref.bin"), "-n", t.w("key.name"), "-t", t.w("ticket.bin")},
+	)
+	switch kind {
+	case sessP:
 		steps = append(steps, []string{"tpm2_policypcr", "-S", s, "-l", "sha256:7,12", "-f", t.w("pcrvals.bin")})
-	case "or":
+	case sessPC:
+		steps = append(steps, []string{"tpm2_policypcr", "-S", s, "-l", "sha256:7,12", "-f", t.w("pcrvals.bin")},
+			[]string{"tpm2_policycommandcode", "-S", s, "TPM2_CC_NV_ChangeAuth"},
+			[]string{"tpm2_policyor", "-S", s, "-l", "sha256:" + t.w("pca.bin") + "," + t.w("av.bin")})
+	case sessPE:
 		steps = append(steps, []string{"tpm2_policyor", "-S", s, "-l", "sha256:" + t.w("b1.bin") + "," + t.w("b2.bin")})
 	}
 	defer t.r.Run("tpm2_flushcontext", s) //nolint:errcheck
@@ -583,16 +763,25 @@ func (t *tpm) session(final string, cmd ...string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return t.run(cmd[0], append(cmd[1:], "-P", "session:"+s)...)
+	return t.run(cmd[0], append(cmd[1:], "session:"+s)...)
 }
 
-func (t *tpm) define(ix Index, policy string) error {
-	_, err := t.run("tpm2_nvdefine", ix.Handle, "-C", "o", "-s", strconv.Itoa(ix.Size),
-		"-a", fmt.Sprintf("0x%08x", ix.Define), "-L", t.w(policy), "-g", "sha256")
+// owner runs an owner-authorized command with policy P ("-C o -P session").
+func (t *tpm) owner(enc string, name string, args ...string) error {
+	_, err := t.session(sessP, enc, append(append([]string{name}, args...), "-C", "o", "-P")...)
 	return err
 }
 
-// initEpoch writes E for the first time through the PolicyNvWritten(NO) branch.
+func (t *tpm) defineWithPolicy(ix Index, policyFile string, authHex string) error {
+	args := []string{ix.Handle, "-s", strconv.Itoa(ix.Size), "-a", fmt.Sprintf("0x%08x", ix.Define), "-L", t.w(policyFile), "-g", "sha256"}
+	enc := ""
+	if authHex != "" {
+		args = append(args, "-p", "hex:"+authHex)
+		enc = "decrypt"
+	}
+	return t.owner(enc, "tpm2_nvdefine", args...)
+}
+
 func (t *tpm) initEpoch() error {
 	s := t.w("s.ctx")
 	defer t.r.Run("tpm2_flushcontext", s) //nolint:errcheck
@@ -610,12 +799,12 @@ func (t *tpm) initEpoch() error {
 	return nil
 }
 
-// revoke sets the bits of all older epochs and refuses a revoked epoch.
 func (t *tpm) revoke() error {
-	v, err := ReadUint64(t.r, Epoch)
+	b, err := ReadNV(t.r, Epoch)
 	if err != nil {
 		return err
 	}
+	v := binary.BigEndian.Uint64(b)
 	if v&(uint64(1)<<uint(t.epoch)) != 0 {
 		return fmt.Errorf("security epoch %d of this UKI is revoked (E = 0x%x)", t.epoch, v)
 	}
@@ -623,7 +812,7 @@ func (t *tpm) revoke() error {
 	if v&mask == mask {
 		return nil
 	}
-	_, err = t.session("or", "tpm2_nvsetbits", Epoch.Handle, "-C", Epoch.Handle, "-i", fmt.Sprintf("0x%x", mask))
+	_, err = t.session(sessPE, "", "tpm2_nvsetbits", Epoch.Handle, "-C", Epoch.Handle, "-i", fmt.Sprintf("0x%x", mask), "-P")
 	return err
 }
 
@@ -635,11 +824,125 @@ func (t *tpm) checkIndex(ix Index, attrs uint32, policy []byte) error {
 	return CheckPublic(ix, pub, attrs, policy)
 }
 
+// createSalt creates the deterministic salt primary and persists it.
+// ownerPolicy selects owner authorization by policy P (locked TPM) instead of
+// the empty owner auth of a fresh TPM.
+func (t *tpm) createSalt(ownerPolicy bool) ([]byte, error) {
+	if _, err := t.run("tpm2_flushcontext", "-t"); err != nil {
+		return nil, err
+	}
+	create := []string{"-G", "ecc256:aes128cfb", "-a", saltTemplateAttrs, "-c", t.w("salt.ctx")}
+	persist := []string{"-c", t.w("salt.ctx"), SaltHandle}
+	if ownerPolicy {
+		if err := t.owner("", "tpm2_createprimary", create...); err != nil {
+			return nil, err
+		}
+		if err := t.owner("", "tpm2_evictcontrol", persist...); err != nil {
+			return nil, err
+		}
+	} else {
+		if _, err := t.run("tpm2_createprimary", append([]string{"-C", "o"}, create...)...); err != nil {
+			return nil, err
+		}
+		if _, err := t.run("tpm2_evictcontrol", append([]string{"-C", "o"}, persist...)...); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := t.run("tpm2_flushcontext", "-t"); err != nil {
+		return nil, err
+	}
+	return t.saltName()
+}
+
+func (t *tpm) saltName() ([]byte, error) {
+	if _, err := t.run("tpm2_readpublic", "-c", SaltHandle, "-n", t.w("salt.name")); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(t.w("salt.name"))
+}
+
+// useSalt enables salted sessions after checking the salt key's Name.
+func (t *tpm) useSalt(want []byte) error {
+	got, err := t.saltName()
+	if err != nil {
+		return err
+	}
+	if len(want) == 0 || !bytes.Equal(got, want) {
+		return fmt.Errorf("salt key %s Name %x does not match the recorded %x (substituted key?)", SaltHandle, got, want)
+	}
+	t.salted = true
+	return nil
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// lockFresh locks a fresh TPM: hierarchy policies P, Clear disabled, random
+// discarded authValues sent with parameter encryption.
+func (t *tpm) lockFresh() error {
+	for _, h := range []string{"o", "e", "l"} {
+		if _, err := t.run("tpm2_setprimarypolicy", "-C", h, "-L", t.w("p.bin"), "-g", "sha256"); err != nil {
+			return err
+		}
+	}
+	if _, err := t.run("tpm2_clearcontrol", "-C", "l", "s"); err != nil {
+		return err
+	}
+	for _, h := range []string{"o", "e", "l"} {
+		v, err := randomHex(32)
+		if err != nil {
+			return err
+		}
+		hs := t.w("h.ctx")
+		steps := [][]string{
+			{"tpm2_startauthsession", "--hmac-session", "-S", hs, "-c", SaltHandle},
+			{"tpm2_sessionconfig", hs, "--enable-decrypt"},
+			{"tpm2_changeauth", "-c", h, "-p", "session:" + hs, "hex:" + v},
+		}
+		for _, st := range steps {
+			if _, err := t.run(st[0], st[1:]...); err != nil {
+				t.r.Run("tpm2_flushcontext", hs) //nolint:errcheck
+				return err
+			}
+		}
+		t.r.Run("tpm2_flushcontext", hs) //nolint:errcheck
+	}
+	return nil
+}
+
+// rotate re-applies the hierarchy policies and fresh random authValues on a
+// locked TPM (healing).
+func (t *tpm) rotate() error {
+	for _, h := range []string{"o", "e", "l"} {
+		if _, err := t.session(sessP, "", "tpm2_setprimarypolicy", "-C", h, "-L", t.w("p.bin"), "-g", "sha256", "-P"); err != nil {
+			return err
+		}
+	}
+	for _, h := range []string{"o", "e", "l"} {
+		v, err := randomHex(32)
+		if err != nil {
+			return err
+		}
+		if _, err := t.session(sessP, "decrypt", "tpm2_changeauth", "-c", h, "hex:"+v, "-p"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------- repart
 
-// Repart runs systemd-repart with args plus --json=short after checking that
-// PCR 12 is clean, and records whether it created the var partition.
+// Repart locks the platform hierarchy, requires a clean PCR 12, runs
+// systemd-repart and records whether it created the partition.
 func Repart(c Config, r Runner, args []string) error {
+	if _, err := LockPlatform(c, r); err != nil {
+		return err
+	}
 	if err := RequireCleanPCR12(r); err != nil {
 		return err
 	}
@@ -667,9 +970,6 @@ func Repart(c Config, r Runner, args []string) error {
 	if !created {
 		return nil
 	}
-	if err := os.MkdirAll(c.RunDir, 0o700); err != nil {
-		return err
-	}
 	fh, err := os.OpenFile(c.CreatedFlag(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
@@ -677,8 +977,8 @@ func Repart(c Config, r Runner, args []string) error {
 	return fh.Close()
 }
 
-func created(c Config) (bool, error) {
-	_, err := os.Stat(c.CreatedFlag())
+func exists(p string) (bool, error) {
+	_, err := os.Stat(p)
 	if err == nil {
 		return true, nil
 	}
@@ -688,25 +988,166 @@ func created(c Config) (bool, error) {
 	return false, err
 }
 
+// ---------------------------------------------------------------- keys
+
+func derive(key []byte, label string) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte(label))
+	return h.Sum(nil)
+}
+
+// StateKeys are derived from the volume key S.
+type StateKeys struct{ MAC, CounterAuth []byte }
+
+func deriveKeys(s []byte) StateKeys {
+	return StateKeys{derive(s, "enklave-state-mac-v1"), derive(s, "enklave-counter-auth-v1")}
+}
+
+// LoadStateKeys reads the runtime copy written by Unlock.
+func LoadStateKeys(c Config) (StateKeys, error) {
+	b, err := os.ReadFile(c.StateKeyFile())
+	if err != nil {
+		return StateKeys{}, err
+	}
+	if len(b) != 64 {
+		return StateKeys{}, errors.New("bad state key file")
+	}
+	return StateKeys{b[:32], b[32:]}, nil
+}
+
+// counterRT authorizes the counter with PolicyAuthValue (runtime + boot).
+type counterRT struct {
+	r    Runner
+	work string
+	auth []byte
+}
+
+func (k counterRT) session(cmd ...string) ([]byte, error) {
+	if err := os.MkdirAll(k.work, 0o700); err != nil {
+		return nil, err
+	}
+	s := filepath.Join(k.work, "c.ctx")
+	defer k.r.Run("tpm2_flushcontext", s) //nolint:errcheck
+	for _, st := range [][]string{
+		{"tpm2_startauthsession", "--policy-session", "-S", s, "-c", SaltHandle},
+		{"tpm2_policyauthvalue", "-S", s},
+		{"tpm2_policyor", "-S", s, "-l", "sha256:" + filepath.Join(k.work, "pca.bin") + "," + filepath.Join(k.work, "av.bin")},
+	} {
+		if _, err := k.r.Run(st[0], st[1:]...); err != nil {
+			return nil, fmt.Errorf("%s: %w", st[0], err)
+		}
+	}
+	out, err := k.r.Run(cmd[0], append(cmd[1:], "-P", "session:"+s+"+hex:"+hex.EncodeToString(k.auth))...)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", cmd[0], err)
+	}
+	return out, nil
+}
+
+func (k counterRT) Read() (uint64, error) {
+	b, err := k.session("tpm2_nvread", Counter.Handle, "-C", Counter.Handle, "-s", "8")
+	if err != nil {
+		return 0, err
+	}
+	if len(b) != 8 {
+		return 0, fmt.Errorf("counter read returned %d bytes", len(b))
+	}
+	return binary.BigEndian.Uint64(b), nil
+}
+
+func (k counterRT) Increment() error {
+	_, err := k.session("tpm2_nvincrement", Counter.Handle, "-C", Counter.Handle)
+	return err
+}
+
+// OpenStore opens the mounted state store for runtime writers: it re-checks
+// the salt key against record A and the counter's policy, then uses the
+// derived keys from /run.
+func OpenStore(c Config, r Runner, pause func(string)) (*statefs.Store, error) {
+	keys, err := LoadStateKeys(c)
+	if err != nil {
+		return nil, err
+	}
+	t, err := newTPM(c, r)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.prepare(); err != nil {
+		return nil, err
+	}
+	rec, err := ReadNV(r, Record)
+	if err != nil {
+		return nil, err
+	}
+	rd, err := ParseRecord(rec)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.useSalt(rd.SaltName); err != nil {
+		return nil, err
+	}
+	if err := t.checkIndex(Counter, Counter.Final, t.pc); err != nil {
+		return nil, err
+	}
+	return &statefs.Store{Root: c.StateRoot, Key: keys.MAC, Counter: counterRT{r, t.c.work(), keys.CounterAuth}, Pause: pause}, nil
+}
+
 // ---------------------------------------------------------------- unlock
 
-// Unlock opens /var (varDev) as /dev/mapper/var. On the genuine first boot it
-// creates the LUKS2 volume and the NV indices; otherwise it reads the key
-// from the TPM. The key is read-locked in the TPM afterwards.
+// state of the enklave objects in the TPM
+type tpmState struct {
+	h        Hierarchy
+	nv, pers map[uint64]bool
+}
+
+func (s tpmState) count() int {
+	n := 0
+	for _, ix := range allIndices {
+		if s.nv[handleNum(ix.Handle)] {
+			n++
+		}
+	}
+	if s.pers[handleNum(SaltHandle)] {
+		n++
+	}
+	return n
+}
+
+func readState(r Runner) (tpmState, error) {
+	var s tpmState
+	var err error
+	if s.h, err = ReadHierarchy(r); err != nil {
+		return s, err
+	}
+	if s.nv, err = DefinedIndices(r); err != nil {
+		return s, err
+	}
+	s.pers, err = handles(r, "handles-persistent")
+	return s, err
+}
+
+// Unlock opens the volume as /dev/mapper/var: provisions on the genuine
+// first boot, heals if the release demands it, otherwise reads the key.
 func Unlock(c Config, r Runner, varDev, espDev string) (string, error) {
 	if err := os.MkdirAll(c.RunDir, 0o700); err != nil {
 		return "", err
 	}
 	defer os.Remove(c.keyFile())
 	defer os.RemoveAll(c.work())
+	if _, err := os.Stat(c.PlatformFile()); err != nil {
+		return "", errors.New("platform hierarchy not handled in this boot")
+	}
 	if err := RequireCleanPCR12(r); err != nil {
 		return "", err
 	}
-	first, err := created(c)
+	first, err := exists(c.CreatedFlag())
 	if err != nil {
 		return "", err
 	}
-	t := &tpm{c: c, r: r}
+	t, err := newTPM(c, r)
+	if err != nil {
+		return "", err
+	}
 	if err := t.prepare(); err != nil {
 		return "", err
 	}
@@ -714,132 +1155,277 @@ func Unlock(c Config, r Runner, varDev, espDev string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defined, err := DefinedIndices(r)
+	st, err := readState(r)
 	if err != nil {
 		return "", err
 	}
 
 	var key []byte
-	if first {
-		for _, ix := range allIndices {
-			if defined[handleNum(ix.Handle)] {
-				return "", fmt.Errorf("NV %s %s already exists on the first boot of this /var (pre-defined by someone else?)", ix.Name, ix.Handle)
-			}
+	verb := "opened"
+	switch {
+	case first:
+		if st.count() != 0 || !st.h.Fresh() {
+			return "", fmt.Errorf("first boot of /var on a TPM that is not fresh (%d enklave objects, %+v)", st.count(), st.h)
 		}
 		if _, err := r.Run("cryptsetup", "isLuks", varDev); err == nil {
 			return "", fmt.Errorf("%s already carries a LUKS header on the first boot", varDev)
 		}
-		h, err := ReadHierarchy(r)
-		if err != nil {
+		if key, err = t.provision(f, varDev); err != nil {
 			return "", err
 		}
-		if h.OwnerAuthSet || h.LockoutAuthSet {
-			return "", errors.New("TPM owner/lockout authorization already set on the first boot (not a fresh TPM)")
+		verb = "provisioned"
+	default:
+		if !st.h.Locked() {
+			return "", fmt.Errorf("TPM hierarchies not locked on an enrolled machine: %+v (interrupted provisioning?)", st.h)
 		}
-		if err := t.put("pe.bin", t.pe); err != nil {
+		if !st.nv[handleNum(Epoch.Handle)] {
+			return "", errors.New("epoch index missing on an enrolled machine")
+		}
+		if err := t.authorize(f); err != nil {
 			return "", err
 		}
-		if err := t.put("p.bin", t.policy); err != nil {
+		if err := t.revoke(); err != nil {
 			return "", err
 		}
-		if err := t.define(Epoch, "pe.bin"); err != nil {
-			return "", err
+		complete := st.count() == len(allIndices)+1
+		var rd RecordData
+		if st.nv[handleNum(Record.Handle)] {
+			b, err := ReadNV(r, Record)
+			if err != nil {
+				return "", err
+			}
+			if rd, err = ParseRecord(b); err != nil {
+				return "", err
+			}
 		}
-		if err := t.initEpoch(); err != nil {
-			return "", err
-		}
-	} else if !defined[handleNum(Secret.Handle)] || !defined[handleNum(Epoch.Handle)] {
-		return "", errors.New("NV secret/epoch index missing but /var already existed before this boot")
-	}
-
-	if err := t.authorize(f); err != nil {
-		return "", err
-	}
-	if err := t.revoke(); err != nil {
-		return "", err
-	}
-
-	if first {
-		key = make([]byte, Secret.Size)
-		if _, err := rand.Read(key); err != nil {
-			return "", err
-		}
-		if err := os.WriteFile(c.keyFile(), key, 0o600); err != nil {
-			return "", err
-		}
-		if _, err := t.run("cryptsetup", "luksFormat", "--batch-mode", "--type", "luks2",
-			"--cipher", "aes-xts-plain64", "--key-size", "512", "--hash", "sha256",
-			"--pbkdf", "argon2id", "--integrity", "hmac-sha256", "--label", "enklave-var",
-			"--key-file", c.keyFile(), varDev); err != nil {
-			return "", err
-		}
-		tok := fmt.Sprintf(`{"type":"enklave-tpm2-nv","keyslots":["0"],"nv-secret":"%s","nv-record":"%s","nv-counter":"%s","nv-epoch":"%s"}`,
-			Secret.Handle, Record.Handle, Counter.Handle, Epoch.Handle)
-		if err := t.put("token.json", []byte(tok)); err != nil {
-			return "", err
-		}
-		if _, err := t.run("cryptsetup", "token", "import", "--json-file", t.w("token.json"), "--token-id", "0", varDev); err != nil {
-			return "", err
-		}
-		if err := t.define(Secret, "p.bin"); err != nil {
-			return "", err
-		}
-		if err := t.put("secret.bin", key); err != nil {
-			return "", err
-		}
-		if _, err := t.session("pcr", "tpm2_nvwrite", Secret.Handle, "-C", Secret.Handle, "-i", t.w("secret.bin")); err != nil {
-			return "", err
-		}
-		os.Remove(t.w("secret.bin"))
-		if _, err := t.session("pcr", "tpm2_nvwritelock", Secret.Handle, "-C", Secret.Handle); err != nil {
-			return "", err
-		}
-	} else {
-		if err := t.checkIndex(Secret, Secret.Final&^attrReadLocked, t.policy); err != nil {
-			return "", err
-		}
-		key, err = t.session("pcr", "tpm2_nvread", Secret.Handle, "-C", Secret.Handle, "-s", strconv.Itoa(Secret.Size))
-		if err != nil {
-			return "", fmt.Errorf("reading the /var key from the TPM: %w", err)
-		}
-		if len(key) != Secret.Size {
-			return "", fmt.Errorf("TPM returned %d key bytes", len(key))
-		}
-		if err := os.WriteFile(c.keyFile(), key, 0o600); err != nil {
-			return "", err
+		heal := t.id.Release.HealBelow > 0 && (!st.nv[handleNum(Record.Handle)] || rd.Epoch < uint64(t.id.Release.HealBelow))
+		switch {
+		case heal:
+			if key, err = t.heal(st, varDev); err != nil {
+				return "", fmt.Errorf("healing: %w", err)
+			}
+			verb = "healed"
+		case !complete:
+			return "", fmt.Errorf("partial enklave TPM state (%d of %d objects): interrupted provisioning, refusing", st.count(), len(allIndices)+1)
+		default:
+			if err := t.useSalt(rd.SaltName); err != nil {
+				return "", err
+			}
+			for _, ck := range []struct {
+				ix     Index
+				attrs  uint32
+				policy []byte
+			}{{Record, Record.Final, t.policy}, {Secret, Secret.Final &^ attrReadLocked, t.policy}, {Counter, Counter.Final, t.pc}} {
+				if err := t.checkIndex(ck.ix, ck.attrs, ck.policy); err != nil {
+					return "", err
+				}
+			}
+			key, err = t.session(sessP, "encrypt", "tpm2_nvread", Secret.Handle, "-C", Secret.Handle, "-s", strconv.Itoa(Secret.Size), "-P")
+			if err != nil {
+				return "", fmt.Errorf("reading the volume key from the TPM: %w", err)
+			}
+			if len(key) != Secret.Size {
+				return "", fmt.Errorf("TPM returned %d key bytes", len(key))
+			}
+			if err := os.WriteFile(c.keyFile(), key, 0o600); err != nil {
+				return "", err
+			}
+			if err := t.attach(varDev); err != nil {
+				return "", err
+			}
 		}
 	}
-
-	// keyfile-erase removes the key file after use; volume key measured into PCR 15.
-	_, attachErr := t.run("/usr/lib/systemd/systemd-cryptsetup", "attach", "var", varDev, c.keyFile(),
-		"headless=true,keyfile-erase,tpm2-measure-pcr=yes")
+	keys := deriveKeys(key)
 	for i := range key {
 		key[i] = 0
 	}
-	if _, err := t.session("pcr", "tpm2_nvreadlock", Secret.Handle, "-C", Secret.Handle); err != nil {
-		return "", fmt.Errorf("read-locking the /var key: %w", err)
-	}
-	if attachErr != nil {
-		return "", attachErr
-	}
-	if first {
-		if _, err := t.run("mkfs.ext4", "-q", "-L", "var", "/dev/mapper/var"); err != nil {
-			return "", err
-		}
-	}
-	if err := os.WriteFile(c.EpochFile(), []byte(strconv.Itoa(t.epoch)+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(c.StateKeyFile(), append(append([]byte{}, keys.MAC...), keys.CounterAuth...), 0o400); err != nil {
 		return "", err
 	}
-	if first {
-		return fmt.Sprintf("created and opened /var on %s (epoch %d)", varDev, t.epoch), nil
+	return fmt.Sprintf("%s the state volume on %s (role %s, profile %s, epoch %d)", verb, varDev, t.id.Role, t.id.Profile, t.epoch), nil
+}
+
+// attach opens the volume with the key file (erased after use), measures the
+// volume key into PCR 15 and read-locks the secret.
+func (t *tpm) attach(varDev string) error {
+	_, attachErr := t.run("/usr/lib/systemd/systemd-cryptsetup", "attach", "var", varDev, t.c.keyFile(),
+		"headless=true,keyfile-erase,tpm2-measure-pcr=yes")
+	if _, err := t.session(sessP, "", "tpm2_nvreadlock", Secret.Handle, "-C", Secret.Handle, "-P"); err != nil {
+		return fmt.Errorf("read-locking the volume key: %w", err)
 	}
-	return fmt.Sprintf("opened /var on %s with the TPM-held key (epoch %d)", varDev, t.epoch), nil
+	return attachErr
+}
+
+// provision runs the genuine first boot on a fresh TPM. Order (N1): the
+// hierarchies are locked before any index that protects data is defined;
+// every later boot that finds a partial state fails closed.
+func (t *tpm) provision(f tpmpolicy.File, varDev string) ([]byte, error) {
+	if _, err := t.createSalt(false); err != nil {
+		return nil, err
+	}
+	t.pause("salt-created")
+	if err := t.defineFresh(Epoch, "pe.bin"); err != nil {
+		return nil, err
+	}
+	if err := t.initEpoch(); err != nil {
+		return nil, err
+	}
+	t.pause("epoch-defined")
+	if err := t.authorize(f); err != nil {
+		return nil, err
+	}
+	if err := t.revoke(); err != nil {
+		return nil, err
+	}
+	name, err := t.saltName()
+	if err != nil {
+		return nil, err
+	}
+	if err := t.useSalt(name); err != nil {
+		return nil, err
+	}
+	if err := t.lockFresh(); err != nil {
+		return nil, err
+	}
+	t.pause("locked")
+	return t.provisionVolume(varDev)
+}
+
+func (t *tpm) defineFresh(ix Index, policyFile string) error {
+	_, err := t.run("tpm2_nvdefine", ix.Handle, "-C", "o", "-s", strconv.Itoa(ix.Size),
+		"-a", fmt.Sprintf("0x%08x", ix.Define), "-L", t.w(policyFile), "-g", "sha256")
+	return err
+}
+
+// provisionVolume creates S, the LUKS2 volume, the counter and the empty
+// state store. The record A is written by Verify (it needs PCR 15).
+func (t *tpm) provisionVolume(varDev string) ([]byte, error) {
+	if err := t.defineWithPolicy(Secret, "p.bin", ""); err != nil {
+		return nil, err
+	}
+	key := make([]byte, Secret.Size)
+	if _, err := rand.Read(key); err != nil {
+		return nil, err
+	}
+	if err := t.put("secret.bin", key); err != nil {
+		return nil, err
+	}
+	_, err := t.session(sessP, "decrypt", "tpm2_nvwrite", Secret.Handle, "-C", Secret.Handle, "-i", t.w("secret.bin"), "-P")
+	os.Remove(t.w("secret.bin"))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := t.session(sessP, "", "tpm2_nvwritelock", Secret.Handle, "-C", Secret.Handle, "-P"); err != nil {
+		return nil, err
+	}
+	t.pause("secret-written")
+	if err := os.WriteFile(t.c.keyFile(), key, 0o600); err != nil {
+		return nil, err
+	}
+	if _, err := t.run("cryptsetup", "luksFormat", "--batch-mode", "--type", "luks2",
+		"--cipher", "aes-xts-plain64", "--key-size", "512", "--hash", "sha256",
+		"--pbkdf", "argon2id", "--integrity", "hmac-sha256", "--label", "enklave-var",
+		"--key-file", t.c.keyFile(), varDev); err != nil {
+		return nil, err
+	}
+	tok := fmt.Sprintf(`{"type":"enklave-tpm2-nv","keyslots":["0"],"nv-secret":"%s","nv-record":"%s","nv-counter":"%s","nv-epoch":"%s","salt":"%s","ref":"%s"}`,
+		Secret.Handle, Record.Handle, Counter.Handle, Epoch.Handle, SaltHandle, t.id.Ref)
+	if err := t.put("token.json", []byte(tok)); err != nil {
+		return nil, err
+	}
+	if _, err := t.run("cryptsetup", "token", "import", "--json-file", t.w("token.json"), "--token-id", "0", varDev); err != nil {
+		return nil, err
+	}
+	t.pause("formatted")
+	if err := t.attach(varDev); err != nil {
+		return nil, err
+	}
+	if _, err := t.run("mkfs.ext4", "-q", "-L", "enklave-state", "/dev/mapper/var"); err != nil {
+		return nil, err
+	}
+	keys := deriveKeys(key)
+	// The counter's authValue is set with TPM2_NV_ChangeAuth (ADMIN role via
+	// the P branch, parameter-encrypted): an authValue passed to
+	// NV_DefineSpace under an owner *policy* session does not take effect
+	// with tpm2-tools 5.7 (TPM_RC_AUTH_FAIL on first use, reproduced on swtpm).
+	if err := t.defineWithPolicy(Counter, "pc.bin", ""); err != nil {
+		return nil, err
+	}
+	if _, err := t.session(sessPC, "decrypt", "tpm2_changeauth", "-c", Counter.Handle, "hex:"+hex.EncodeToString(keys.CounterAuth), "-p"); err != nil {
+		return nil, err
+	}
+	ctr := counterRT{t.r, t.c.work(), keys.CounterAuth}
+	if err := ctr.Increment(); err != nil {
+		return nil, err
+	}
+	if err := t.withState(func(root string) error {
+		return (&statefs.Store{Root: root, Key: keys.MAC, Counter: ctr}).Init()
+	}); err != nil {
+		return nil, err
+	}
+	t.pause("state-initialized")
+	if err := os.WriteFile(t.c.ProvisionedFlag(), []byte(strconv.Itoa(t.epoch)+"\n"), 0o600); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+func (t *tpm) withState(fn func(root string) error) error {
+	mnt := t.c.stateMount()
+	if err := os.MkdirAll(mnt, 0o700); err != nil {
+		return err
+	}
+	if _, err := t.run("mount", "-t", "ext4", "-o", "nosuid,nodev,noexec", "/dev/mapper/var", mnt); err != nil {
+		return err
+	}
+	err := fn(mnt)
+	if _, uerr := t.run("umount", mnt); err == nil {
+		err = uerr
+	}
+	return err
+}
+
+// heal (N4) rotates the hierarchy authorization, replaces the salt key,
+// destroys every index that a compromised epoch could have learned (S, A, C)
+// and re-provisions an empty state volume with a new key.
+func (t *tpm) heal(st tpmState, varDev string) ([]byte, error) {
+	if st.pers[handleNum(SaltHandle)] {
+		if err := t.owner("", "tpm2_evictcontrol", "-c", SaltHandle); err != nil {
+			return nil, err
+		}
+	}
+	name, err := t.createSalt(true)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.useSalt(name); err != nil {
+		return nil, err
+	}
+	if err := t.rotate(); err != nil {
+		return nil, err
+	}
+	for _, ix := range []Index{Record, Secret, Counter} {
+		if st.nv[handleNum(ix.Handle)] {
+			if err := t.owner("", "tpm2_nvundefine", ix.Handle); err != nil {
+				return nil, err
+			}
+		}
+	}
+	t.pause("healed-tpm")
+	if _, err := t.run("cryptsetup", "erase", "--batch-mode", varDev); err != nil {
+		// not a LUKS volume any more (interrupted heal): nothing to erase
+		if _, lerr := t.r.Run("cryptsetup", "isLuks", varDev); lerr == nil {
+			return nil, err
+		}
+	}
+	return t.provisionVolume(varDev)
 }
 
 // ---------------------------------------------------------------- verify
 
-// Verify authenticates the opened /var (PCR 15 record), enforces the
-// anti-rollback counter, checks every NV index and locks the TPM hierarchies.
+// Verify authenticates the opened volume (PCR 15 against record A), checks
+// every public area and the hierarchy lock, and verifies the state store
+// against its manifest and the TPM counter (anti-rollback, anti-splice).
 func Verify(c Config, r Runner) (string, error) {
 	defer os.RemoveAll(c.work())
 	pcr15, err := ReadPCR(r, 15)
@@ -847,16 +1433,15 @@ func Verify(c Config, r Runner) (string, error) {
 		return "", err
 	}
 	if bytes.Equal(pcr15, zero32) {
-		return "", errors.New("PCR 15 is zero: the /var volume key was not measured")
+		return "", errors.New("PCR 15 is zero: the volume key was not measured")
 	}
 	if err := RequireCleanPCR12(r); err != nil {
 		return "", err
 	}
-	first, err := created(c)
+	t, err := newTPM(c, r)
 	if err != nil {
 		return "", err
 	}
-	t := &tpm{c: c, r: r}
 	if err := t.prepare(); err != nil {
 		return "", err
 	}
@@ -867,213 +1452,83 @@ func Verify(c Config, r Runner) (string, error) {
 	if err := t.authorize(f); err != nil {
 		return "", err
 	}
-	defined, err := DefinedIndices(r)
-	if err != nil {
-		return "", err
-	}
-
-	if first {
-		if defined[handleNum(Record.Handle)] || defined[handleNum(Counter.Handle)] {
-			return "", errors.New("NV record/counter index already exists on the first boot")
-		}
-		if err := t.put("p.bin", t.policy); err != nil {
-			return "", err
-		}
-		if err := t.define(Record, "p.bin"); err != nil {
-			return "", err
-		}
-		if err := t.put("pcr15.bin", pcr15); err != nil {
-			return "", err
-		}
-		if _, err := t.session("pcr", "tpm2_nvwrite", Record.Handle, "-C", Record.Handle, "-i", t.w("pcr15.bin")); err != nil {
-			return "", err
-		}
-		if _, err := t.session("pcr", "tpm2_nvwritelock", Record.Handle, "-C", Record.Handle); err != nil {
-			return "", err
-		}
-		if err := t.define(Counter, "p.bin"); err != nil {
-			return "", err
-		}
-		if _, err := t.session("pcr", "tpm2_nvincrement", Counter.Handle, "-C", Counter.Handle); err != nil {
-			return "", err
-		}
-	} else if !defined[handleNum(Record.Handle)] || !defined[handleNum(Counter.Handle)] {
-		return "", errors.New("NV record/counter index missing but /var already existed before this boot")
-	}
-
-	for _, ix := range []Index{Record, Secret, Counter} {
-		if err := t.checkIndex(ix, ix.Final, t.policy); err != nil {
-			return "", err
-		}
-	}
-	nv, err := ReadNV(r, Record)
-	if err != nil {
-		return "", err
-	}
-	if subtle.ConstantTimeCompare(nv, pcr15) != 1 {
-		return "", fmt.Errorf("/var volume does not match NV record %s (PCR 15 %x, recorded %x)", Record.Handle, pcr15, nv)
-	}
-
-	ctr, err := t.rollback(first)
-	if err != nil {
-		return "", err
-	}
-
 	h, err := ReadHierarchy(r)
 	if err != nil {
 		return "", err
 	}
 	if !h.Locked() {
-		// First boot, or a first boot interrupted after provisioning: every
-		// index has just been verified, so finish the lock-down now.
-		if err := lockHierarchies(r, h); err != nil {
+		return "", fmt.Errorf("TPM hierarchies not locked: %+v", h)
+	}
+	provisioned, err := exists(c.ProvisionedFlag())
+	if err != nil {
+		return "", err
+	}
+	name, err := t.saltName()
+	if err != nil {
+		return "", err
+	}
+	if provisioned {
+		t.salted = true // salt key created in this boot by Unlock
+		if err := t.defineWithPolicy(Record, "p.bin", ""); err != nil {
 			return "", err
 		}
-		if h, err = ReadHierarchy(r); err != nil {
+		rd := RecordData{PCR15: pcr15, Epoch: uint64(t.epoch), SaltName: name}
+		if err := t.put("record.bin", rd.bytes()); err != nil {
 			return "", err
 		}
-		if !h.Locked() {
-			return "", fmt.Errorf("TPM hierarchies not locked: %+v", h)
+		if _, err := t.session(sessP, "", "tpm2_nvwrite", Record.Handle, "-C", Record.Handle, "-i", t.w("record.bin"), "-P"); err != nil {
+			return "", err
+		}
+		if _, err := t.session(sessP, "", "tpm2_nvwritelock", Record.Handle, "-C", Record.Handle, "-P"); err != nil {
+			return "", err
 		}
 	}
-
+	b, err := ReadNV(r, Record)
+	if err != nil {
+		return "", err
+	}
+	rd, err := ParseRecord(b)
+	if err != nil {
+		return "", err
+	}
+	if err := t.useSalt(rd.SaltName); err != nil {
+		return "", err
+	}
+	for _, ck := range []struct {
+		ix     Index
+		attrs  uint32
+		policy []byte
+	}{{Record, Record.Final, t.policy}, {Secret, Secret.Final, t.policy}, {Counter, Counter.Final, t.pc}} {
+		if err := t.checkIndex(ck.ix, ck.attrs, ck.policy); err != nil {
+			return "", err
+		}
+	}
+	if subtle.ConstantTimeCompare(rd.PCR15, pcr15) != 1 {
+		return "", fmt.Errorf("volume does not match NV record %s (PCR 15 %x, recorded %x)", Record.Handle, pcr15, rd.PCR15)
+	}
+	keys, err := LoadStateKeys(c)
+	if err != nil {
+		return "", err
+	}
+	var version uint64
+	if err := t.withState(func(root string) error {
+		var verr error
+		version, verr = (&statefs.Store{Root: root, Key: keys.MAC, Counter: counterRT{r, t.c.work(), keys.CounterAuth}}).Verify()
+		return verr
+	}); err != nil {
+		return "", err
+	}
 	if err := os.WriteFile(c.ResultFile(), []byte(hex.EncodeToString(pcr15)+"\n"), 0o600); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(c.CounterFile(), []byte(strconv.FormatUint(ctr, 10)+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(c.CounterFile(), []byte(strconv.FormatUint(version, 10)+"\n"), 0o600); err != nil {
 		return "", err
 	}
-	verb := "verified"
-	if first {
-		verb = "provisioned and verified"
-	}
-	return fmt.Sprintf("/var %s: NV record %s (PCR 15 %x), rollback counter %d, epoch %d, TPM hierarchies locked",
-		verb, Record.Handle, pcr15, ctr, t.epoch), nil
+	return fmt.Sprintf("state volume verified: record %s (PCR 15 %x, provisioned at epoch %d), state version %d, %s/%s epoch %d, TPM locked",
+		Record.Handle, pcr15, rd.Epoch, version, t.id.Role, t.id.Profile, t.epoch), nil
 }
 
-// rollback enforces file value F == counter C (or C+1 after an interrupted
-// update), then advances F and C by one. It returns the final counter.
-func (t *tpm) rollback(first bool) (uint64, error) {
-	mnt := t.c.varMount()
-	if err := os.MkdirAll(mnt, 0o700); err != nil {
-		return 0, err
-	}
-	if _, err := t.run("mount", "-t", "ext4", "-o", "nosuid,nodev,noexec", "/dev/mapper/var", mnt); err != nil {
-		return 0, err
-	}
-	umounted := false
-	defer func() {
-		if !umounted {
-			t.r.Run("umount", mnt) //nolint:errcheck
-		}
-	}()
-	path := filepath.Join(mnt, t.c.RollbackRel)
-	cval, err := ReadUint64(t.r, Counter)
-	if err != nil {
-		return 0, err
-	}
-	var fval uint64
-	b, err := os.ReadFile(path)
-	switch {
-	case err == nil:
-		if fval, err = strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64); err != nil {
-			return 0, fmt.Errorf("bad rollback file: %w", err)
-		}
-	case errors.Is(err, os.ErrNotExist) && first:
-		fval = cval
-	case errors.Is(err, os.ErrNotExist):
-		return 0, errors.New("anti-rollback file missing in an existing /var")
-	default:
-		return 0, err
-	}
-	switch {
-	case fval == cval:
-	case fval == cval+1: // crash between writing F and incrementing C
-		if _, err := t.session("pcr", "tpm2_nvincrement", Counter.Handle, "-C", Counter.Handle); err != nil {
-			return 0, err
-		}
-		cval++
-	case fval < cval:
-		return 0, fmt.Errorf("/var ROLLBACK detected: /var counter %d < TPM counter %d (old snapshot?)", fval, cval)
-	default:
-		return 0, fmt.Errorf("/var counter %d ahead of TPM counter %d", fval, cval)
-	}
-	if err := writeDurable(path, []byte(strconv.FormatUint(cval+1, 10)+"\n")); err != nil {
-		return 0, err
-	}
-	if _, err := t.session("pcr", "tpm2_nvincrement", Counter.Handle, "-C", Counter.Handle); err != nil {
-		return 0, err
-	}
-	if after, err := ReadUint64(t.r, Counter); err != nil || after != cval+1 {
-		return 0, fmt.Errorf("TPM counter did not advance to %d (%d, %v)", cval+1, after, err)
-	}
-	if _, err := t.run("umount", mnt); err != nil {
-		return 0, err
-	}
-	umounted = true
-	return cval + 1, nil
-}
-
-func writeDurable(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	fh, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := fh.Write(data); err != nil {
-		fh.Close()
-		return err
-	}
-	if err := fh.Sync(); err != nil {
-		fh.Close()
-		return err
-	}
-	if err := fh.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
-
-// lockHierarchies disables TPM2_Clear and sets random, discarded
-// authorization values for lockout, owner and endorsement.
-func lockHierarchies(r Runner, h Hierarchy) error {
-	if !h.DisableClear {
-		if _, err := r.Run("tpm2_clearcontrol", "-C", "l", "s"); err != nil {
-			return fmt.Errorf("tpm2_clearcontrol: %w", err)
-		}
-	}
-	for _, hi := range []struct {
-		set  bool
-		name string
-	}{{h.LockoutAuthSet, "l"}, {h.OwnerAuthSet, "o"}, {h.EndorsementAuthSet, "e"}} {
-		if hi.set {
-			continue
-		}
-		b := make([]byte, 32)
-		if _, err := rand.Read(b); err != nil {
-			return err
-		}
-		if _, err := r.Run("tpm2_changeauth", "-c", hi.name, "hex:"+hex.EncodeToString(b)); err != nil {
-			return fmt.Errorf("tpm2_changeauth -c %s: %w", hi.name, err)
-		}
-		for i := range b {
-			b[i] = 0
-		}
-	}
-	return nil
-}
+// ---------------------------------------------------------------- checks
 
 // CurrentPCR11Policy returns PolicyPCR(sha256:11) for the current PCR 11.
 func CurrentPCR11Policy(c Config, r Runner) ([]byte, error) {
@@ -1083,6 +1538,99 @@ func CurrentPCR11Policy(c Config, r Runner) ([]byte, error) {
 	}
 	defer os.RemoveAll(c.work())
 	return t.trial([]string{"tpm2_policypcr", "-l", "sha256:11"})
+}
+
+// SignedPCR11Policies returns every signed PCR 11 policy known to this boot
+// (systemd's .pcrsig and the enklave approved policy).
+func SignedPCR11Policies(pcrsig, cache string) ([]string, error) {
+	var out []string
+	b, err := os.ReadFile(pcrsig)
+	if err != nil {
+		return nil, err
+	}
+	var doc map[string][]struct {
+		Pol string `json:"pol"`
+	}
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return nil, err
+	}
+	for _, e := range doc["sha256"] {
+		out = append(out, e.Pol)
+	}
+	b, err = os.ReadFile(cache)
+	if err != nil {
+		return nil, err
+	}
+	var f tpmpolicy.File
+	if err := json.Unmarshal(b, &f); err != nil {
+		return nil, err
+	}
+	out = append(out, f.PCR11Policy)
+	return out, nil
+}
+
+// Sealed fails unless PCR 11 has left every signed phase (N7: runs after
+// systemd-pcrphase-sysinit, independent of its conditions).
+func Sealed(c Config, r Runner, pcrsig string) (string, error) {
+	cur, err := CurrentPCR11Policy(c, r)
+	if err != nil {
+		return "", err
+	}
+	signed, err := SignedPCR11Policies(pcrsig, c.policyCache())
+	if err != nil {
+		return "", err
+	}
+	for _, s := range signed {
+		if strings.EqualFold(s, hex.EncodeToString(cur)) {
+			return "", fmt.Errorf("PCR 11 still satisfies a signed policy (%s): the sysinit phase was not measured", s)
+		}
+	}
+	return fmt.Sprintf("PCR 11 policy %x matches none of %d signed policies", cur, len(signed)), nil
+}
+
+// Probe tries to read the volume key like root in the running system would.
+// It returns nil only if the key could be read.
+func Probe(c Config, r Runner) error {
+	defer os.RemoveAll(c.work())
+	t, err := newTPM(c, r)
+	if err != nil {
+		return err
+	}
+	if err := t.prepare(); err != nil {
+		return err
+	}
+	f, err := t.cachedPolicy()
+	if err != nil {
+		return err
+	}
+	if pcr11, _, err := f.Decode(t.id.Role, t.id.Profile); err == nil {
+		t.pcr11 = pcr11 // try the signed state even though PCR 11 moved on
+	}
+	if err := t.authorize(f); err != nil {
+		return err
+	}
+	_, err = t.session(sessP, "", "tpm2_nvread", Secret.Handle, "-C", Secret.Handle, "-s", strconv.Itoa(Secret.Size), "-P")
+	return err
+}
+
+// pauseHook is called at a test pause point (overridden in unit tests).
+var pauseHook = func(string) { time.Sleep(time.Hour) }
+
+// ReadCounter returns the TPM state counter (selftest).
+func ReadCounter(c Config, r Runner) (uint64, error) {
+	keys, err := LoadStateKeys(c)
+	if err != nil {
+		return 0, err
+	}
+	t, err := newTPM(c, r)
+	if err != nil {
+		return 0, err
+	}
+	defer os.RemoveAll(c.work())
+	if err := t.prepare(); err != nil {
+		return 0, err
+	}
+	return counterRT{r, c.work(), keys.CounterAuth}.Read()
 }
 
 // MeasureEvent is one record of systemd's userspace TPM measurement log
@@ -1099,8 +1647,7 @@ type MeasureEvent struct {
 	} `json:"content"`
 }
 
-// ReplayPCR replays all sha256 events for pcr in a JSON-SEQ measurement log
-// and returns the resulting value plus the events in order.
+// ReplayPCR replays all sha256 events for pcr in a JSON-SEQ measurement log.
 func ReplayPCR(log []byte, pcr int) ([]byte, []MeasureEvent, error) {
 	v := make([]byte, 32)
 	var evs []MeasureEvent
@@ -1136,32 +1683,11 @@ func ReplayPCR(log []byte, pcr int) ([]byte, []MeasureEvent, error) {
 	return v, evs, nil
 }
 
-// Probe tries to read the /var key the way an attacker with root in the
-// running system would (authorized policy session with the UKI's signed
-// approved policy). It returns nil only if the key could be read, which must
-// never happen after unlock (PCR 11 has left the signed phase and the index
-// is read-locked).
-func Probe(c Config, r Runner) error {
+// SaltName returns the Name of the persistent salt key (selftest).
+func SaltName(c Config, r Runner) ([]byte, error) {
+	if err := os.MkdirAll(c.work(), 0o700); err != nil {
+		return nil, err
+	}
 	defer os.RemoveAll(c.work())
-	t := &tpm{c: c, r: r}
-	if err := t.prepare(); err != nil {
-		return err
-	}
-	b, err := os.ReadFile(c.policyCache())
-	if err != nil {
-		return err
-	}
-	var f tpmpolicy.File
-	if err := json.Unmarshal(b, &f); err != nil {
-		return err
-	}
-	// Use the signed policy even though PCR 11 no longer matches it.
-	if pcr11, _, err := f.Decode(); err == nil {
-		t.pcr11 = pcr11
-	}
-	if err := t.authorize(f); err != nil {
-		return err
-	}
-	_, err = t.session("pcr", "tpm2_nvread", Secret.Handle, "-C", Secret.Handle, "-s", strconv.Itoa(Secret.Size))
-	return err
+	return (&tpm{c: c, r: r}).saltName()
 }

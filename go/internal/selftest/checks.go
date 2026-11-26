@@ -61,7 +61,7 @@ func checkList() []check {
 		}},
 		{"usr_verity", func(root string, _ Runner) (string, error) { return dmUUIDPrefix(root, "/usr", "CRYPT-VERITY-") }},
 		{"usr_readonly", checkUsrRO},
-		{"var_luks", func(root string, _ Runner) (string, error) { return dmUUIDPrefix(root, "/var", "CRYPT-LUKS2-") }},
+		{"var_luks", func(root string, _ Runner) (string, error) { return dmUUIDPrefix(root, stateMount, "CRYPT-LUKS2-") }},
 		{"var_tpm_bound", checkVarTPM},
 		{"var_authenticated", checkVarAuthenticated},
 		{"var_integrity", checkVarIntegrity},
@@ -372,7 +372,7 @@ func checkVersion(root string, _ Runner) (string, error) {
 }
 
 func checkMarker(root string, _ Runner) (string, error) {
-	if _, err := os.Stat(filepath.Join(root, "var/lib/enklave/marker")); err != nil {
+	if _, err := os.Stat(filepath.Join(root, "var/lib/enklave/data/marker")); err != nil {
 		return "", err
 	}
 	return "present", nil
