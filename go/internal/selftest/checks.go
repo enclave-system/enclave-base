@@ -4,14 +4,17 @@
 package selftest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Runner runs external commands (nft, cryptsetup, systemctl).
@@ -24,7 +27,9 @@ type ExecRunner struct{}
 
 // Run executes the command and returns its stdout.
 func (ExecRunner) Run(name string, args ...string) ([]byte, error) {
-	return exec.Command(name, args...).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).Output()
 }
 
 // Result is the outcome of one check.
@@ -242,10 +247,23 @@ func checkVarTPM(root string, r Runner) (string, error) {
 	return dev, nil
 }
 
+// mustNotExist succeeds only if the path definitively does not exist; any
+// other stat error (e.g. ENOTDIR, EACCES) is a failure.
+func mustNotExist(root, rel string) error {
+	_, err := os.Lstat(filepath.Join(root, rel))
+	switch {
+	case err == nil:
+		return fmt.Errorf("/%s exists", rel)
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	}
+	return err
+}
+
 func checkNoPkg(root string, _ Runner) (string, error) {
 	for _, p := range []string{"usr/bin/apt", "usr/bin/apt-get", "usr/bin/dpkg", "var/lib/dpkg"} {
-		if _, err := os.Lstat(filepath.Join(root, p)); err == nil {
-			return "", fmt.Errorf("/%s exists", p)
+		if err := mustNotExist(root, p); err != nil {
+			return "", err
 		}
 	}
 	return "", nil
@@ -298,8 +316,8 @@ func checkNoGetty(_ string, r Runner) (string, error) {
 }
 
 func checkIPv6Absent(root string, _ Runner) (string, error) {
-	if _, err := os.Stat(filepath.Join(root, "proc/net/if_inet6")); err == nil {
-		return "", errors.New("/proc/net/if_inet6 exists")
+	if err := mustNotExist(root, "proc/net/if_inet6"); err != nil {
+		return "", err
 	}
 	return "", nil
 }

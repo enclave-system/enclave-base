@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeRunner struct {
@@ -174,6 +175,9 @@ func TestMissingEverythingNoPanic(t *testing.T) {
 			continue
 		}
 		if r.Check == "ipv6_absent" || r.Check == "no_pkg_manager" {
+			if !r.OK { // definitive ENOENT: absence is ok
+				t.Errorf("%s not ok on empty root: %s", r.Check, r.Detail)
+			}
 			continue
 		}
 		if r.OK {
@@ -316,17 +320,85 @@ func TestArgv0Dispatch(t *testing.T) {
 	}
 }
 
-func TestPowerOffFallback(t *testing.T) {
+func TestPowerOffFallbackRetriesAndLogs(t *testing.T) {
 	r := &fakeRunner{err: map[string]error{"systemctl poweroff --force --force": errors.New("no")}}
-	called := 0
-	powerOff(r, func() error { called++; return nil })
-	if called != 1 {
-		t.Errorf("fallback calls %d", called)
+	called, slept := 0, 0
+	var log bytes.Buffer
+	powerOff(r, func() error { called++; return errors.New("eperm") },
+		func(time.Duration) { slept++ }, &log, time.Second, time.Second, 3)
+	if called != 3 || slept != 3 {
+		t.Errorf("called=%d slept=%d, want 3", called, slept)
+	}
+	if !strings.Contains(log.String(), "systemctl poweroff failed") || !strings.Contains(log.String(), "eperm") {
+		t.Errorf("log: %q", log.String())
 	}
 	r = &fakeRunner{out: map[string]string{"systemctl poweroff --force --force": ""}}
-	powerOff(r, func() error { called++; return nil })
-	if called != 1 {
+	powerOff(r, func() error { called++; return nil }, func(time.Duration) {}, &log, time.Second, time.Second, 3)
+	if called != 3 {
 		t.Errorf("fallback used despite systemctl success")
+	}
+}
+
+type hangRunner struct{ block chan struct{} }
+
+func (h *hangRunner) Run(string, ...string) ([]byte, error) { <-h.block; return nil, nil }
+
+func TestPowerOffSystemctlHangFallsBack(t *testing.T) {
+	h := &hangRunner{block: make(chan struct{})}
+	defer close(h.block)
+	called := 0
+	var log bytes.Buffer
+	powerOff(h, func() error { called++; return nil }, func(time.Duration) {}, &log,
+		20*time.Millisecond, time.Millisecond, 2)
+	if called != 2 || !strings.Contains(log.String(), "timed out") {
+		t.Errorf("called=%d log=%q", called, log.String())
+	}
+}
+
+func TestRequireSecureBootUsageErrorsStillGuard(t *testing.T) {
+	cases := []struct {
+		name    string
+		argv0   string
+		args    func(root string) []string
+		wantOff bool
+		want    int
+	}{
+		{"unknown-flag", "require-secureboot", func(r string) []string { return []string{"--root", r, "--bogus"} }, true, 2},
+		{"stray-positional", "require-secureboot", func(r string) []string { return []string{"--root", r, "stray"} }, true, 2},
+		{"doubled-name", "require-secureboot", func(r string) []string { return []string{"--root", r, "require-secureboot"} }, true, 2},
+		{"subcmd-unknown-flag", "enklave-selftest", func(r string) []string { return []string{"require-secureboot", "--root", r, "--bogus"} }, true, 2},
+		{"log-only-usage", "require-secureboot", func(r string) []string { return []string{"--root", r, "--log-only", "x"} }, false, 2},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			root := t.TempDir()
+			off := 0
+			var errb bytes.Buffer
+			code := Main(c.argv0, c.args(root), &fakeRunner{}, func(Runner) { off++ }, &errb)
+			if code != c.want || (off == 1) != c.wantOff {
+				t.Errorf("code=%d off=%d", code, off)
+			}
+		})
+	}
+	// Secure Boot on + usage error: no poweroff, usage code.
+	root := t.TempDir()
+	put(t, root, sbPath, "\x06\x00\x00\x00\x01")
+	off := 0
+	if code := Main("require-secureboot", []string{"--root", root, "--bogus"}, &fakeRunner{}, func(Runner) { off++ }, &bytes.Buffer{}); code != 2 || off != 0 {
+		t.Errorf("code=%d off=%d", code, off)
+	}
+}
+
+func TestStatErrorsAreNotOk(t *testing.T) {
+	root, r := goodRoot(t)
+	put(t, root, "proc/net", "i am a file") // ENOTDIR for proc/net/if_inet6
+	if x := find(t, RunChecks(root, r), "ipv6_absent"); x.OK || x.Detail == "" {
+		t.Errorf("ipv6_absent: %+v", x)
+	}
+	root, r = goodRoot(t)
+	put(t, root, "usr/bin", "i am a file") // ENOTDIR for usr/bin/apt
+	if x := find(t, RunChecks(root, r), "no_pkg_manager"); x.OK || x.Detail == "" {
+		t.Errorf("no_pkg_manager: %+v", x)
 	}
 }
 
