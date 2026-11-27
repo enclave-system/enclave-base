@@ -91,11 +91,12 @@ func Main(argv0 string, args []string, r Runner, off PowerOff, stderr io.Writer)
 	fs.SetOutput(stderr)
 	out := fs.String("out", "", "output file or device (required)")
 	root := fs.String("root", "/", "filesystem root")
+	forbidDev := fs.Bool("forbid-dev-keys", false, "fail the dev_keys check for images signed with a development PKI")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *out == "" || fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "usage: enklave-selftest --out PATH [--root /] | require-secureboot [--root /] [--log-only]")
+		fmt.Fprintln(stderr, "usage: enklave-selftest --out PATH [--root /] [--forbid-dev-keys] | require-secureboot [--root /] [--log-only]")
 		return 2
 	}
 	w, err := openOut(*out)
@@ -104,7 +105,7 @@ func Main(argv0 string, args []string, r Runner, off PowerOff, stderr io.Writer)
 		return 1
 	}
 	defer w.Close()
-	if WriteResults(w, RunChecks(*root, r)) {
+	if WriteResults(w, RunChecksWith(*root, r, Options{ForbidDevKeys: *forbidDev})) {
 		return 0
 	}
 	return 1

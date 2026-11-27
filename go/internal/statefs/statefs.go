@@ -16,6 +16,7 @@
 //	.manifest.next   prepared manifest of an in-flight commit
 //	.staging/        prepared data tree of an in-flight commit
 //	lost+found/      created by mkfs, ignored
+//	.pcr7            PCR 7 transition record (written and authenticated by varauth)
 //
 // Commit protocol (Exec): copy data -> .staging, run the writer on .staging,
 // write .manifest.next (version+1), exchange data and .staging atomically
@@ -237,6 +238,7 @@ func (s *Store) checkRoot() error {
 	for _, e := range ents {
 		switch e.Name() {
 		case "data", ".manifest", ".manifest.next", ".manifest.tmp", ".manifest.next.tmp", ".staging", ".lock", "lost+found":
+		case ".pcr7", ".pcr7.tmp": // PCR 7 transition record (package varauth, own MAC)
 		default:
 			return fmt.Errorf("unexpected entry %q in the state volume: %w", e.Name(), ErrTampered)
 		}

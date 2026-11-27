@@ -51,7 +51,14 @@ type check struct {
 	fn   func(root string, r Runner) (string, error)
 }
 
-func checkList() []check {
+// Options modify the check list.
+type Options struct {
+	// ForbidDevKeys turns the informational dev_keys check into a failure
+	// for images signed with a development PKI (production acceptance).
+	ForbidDevKeys bool
+}
+
+func checkList(o Options) []check {
 	return []check{
 		{"secureboot", func(root string, _ Runner) (string, error) { return efiBool(root, "SecureBoot", 1) }},
 		{"setupmode_off", func(root string, _ Runner) (string, error) { return efiBool(root, "SetupMode", 0) }},
@@ -66,6 +73,8 @@ func checkList() []check {
 		{"var_authenticated", checkVarAuthenticated},
 		{"var_integrity", checkVarIntegrity},
 		{"var_rollback", checkVarRollback},
+		{"state_readonly", checkStateReadOnly},
+		{"efi_updates", checkEFIUpdates},
 		{"tpm_locked", checkTPMLocked},
 		{"pcr11_sealed", checkPCR11Sealed},
 		{"no_pkg_manager", checkNoPkg},
@@ -78,12 +87,16 @@ func checkList() []check {
 		{"no_credentials", checkNoCredentials},
 		{"role", checkRole},
 		{"version", checkVersion},
+		{"dev_keys", func(root string, _ Runner) (string, error) { return checkDevKeys(root, o.ForbidDevKeys) }},
 	}
 }
 
 // RunChecks runs all checks in the fixed order. The marker check is appended
 // only when the test-profile file exists. It never panics on check errors.
-func RunChecks(root string, r Runner) []Result {
+func RunChecks(root string, r Runner) []Result { return RunChecksWith(root, r, Options{}) }
+
+// RunChecksWith is RunChecks with options.
+func RunChecksWith(root string, r Runner, o Options) []Result {
 	var out []Result
 	run := func(c check) {
 		res := Result{Check: c.name}
@@ -102,7 +115,7 @@ func RunChecks(root string, r Runner) []Result {
 		}()
 		out = append(out, res)
 	}
-	for _, c := range checkList() {
+	for _, c := range checkList(o) {
 		run(c)
 	}
 	if _, err := os.Stat(filepath.Join(root, "usr/lib/enklave/test-profile")); err == nil {

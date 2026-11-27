@@ -311,8 +311,9 @@ func main() {
 	profile := flag.String("profile", "", "prod or test")
 	pkiDir := flag.String("pki", "", "PKI directory (checked for the DEV-KEYS marker)")
 	allowDevProd := flag.Bool("allow-dev-key-for-prod", false, "development only: sign a prod image with dev keys")
+	releasePath := flag.String("release", "", "release.json that went into the image (checked for the dev-key marker and epoch)")
 	flag.Parse()
-	if *uki == "" || *keyPath == "" || *pub == "" || *epoch < 0 || *out == "" || *pkiDir == "" {
+	if *uki == "" || *keyPath == "" || *pub == "" || *epoch < 0 || *out == "" || *pkiDir == "" || *releasePath == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -330,6 +331,23 @@ func main() {
 		die("refusing to sign a prod image with dev keys (%s/DEV-KEYS); use --allow-dev-key-for-prod for development builds only", *pkiDir)
 	case *profile == "prod" && dev:
 		fmt.Fprintln(os.Stderr, "enklave-sign-policy: WARNING: prod image signed with DEV keys (development build, never ship)")
+	}
+	// M2: the image must carry the truth about its keys (verity-protected
+	// release.json, covered by PCR 11 through the usr root hash).
+	rb, err := os.ReadFile(*releasePath)
+	if err != nil {
+		die("%v", err)
+	}
+	var rel tpmpolicy.Release
+	if err := json.Unmarshal(rb, &rel); err != nil {
+		die("%s: %v", *releasePath, err)
+	}
+	if rel.DevKeys != dev {
+		die("%s says dev_keys=%v but %s is %sa DEV-KEYS PKI: refusing to sign an image with a wrong dev-key marker",
+			*releasePath, rel.DevKeys, *pkiDir, map[bool]string{true: "", false: "not "}[dev])
+	}
+	if rel.Epoch != *epoch {
+		die("%s is for epoch %d, signing for epoch %d", *releasePath, rel.Epoch, *epoch)
 	}
 	tmp, err := os.MkdirTemp("", "enklave-sign-policy")
 	if err != nil {
@@ -390,12 +408,16 @@ func main() {
 		die("%v", err)
 	}
 	doc := tpmpolicy.File{Version: 2, Role: *role, Profile: *profile, Epoch: *epoch, PCR11Policy: hex.EncodeToString(pol),
-		Approved: hex.EncodeToString(approved), Ref: ref, Signature: base64.StdEncoding.EncodeToString(signature)}
+		Approved: hex.EncodeToString(approved), Ref: ref, Signature: base64.StdEncoding.EncodeToString(signature), DevKeys: dev}
 	b, _ := json.MarshalIndent(doc, "", "  ")
 	if err := os.WriteFile(*out, append(b, '\n'), 0o644); err != nil {
 		die("%v", err)
 	}
-	fmt.Printf("enklave-sign-policy: %s: phase %s proven, ref %s, epoch %d, approved %x\n", filepath.Base(*uki), phase, ref, *epoch, approved)
+	keys := "production keys"
+	if dev {
+		keys = "DEV KEYS"
+	}
+	fmt.Printf("enklave-sign-policy: %s: phase %s proven, ref %s, epoch %d, %s, approved %x\n", filepath.Base(*uki), phase, ref, *epoch, keys, approved)
 	if *image != "" {
 		n := strings.TrimSuffix(filepath.Base(*uki), ".efi") + ".json"
 		if err := embed(*image, *out, n); err != nil {

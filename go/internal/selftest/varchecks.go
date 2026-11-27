@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"enklave.local/base/internal/sbstate"
+	"enklave.local/base/internal/tpmpolicy"
 	"enklave.local/base/internal/varauth"
 )
 
@@ -26,6 +28,12 @@ func varConfig(root string) varauth.Config {
 	c.TestMarker = filepath.Join(root, "usr/lib/enklave/test-profile")
 	c.ReleaseFile = filepath.Join(root, "usr/lib/enklave/release.json")
 	c.StateRoot = filepath.Join(root, "var/lib/enklave")
+	c.EKCADir = filepath.Join(root, "usr/share/enklave/tpm-ek-ca")
+	c.EKTestCADir = filepath.Join(root, "usr/share/enklave/tpm-ek-ca-test")
+	c.EKAllowlist = filepath.Join(root, "usr/lib/enklave/ek-allowlist")
+	c.UpdatesDir = filepath.Join(root, "usr/lib/enklave/efi-updates")
+	c.EventLog = filepath.Join(root, "sys/kernel/security/tpm0/binary_bios_measurements")
+	c.EFI = sbstate.EFIVarFS{Dir: filepath.Join(root, "sys/firmware/efi/efivars")}
 	return c
 }
 
@@ -94,9 +102,12 @@ func checkVarTPM(root string, r Runner) (string, error) {
 }
 
 // checkVarAuthenticated: every NV index has its pinned public area and
-// policy (bound to this role/profile), record A matches the verified PCR 15
-// and the salt key, and the measurement log replays to the live PCR 15 with
-// the volume key of the mounted state volume as first event.
+// policy (bound to this role/profile); the PCR policy index holds the Secure
+// Boot state of this boot (or this boot chain during a signed variable
+// update); record A matches the verified PCR 15 and the salt key; the salt
+// key is the endorsement key certified by a TPM vendor CA (or allowlisted);
+// and the measurement log replays to the live PCR 15 with the volume key of
+// the mounted state volume as first event.
 func checkVarAuthenticated(root string, r Runner) (string, error) {
 	c := varConfig(root)
 	p, err := varauth.ExpectedPolicies(c, r)
@@ -106,7 +117,7 @@ func checkVarAuthenticated(root string, r Runner) (string, error) {
 	for _, ck := range []struct {
 		ix     varauth.Index
 		policy []byte
-	}{{varauth.Record, p.P}, {varauth.Secret, p.P}, {varauth.Counter, p.PC}, {varauth.Epoch, p.PE}} {
+	}{{varauth.Record, p.P}, {varauth.Secret, p.P}, {varauth.Counter, p.PC}, {varauth.Epoch, p.PE}, {varauth.PCRPolicy, p.VAuth}} {
 		pub, err := varauth.ReadPublic(r, ck.ix)
 		if err != nil {
 			return "", err
@@ -114,6 +125,18 @@ func checkVarAuthenticated(root string, r Runner) (string, error) {
 		if err := varauth.CheckPublic(ck.ix, pub, ck.ix.Final, ck.policy); err != nil {
 			return "", err
 		}
+	}
+	v, err := varauth.ReadNV(r, varauth.PCRPolicy)
+	if err != nil {
+		return "", err
+	}
+	binding := "PCR 7+12"
+	switch {
+	case bytes.Equal(v, p.Steady):
+	case bytes.Equal(v, p.Bridge):
+		binding = "PCR 0+2+4+12 (Secure Boot variable update pending)"
+	default:
+		return "", fmt.Errorf("PCR policy index holds %x, want the Secure Boot state of this boot (%x)", v, p.Steady)
 	}
 	b, err := varauth.ReadNV(r, varauth.Record)
 	if err != nil {
@@ -130,7 +153,7 @@ func checkVarAuthenticated(root string, r Runner) (string, error) {
 	if rec != hex.EncodeToString(rd.PCR15) {
 		return "", fmt.Errorf("record PCR 15 %x, verified %s", rd.PCR15, rec)
 	}
-	salt, err := varauth.SaltName(c, r)
+	salt, saltSource, err := varauth.SaltName(c, r)
 	if err != nil {
 		return "", err
 	}
@@ -174,8 +197,8 @@ func checkVarAuthenticated(root string, r Runner) (string, error) {
 		strings.ToLower(strings.ReplaceAll(uuid, "-", "")) != strings.ToLower(parts[2]) {
 		return "", fmt.Errorf("first PCR 15 event %q is not the volume key of the mounted state volume (%s)", first, parts[2])
 	}
-	return fmt.Sprintf("NV indices pinned, record %s (provisioned at epoch %d), salt key pinned, PCR 15 replayed (%d events, first %s)",
-		rec, rd.Epoch, len(evs), first), nil
+	return fmt.Sprintf("NV indices pinned, policy bound to %s, record %s (provisioned at epoch %d), salt key = EK authenticated by %s, PCR 15 replayed (%d events, first %s)",
+		binding, rec, rd.Epoch, saltSource, len(evs), first), nil
 }
 
 // checkVarIntegrity: LUKS2 with authenticated encryption and argon2id.
@@ -223,7 +246,8 @@ func checkVarRollback(root string, r Runner) (string, error) {
 }
 
 // checkTPMLocked: owner/endorsement/lockout auth set, Clear disabled, the
-// platform hierarchy disabled (or held by firmware auth).
+// platform hierarchy disabled (or held by firmware auth), dictionary-attack
+// lockout disabled.
 func checkTPMLocked(root string, r Runner) (string, error) {
 	h, err := varauth.ReadHierarchy(r)
 	if err != nil {
@@ -242,7 +266,18 @@ func checkTPMLocked(root string, r Runner) (string, error) {
 	default:
 		return "", fmt.Errorf("platform hierarchy state %q with phEnable=%v", ps, h.PhEnable)
 	}
-	return "ownerAuthSet lockoutAuthSet endorsementAuthSet disableClear, platform " + ps, nil
+	// The endorsement key (salt key) is DA protected; a TPM in lockout
+	// refuses salted sessions. enklave disables the lockout (no enklave
+	// secret is a guessable authValue).
+	da, err := varauth.ReadDA(r)
+	if err != nil {
+		return "", err
+	}
+	if da.InLockout || da.Interval != 0 {
+		return "", fmt.Errorf("TPM dictionary-attack lockout not disabled (in lockout: %v, counter %d of %d, recovery time %d s)",
+			da.InLockout, da.Counter, da.MaxTries, da.Interval)
+	}
+	return "ownerAuthSet lockoutAuthSet endorsementAuthSet disableClear, DA lockout disabled, platform " + ps, nil
 }
 
 // checkPCR11Sealed: PCR 11 has left every signed phase.
@@ -262,4 +297,60 @@ func checkPCR11Sealed(root string, r Runner) (string, error) {
 		}
 	}
 	return fmt.Sprintf("current PCR 11 policy %x matches none of %d signed", cur, len(signed)), nil
+}
+
+// checkEFIUpdates: every signed Secure Boot variable update shipped by this
+// release (dbx revocations, db/KEK appends) is in the firmware and no PCR 7
+// transition is pending.
+func checkEFIUpdates(root string, _ Runner) (string, error) {
+	s, err := readTrim(root, "run/enklave/efi-updates")
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(s, "current") {
+		return "", errors.New(s)
+	}
+	return s, nil
+}
+
+// checkStateReadOnly: the state volume is mounted read-only; only
+// "enklave-varauth state-exec" writes it, in a private mount namespace.
+func checkStateReadOnly(root string, _ Runner) (string, error) {
+	m, err := findMount(root, stateMount)
+	if err != nil {
+		return "", err
+	}
+	for _, o := range strings.Split(m.opts, ",") {
+		if o == "ro" {
+			return m.opts, nil
+		}
+	}
+	return "", fmt.Errorf("%s mounted with options %q, not ro", stateMount, m.opts)
+}
+
+// checkDevKeys reports whether the image was signed with a development PKI.
+// It is informational (test-profile images are always dev-signed) unless
+// forbidDev is set: production acceptance runs the selftest with
+// --forbid-dev-keys and rejects such builds. A test-profile image that
+// claims production keys is always an error (the build refuses to sign it).
+func checkDevKeys(root string, forbidDev bool) (string, error) {
+	b, err := os.ReadFile(filepath.Join(root, "usr/lib/enklave/release.json"))
+	if err != nil {
+		return "", err
+	}
+	var rel tpmpolicy.Release
+	if err := json.Unmarshal(b, &rel); err != nil {
+		return "", err
+	}
+	_, terr := os.Stat(filepath.Join(root, "usr/lib/enklave/test-profile"))
+	test := terr == nil
+	switch {
+	case rel.DevKeys && forbidDev:
+		return "", errors.New("DEV KEYS: development build signed with a DEV-KEYS PKI, must not be deployed")
+	case rel.DevKeys:
+		return "DEV KEYS (development build, never ship)", nil
+	case test:
+		return "", errors.New("test-profile image without the dev-key marker")
+	}
+	return "production keys", nil
 }

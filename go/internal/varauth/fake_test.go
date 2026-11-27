@@ -2,18 +2,29 @@ package varauth
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"enklave.local/base/internal/ekcert"
+	"enklave.local/base/internal/sbstate/sbtest"
 	"enklave.local/base/internal/tpmpolicy"
 )
 
@@ -57,31 +68,54 @@ type fakeTPM struct {
 	h          map[string]*hierarchy
 	disClear   bool
 	phEnable   bool
-	pers       map[uint64][]byte
-	ownerSeed  string
+	pers       map[uint64][]byte // persistent objects: TPM2B_PUBLIC
+	ek         *ecdsa.PrivateKey // derived from the endorsement seed
 	luks       map[string][]byte
 	stateDir   string
 	repart     string
 	fail       map[string]error
 	calls      []string
 	violations []string
+	// noAuthorizeNV models a TPM older than library revision 1.38.
+	noAuthorizeNV bool
+	// Dictionary-attack state (defaults of swtpm). The endorsement key is DA
+	// protected: after it was used as a salt key, a power cut without
+	// TPM2_Shutdown counts as a failed authorization.
+	daCounter, daMax, daInterval, daRecovery uint64
+	daUsed                                   bool
+	// mitm, if set, rewrites every TPM2_ReadPublic response for a persistent
+	// key (an active bus interposer); readPubs counts the responses.
+	mitm     func(n int, real []byte) []byte
+	readPubs int
+}
+
+// readPublic is what the host sees for TPM2_ReadPublic of a persistent key.
+func (f *fakeTPM) readPublic(handle uint64) []byte {
+	real := f.pers[handle]
+	if real == nil || f.mitm == nil {
+		return real
+	}
+	f.readPubs++
+	return f.mitm(f.readPubs, real)
 }
 
 func newFakeTPM(t *testing.T, stateDir string) *fakeTPM {
 	return &fakeTPM{
 		t: t,
 		pcr: map[int][]byte{
+			0: bytes.Repeat([]byte{0xf0}, 32), 2: bytes.Repeat([]byte{0xf2}, 32), 4: bytes.Repeat([]byte{0xf4}, 32),
 			7: bytes.Repeat([]byte{7}, 32), 11: bytes.Repeat([]byte{11}, 32),
 			12: make([]byte, 32), 15: make([]byte, 32),
 		},
 		nv: map[uint64]*nvIdx{}, sess: map[string]*fsess{}, tickets: map[string]ticket{},
-		h:         map[string]*hierarchy{"o": {}, "e": {}, "l": {}, "p": {auth: "firmware"}},
-		phEnable:  true,
-		pers:      map[uint64][]byte{},
-		ownerSeed: "seed-1",
-		luks:      map[string][]byte{},
-		stateDir:  stateDir,
-		repart:    `[{"type":"var","activity":"create"}]`,
+		h:        map[string]*hierarchy{"o": {}, "e": {}, "l": {}, "p": {auth: "firmware"}},
+		phEnable: true,
+		pers:     map[uint64][]byte{},
+		ek:       newEKKey(),
+		daMax:    3, daInterval: 1000, daRecovery: 1000,
+		luks:     map[string][]byte{},
+		stateDir: stateDir,
+		repart:   `[{"type":"var","activity":"create"}]`,
 	}
 }
 
@@ -93,11 +127,48 @@ func h(parts ...[]byte) []byte {
 	return s.Sum(nil)
 }
 
-func fakeName(handle uint64, attrs uint32, policy []byte) []byte {
-	var b [8]byte
-	binary.BigEndian.PutUint32(b[:4], uint32(handle))
-	binary.BigEndian.PutUint32(b[4:], attrs)
-	return append([]byte{0, 0x0b}, h(b[:], policy)...)
+func newEKKey() *ecdsa.PrivateKey {
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	return k
+}
+
+// ekPublic is the TPM2B_PUBLIC of the endorsement key the TPM derives.
+func (f *fakeTPM) ekPublic() []byte {
+	k, err := ekcert.FromPublicKey(&f.ek.PublicKey)
+	if err != nil {
+		panic(err)
+	}
+	return k.TPM2B()
+}
+
+// powerCut models a power loss (no TPM2_Shutdown) followed by TPM2_Startup.
+func (f *fakeTPM) powerCut() {
+	if f.daUsed && f.daInterval != 0 {
+		f.daCounter++
+	}
+	f.daUsed = false
+}
+
+func (f *fakeTPM) inLockout() bool { return f.daInterval != 0 && f.daCounter >= f.daMax }
+
+// nvName is the real TPM Name of an index.
+func nvName(handle uint64, ix *nvIdx) []byte {
+	return tpmpolicy.NVName(uint32(handle), ix.attrs, ix.policy, ix.size)
+}
+
+var ccCodes = map[string]uint32{"TPM2_CC_NV_ChangeAuth": tpmpolicy.CCNVChangeAuth, "TPM2_CC_NV_SetBits": tpmpolicy.CCNVSetBits}
+
+// pcrConcat returns the values of a "sha256:a,b,c" selection.
+func (f *fakeTPM) pcrConcat(sel string) []byte {
+	var out []byte
+	for _, s := range strings.Split(strings.TrimPrefix(sel, "sha256:"), ",") {
+		n, _ := strconv.Atoi(s)
+		out = append(out, f.pcr[n]...)
+	}
+	return out
 }
 
 func fakePol11(pcr11 []byte) []byte { return h([]byte("pcr11"), make([]byte, 32), pcr11) }
@@ -216,9 +287,29 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 			ns.policy = false
 		}
 		if c := arg(args, "-c"); c != "" {
-			if f.pers[handleNum(c)] == nil {
+			// The salt is encrypted to the public key the host holds for the
+			// handle: the one inside a serialized ESYS_TR, or, for a raw
+			// handle, whatever ESYS's own TPM2_ReadPublic returns.
+			var handle uint64
+			var seen []byte
+			if strings.HasPrefix(c, "0x") {
+				handle = handleNum(c)
+				seen = f.readPublic(handle)
+			} else {
+				tr := f.read(c)
+				handle = uint64(binary.BigEndian.Uint32(tr[:4]))
+				seen = tr[4+2+34+4:]
+			}
+			if f.pers[handle] == nil {
 				return nil, errors.New("TPM_RC_HANDLE (salt key)")
 			}
+			if !bytes.Equal(seen, f.pers[handle]) {
+				f.violate("session salted to a substituted key (bus interposer learns the session key)")
+			}
+			if f.inLockout() {
+				return nil, errors.New("TPM_RC_LOCKOUT 0x921: the TPM is in DA lockout mode")
+			}
+			f.daUsed = true
 			ns.salted = true
 			ns.dec, ns.encr = true, true // tpm2_startauthsession -c enables both
 		}
@@ -251,19 +342,33 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 		s.d = h([]byte("authorize"), []byte(ref))
 		return hexOut(s.d), nil
 	case "tpm2_policypcr":
-		if arg(args, "-l") == "sha256:11" {
+		sel := arg(args, "-l")
+		if sel == "sha256:11" {
 			s.d = h([]byte("pcr11"), s.d, f.pcr[11])
 			return hexOut(s.d), nil
 		}
 		vals := f.read(arg(args, "-f"))
-		if s.policy && !bytes.Equal(vals, append(append([]byte{}, f.pcr[7]...), f.pcr[12]...)) {
+		if s.policy && !bytes.Equal(vals, f.pcrConcat(sel)) {
 			return nil, errors.New("TPM_RC_VALUE (pcr)")
 		}
-		s.d = h([]byte("p"), s.d, vals)
+		s.d = h([]byte("p"), []byte(sel), s.d, vals)
+		return hexOut(s.d), nil
+	case "tpm2_policyauthorizenv":
+		ix, n, err := f.nvIndex(args[len(args)-1])
+		if err != nil {
+			return nil, err
+		}
+		if ix.attrs&attrWritten == 0 {
+			return nil, errors.New("TPM_RC_NV_UNINITIALIZED")
+		}
+		if s.policy && !bytes.Equal(ix.data, tpmpolicy.DigestNV(s.d)) {
+			return nil, errors.New("TPM_RC_VALUE 0x84 (policy does not match the NV index)")
+		}
+		s.d = tpmpolicy.PolicyAuthorizeNV(nvName(n, ix))
 		return hexOut(s.d), nil
 	case "tpm2_policycommandcode":
 		s.cc = args[len(args)-1]
-		s.d = h([]byte("cc"), s.d, []byte(s.cc))
+		s.d = tpmpolicy.PolicyCommandCode(s.d, ccCodes[s.cc])
 		return hexOut(s.d), nil
 	case "tpm2_policynvwritten":
 		s.d = h([]byte("nw"), s.d)
@@ -284,7 +389,7 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 		if s.policy && !ok {
 			return nil, errors.New("TPM_RC_VALUE (policyor)")
 		}
-		s.d = h(append([][]byte{[]byte("or")}, bs...)...)
+		s.d = tpmpolicy.PolicyOR(bs...)
 		return hexOut(s.d), nil
 	case "tpm2_policynv":
 		op := f.read(arg(args, "-i"))
@@ -295,7 +400,7 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 		if s.policy && binary.BigEndian.Uint64(eix.data)&binary.BigEndian.Uint64(op) != 0 {
 			return nil, errors.New("TPM_RC_POLICY 0x126 (bit set)")
 		}
-		s.d = tpmpolicy.PolicyNV(s.d, op, 0, 0x000B, fakeName(handleNum(Epoch.Handle), eix.attrs, eix.policy))
+		s.d = tpmpolicy.PolicyNV(s.d, op, 0, 0x000B, nvName(handleNum(Epoch.Handle), eix))
 		return nil, nil
 	case "tpm2_verifysignature":
 		msg, sig := f.read(arg(args, "-m")), f.read(arg(args, "-s"))
@@ -307,6 +412,11 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 	case "tpm2_getcap":
 		var b strings.Builder
 		switch args[0] {
+		case "commands":
+			b.WriteString("TPM2_CC_PolicyAuthorizeNV:\n  value: 0x6000192\n")
+			if f.noAuthorizeNV {
+				b.Reset()
+			}
 		case "handles-nv-index":
 			for n := range f.nv {
 				fmt.Fprintf(&b, "- 0x%X\n", n)
@@ -323,11 +433,27 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 				return 0
 			}
 			fmt.Fprintf(&b, "TPM2_PT_PERMANENT:\n  ownerAuthSet:              %d\n  endorsementAuthSet:        %d\n"+
-				"  lockoutAuthSet:            %d\n  reserved1:                 0\n  disableClear:              %d\n"+
-				"TPM2_PT_STARTUP_CLEAR:\n  phEnable:                  %d\n  shEnable:                  1\n",
-				v(f.h["o"].auth != ""), v(f.h["e"].auth != ""), v(f.h["l"].auth != ""), v(f.disClear), v(f.phEnable))
+				"  lockoutAuthSet:            %d\n  reserved1:                 0\n  disableClear:              %d\n  inLockout:                 %d\n"+
+				"TPM2_PT_STARTUP_CLEAR:\n  phEnable:                  %d\n  shEnable:                  1\n"+
+				"TPM2_PT_LOCKOUT_COUNTER: 0x%X\nTPM2_PT_MAX_AUTH_FAIL: 0x%X\nTPM2_PT_LOCKOUT_INTERVAL: 0x%X\nTPM2_PT_LOCKOUT_RECOVERY: 0x%X\n",
+				v(f.h["o"].auth != ""), v(f.h["e"].auth != ""), v(f.h["l"].auth != ""), v(f.disClear), v(f.inLockout()), v(f.phEnable),
+				f.daCounter, f.daMax, f.daInterval, f.daRecovery)
 		}
 		return []byte(b.String()), nil
+	case "tpm2_dictionarylockout":
+		// lockout hierarchy authorization; a policy session works in lockout too
+		l := f.h["l"]
+		if _, err := f.authEntity(arg(args, "-p"), l.auth, l.policy, ""); err != nil {
+			return nil, err
+		}
+		if args[0] == "-c" {
+			f.daCounter = 0
+			return nil, nil
+		}
+		f.daMax, _ = strconv.ParseUint(arg(args, "-n"), 10, 64)
+		f.daInterval, _ = strconv.ParseUint(arg(args, "-t"), 10, 64)
+		f.daRecovery, _ = strconv.ParseUint(arg(args, "-l"), 10, 64)
+		return nil, nil
 	case "tpm2_hierarchycontrol":
 		if f.h["p"].auth != "" {
 			return nil, errors.New("exit status 1 (ERROR: Esys_HierarchyControl(0x9A2) - tpm:session(1):authorization failure without DA implications)")
@@ -387,11 +513,15 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 		ix.auth = newAuth
 		return nil, nil
 	case "tpm2_createprimary":
-		o := f.h["o"]
-		if _, err := f.authEntity(arg(args, "-P"), o.auth, o.policy, ""); err != nil {
+		hi := f.h[arg(args, "-C")]
+		if _, err := f.authEntity(arg(args, "-P"), hi.auth, hi.policy, ""); err != nil {
 			return nil, err
 		}
-		return nil, os.WriteFile(arg(args, "-c"), []byte(f.ownerSeed), 0o600)
+		if arg(args, "-C") != "e" || arg(args, "-G") != "ecc256:aes128cfb" || !bytes.Equal(f.read(arg(args, "-L")), ekcert.PolicyA) {
+			// only the ECC EK exists in this model; another template yields another key
+			return nil, os.WriteFile(arg(args, "-c"), []byte("OTHER"), 0o600)
+		}
+		return nil, os.WriteFile(arg(args, "-c"), f.ekPublic(), 0o600)
 	case "tpm2_evictcontrol":
 		o := f.h["o"]
 		if _, err := f.authEntity(arg(args, "-P"), o.auth, o.policy, ""); err != nil {
@@ -408,14 +538,23 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 				target = a
 			}
 		}
-		f.pers[handleNum(target)] = append([]byte{0, 0x0b}, h([]byte("salt"), f.read(c))...)
+		f.pers[handleNum(target)] = f.read(c)
 		return nil, nil
 	case "tpm2_readpublic":
-		n := f.pers[handleNum(arg(args, "-c"))]
-		if n == nil {
+		var pub []byte
+		if c := arg(args, "-c"); strings.HasPrefix(c, "0x") {
+			pub = f.readPublic(handleNum(c))
+		} else {
+			pub = f.read(c) // transient object context
+			if f.mitm != nil {
+				f.readPubs++
+				pub = f.mitm(f.readPubs, pub)
+			}
+		}
+		if pub == nil {
 			return nil, errors.New("TPM_RC_HANDLE")
 		}
-		return nil, os.WriteFile(arg(args, "-n"), n, 0o600)
+		return nil, os.WriteFile(arg(args, "-o"), pub, 0o600)
 	case "tpm2_nvdefine":
 		n := handleNum(args[0])
 		if f.nv[n] != nil {
@@ -444,7 +583,17 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 		auth := arg(args, "-P")
 		readAuthFree := name == "tpm2_nvread" && ix.attrs&attrAuthRead != 0 && auth == ""
 		var sx *fsess
-		if !readAuthFree {
+		if arg(args, "-C") == "o" { // owner authorization
+			if name != "tpm2_nvwrite" || ix.attrs&attrOwnerWrite == 0 {
+				return nil, errors.New("TPM_RC_NV_AUTHORIZATION (owner)")
+			}
+			if sx, err = f.authEntity(auth, f.h["o"].auth, f.h["o"].policy, ""); err != nil {
+				return nil, err
+			}
+		} else if !readAuthFree {
+			if ix.attrs&attrOwnerWrite != 0 && name != "tpm2_nvread" {
+				return nil, errors.New("TPM_RC_NV_AUTHORIZATION (index auth cannot write an owner-write index)")
+			}
 			if sx, err = f.authEntity(auth, ix.auth, ix.policy, ""); err != nil {
 				return nil, err
 			}
@@ -503,7 +652,7 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 		}
 		return []byte(fmt.Sprintf("0x%x:\n  name: %x\n  hash algorithm:\n    friendly: sha256\n    value: 0xB\n"+
 			"  attributes:\n    friendly: x\n    value: 0x%X\n  size: %d\n  authorization policy: %X\n\n",
-			n, fakeName(n, ix.attrs, ix.policy), ix.attrs, ix.size, ix.policy)), nil
+			n, nvName(n, ix), ix.attrs, ix.size, ix.policy)), nil
 	case "cryptsetup":
 		dev := args[len(args)-1]
 		switch args[0] {
@@ -543,24 +692,85 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 
 // ----------------------------------------------------------------- env
 
+// testCA issues the EK certificates of the fake TPMs ("TPM vendor").
+type testCA struct {
+	cert *x509.Certificate
+	key  *ecdsa.PrivateKey
+}
+
+var (
+	vendorOnce sync.Once
+	vendor     *testCA
+	testNow    = time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+)
+
+func newTestCA(cn string) *testCA {
+	key := newEKKey()
+	tpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: cn},
+		NotBefore: testNow.Add(-24 * time.Hour), NotAfter: testNow.Add(24 * time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	c, _ := x509.ParseCertificate(der)
+	return &testCA{c, key}
+}
+
+func vendorCA() *testCA {
+	vendorOnce.Do(func() { vendor = newTestCA("fake TPM vendor EK CA") })
+	return vendor
+}
+
+// ekCertificate issues an EK certificate like TPM vendors do (critical
+// directoryName subjectAltName, EK extended key usage).
+func (ca *testCA) ekCertificate(pub *ecdsa.PublicKey) []byte {
+	name, _ := asn1.Marshal(pkix.Name{CommonName: "fake tpm"}.ToRDNSequence())
+	san, _ := asn1.Marshal([]asn1.RawValue{{Class: asn1.ClassContextSpecific, Tag: 4, IsCompound: true, Bytes: name}})
+	tpl := &x509.Certificate{SerialNumber: big.NewInt(2), NotBefore: testNow.Add(-time.Hour), NotAfter: testNow.Add(time.Hour),
+		KeyUsage:           x509.KeyUsageKeyAgreement,
+		UnknownExtKeyUsage: []asn1.ObjectIdentifier{{2, 23, 133, 8, 1}},
+		ExtraExtensions:    []pkix.Extension{{Id: asn1.ObjectIdentifier{2, 5, 29, 17}, Critical: true, Value: san}}}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, ca.cert, pub, ca.key)
+	if err != nil {
+		panic(err)
+	}
+	return der
+}
+
+// setEKCert stores an EK certificate in the ECC EK certificate index (padded
+// like a fixed-size NV index); nil removes the index.
+func (f *fakeTPM) setEKCert(der []byte) {
+	n := handleNum(ekcert.ECC.CertHandle())
+	if der == nil {
+		delete(f.nv, n)
+		return
+	}
+	data := append(append([]byte{}, der...), make([]byte, 64)...)
+	f.nv[n] = &nvIdx{attrs: attrAuthRead | attrNoDA | attrWritten, data: data, size: len(data)}
+}
+
 type env struct {
 	c   Config
 	f   *fakeTPM
+	fw  *sbtest.Firmware
 	dev string
+	// pcr7, if set, overrides the PCR 7 the firmware would produce
+	pcr7 []byte
 }
 
 func refOf(role, profile string) string { r, _ := tpmpolicy.Ref(role, profile); return r }
 
 func fakePE(ref string) []byte {
 	b1 := h([]byte("authorize"), []byte(ref))
-	b2 := h([]byte("nw"), h([]byte("cc"), make([]byte, 32), []byte("TPM2_CC_NV_SetBits")))
-	return h([]byte("or"), b1, b2)
+	b2 := h([]byte("nw"), tpmpolicy.PolicyCommandCode(make([]byte, 32), tpmpolicy.CCNVSetBits))
+	return tpmpolicy.PolicyOR(b1, b2)
 }
 
 func signed(t *testing.T, pcr11 []byte, epoch int, role, profile string) tpmpolicy.File {
 	t.Helper()
 	ref := refOf(role, profile)
-	eName := fakeName(handleNum(Epoch.Handle), Epoch.Final, fakePE(ref))
+	eName := tpmpolicy.NVName(uint32(handleNum(Epoch.Handle)), Epoch.Final, fakePE(ref), Epoch.Size)
 	approved, err := tpmpolicy.Approved(fakePol11(pcr11), epoch, eName)
 	if err != nil {
 		t.Fatal(err)
@@ -576,8 +786,17 @@ func newEnv(t *testing.T, profile string) *env {
 		RunDir: filepath.Join(d, "run"), PubKey: filepath.Join(d, "pub.pem"), PolicyDir: "EFI/enklave/policy",
 		RoleFile: filepath.Join(d, "usr/role"), TestMarker: filepath.Join(d, "usr/test-profile"),
 		ReleaseFile: filepath.Join(d, "usr/release.json"), StateRoot: filepath.Join(d, "state"),
+		EKCADir: filepath.Join(d, "usr/tpm-ek-ca"), EKTestCADir: filepath.Join(d, "usr/tpm-ek-ca-test"),
+		EKAllowlist: filepath.Join(d, "usr/ek-allowlist"), UpdatesDir: filepath.Join(d, "usr/efi-updates"),
+		EventLog: filepath.Join(d, "sys/binary_bios_measurements"),
+		Now:      func() time.Time { return testNow },
 	}
-	e := &env{c: c, f: newFakeTPM(t, c.stateMount()), dev: "/dev/vda8"}
+	e := &env{c: c, f: newFakeTPM(t, c.stateMount()), fw: sbtest.NewFirmware(), dev: "/dev/vda8"}
+	e.c.EFI = e.fw
+	os.MkdirAll(filepath.Join(c.EKCADir, "Vendor/RootCA"), 0o755)
+	os.MkdirAll(filepath.Dir(c.EventLog), 0o755)
+	os.WriteFile(filepath.Join(c.EKCADir, "Vendor/RootCA/ca.cer"), vendorCA().cert.Raw, 0o644)
+	e.f.setEKCert(vendorCA().ekCertificate(&e.f.ek.PublicKey))
 	e.setImage(t, "ref", profile, 0, 0)
 	return e
 }
@@ -609,14 +828,25 @@ func (e *env) install(t *testing.T, p tpmpolicy.File) {
 // boot runs repart, unlock and verify like the units do (fresh /run).
 func (e *env) boot(t *testing.T) error {
 	t.Helper()
+
 	for _, p := range []string{e.c.CreatedFlag(), e.c.ProvisionedFlag(), e.c.policyCache(), e.c.ResultFile(),
-		e.c.CounterFile(), e.c.StateKeyFile(), e.c.PlatformFile()} {
+		e.c.CounterFile(), e.c.StateKeyFile(), e.c.PlatformFile(), e.c.EFIUpdatesFile(), e.c.SaltSourceFile(),
+		filepath.Join(e.c.RunDir, "test-pause")} {
 		os.Remove(p)
 	}
 	for _, ix := range e.f.nv {
 		ix.attrs &^= attrReadLocked
 	}
 	e.f.pcr[15] = make([]byte, 32)
+	// the firmware measures the Secure Boot variables of this boot into PCR 7
+	log, pcr7 := e.fw.Boot()
+	if err := os.WriteFile(e.c.EventLog, log, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if e.pcr7 != nil {
+		pcr7 = e.pcr7 // PCR 7 not explained by the event log
+	}
+	e.f.pcr[7] = pcr7
 	if err := Repart(e.c, e.f, []string{"--dry-run=no"}); err != nil {
 		return fmt.Errorf("repart: %w", err)
 	}

@@ -1,14 +1,25 @@
 package selftest
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"enklave.local/base/internal/ekcert"
+	"enklave.local/base/internal/tpmpolicy"
 )
 
 const (
@@ -17,23 +28,70 @@ const (
 	hierCmd       = "tpm2_getcap properties-variable"
 	luksUUID      = "6f2fbea9-8c8b-4fd0-afd1-ce8615ab7632"
 
+	pcrPolicyReadCmd = "tpm2_nvread 0x01800E05 -C 0x01800E05 -s 34"
+	ekCertReadCmd    = "tpm2_nvread 0x01C0000A -C 0x01C0000A"
+
 	goodLuksDump = "LUKS header information\nVersion:       \t2\nData segments:\n  0: crypt\n\toffset: 16777216 [bytes]\n" +
 		"\tcipher: aes-xts-plain64\n\tsector: 512 [bytes]\n\tintegrity: hmac(sha256)\n" +
 		"Keyslots:\n  0: luks2\n\tKey:        768 bits\n\tCipher:     aes-xts-plain64\n\tCipher key: 512 bits\n\tPBKDF:      argon2id\n" +
 		"Tokens:\n  0: enklave-tpm2-nv\n\tKeyslot:    0\nDigests:\n"
 	lockedHier = "TPM2_PT_PERMANENT:\n  ownerAuthSet:              1\n  endorsementAuthSet:        1\n  lockoutAuthSet:            1\n" +
-		"  reserved1:                 0\n  disableClear:              1\nTPM2_PT_STARTUP_CLEAR:\n  phEnable:                  1\n"
+		"  reserved1:                 0\n  disableClear:              1\n  inLockout:                 0\nTPM2_PT_STARTUP_CLEAR:\n  phEnable:                  1\n" +
+		"TPM2_PT_LOCKOUT_COUNTER: 0x0\nTPM2_PT_MAX_AUTH_FAIL: 0x3\nTPM2_PT_LOCKOUT_INTERVAL: 0x0\nTPM2_PT_LOCKOUT_RECOVERY: 0x3E8\n"
 )
 
 var (
-	fakeP     = strings.Repeat("aa", 32)
-	fakePE    = strings.Repeat("bb", 32)
-	fakePC    = strings.Repeat("c0", 32)
-	fakePol11 = strings.Repeat("cc", 32) // current PCR 11 policy (after boot)
-	saltName  = "\x00\x0b" + strings.Repeat("\x5a", 32)
-	recordVal = strings.Repeat("\x15", 32) + "\x00\x00\x00\x00\x00\x00\x00\x00" + saltName
-	counter42 = "\x00\x00\x00\x00\x00\x00\x00\x2a"
+	// trial-session outputs of the fake runner
+	fakeB1     = strings.Repeat("11", 32) // PolicyAuthorize(key, ref) = authPolicy of index V
+	fakeAV     = strings.Repeat("33", 32)
+	fakeLit    = strings.Repeat("aa", 32) // ... + PolicyPCR(7,12) of this boot
+	fakeBridge = strings.Repeat("ab", 32) // ... + PolicyPCR(0,2,4,12) of this boot
+	fakePE     = strings.Repeat("bb", 32)
+	fakePol11  = strings.Repeat("cc", 32) // current PCR 11 policy (after boot)
+	// computed locally by varauth: P = PolicyAuthorizeNV(Name(V)), counter policy
+	fakeP, fakePC = expectedPolicies()
+	counter42     = "\x00\x00\x00\x00\x00\x00\x00\x2a"
+
+	// endorsement key of the fake TPM, certified by a fake vendor CA
+	ekKey, ekCA, ekCert = newEK()
+	otherEK, _, _       = newEK()
+	saltName            = string(ekKey.Name())
+	recordVal           = strings.Repeat("\x15", 32) + "\x00\x00\x00\x00\x00\x00\x00\x00" + saltName
 )
+
+func unhex(s string) []byte { b, _ := hex.DecodeString(s); return b }
+
+func expectedPolicies() (string, string) {
+	p := tpmpolicy.PolicyAuthorizeNV(tpmpolicy.NVName(0x01800E05, 0x22040002, unhex(fakeB1), 34))
+	pc := tpmpolicy.PolicyOR(tpmpolicy.PolicyCommandCode(p, tpmpolicy.CCNVChangeAuth), unhex(fakeAV))
+	return hex.EncodeToString(p), hex.EncodeToString(pc)
+}
+
+func newEK() (ekcert.Key, []byte, []byte) {
+	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	now := time.Now()
+	caTpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "selftest fake TPM vendor"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTpl, caTpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		panic(err)
+	}
+	ca, _ := x509.ParseCertificate(caDER)
+	ek, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	name, _ := asn1.Marshal(pkix.Name{CommonName: "tpm"}.ToRDNSequence())
+	san, _ := asn1.Marshal([]asn1.RawValue{{Class: asn1.ClassContextSpecific, Tag: 4, IsCompound: true, Bytes: name}})
+	tpl := &x509.Certificate{SerialNumber: big.NewInt(2), NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour),
+		ExtraExtensions: []pkix.Extension{{Id: asn1.ObjectIdentifier{2, 5, 29, 17}, Critical: true, Value: san}}}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, ca, &ek.PublicKey, caKey)
+	if err != nil {
+		panic(err)
+	}
+	k, err := ekcert.FromPublicKey(&ek.PublicKey)
+	if err != nil {
+		panic(err)
+	}
+	return k, caDER, der
+}
 
 func nvPublic(handle string, attrs uint32, size int, policy string) string {
 	return fmt.Sprintf("%s:\n  name: 000b%s\n  hash algorithm:\n    friendly: sha256\n    value: 0xB\n"+
@@ -66,7 +124,9 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 	put(t, root, "sys/module/module/parameters/sig_enforce", "Y\n")
 	put(t, root, "proc/self/mountinfo",
 		"20 1 253:0 / /usr ro,relatime shared:1 - erofs /dev/mapper/usr ro\n"+
-			"21 1 253:1 / /var/lib/enklave rw,nosuid,nodev,noexec,relatime shared:2 - ext4 /dev/mapper/var rw\n")
+			"21 1 253:1 / /var/lib/enklave ro,nosuid,nodev,noexec,relatime shared:2 - ext4 /dev/mapper/var rw\n")
+	put(t, root, "usr/share/enklave/tpm-ek-ca/Vendor/RootCA/ca.cer", string(ekCA))
+	put(t, root, "run/enklave/efi-updates", "current (0 update(s) in the firmware)\n")
 	put(t, root, "sys/dev/block/253:0/dm/uuid", "CRYPT-VERITY-abc-usr\n")
 	put(t, root, "sys/dev/block/253:1/dm/uuid", "CRYPT-LUKS2-"+strings.ReplaceAll(luksUUID, "-", "")+"-var\n")
 	// state volume (dm-crypt 253:1) -> dm-integrity dm-2 -> vda8, as with LUKS2 integrity
@@ -95,9 +155,17 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 		"tpm2_nvreadpublic 0x01800E02": nvPublic("0x01800E02", 0xB2082808, 64, fakeP),
 		"tpm2_nvreadpublic 0x01800E03": nvPublic("0x01800E03", 0x22080018, 8, fakePC),
 		"tpm2_nvreadpublic 0x01800E04": nvPublic("0x01800E04", 0x22040028, 8, fakePE),
+		"tpm2_nvreadpublic 0x01800E05": nvPublic("0x01800E05", 0x22040002, 34, fakeB1),
+		pcrPolicyReadCmd:               "\x00\x0b" + string(unhex(fakeLit)),
+		"tpm2_getcap handles-nv-index": "- 0x1800E01\n- 0x1800E02\n- 0x1800E03\n- 0x1800E04\n- 0x1800E05\n- 0x1C0000A\n",
+		ekCertReadCmd:                  string(ekCert) + strings.Repeat("\x00", 32),
 		recordReadCmd:                  recordVal,
 		hierCmd:                        lockedHier,
 		"tpm2_pcrread sha256:7":        "  sha256:\n    7 : 0x" + strings.Repeat("07", 32) + "\n",
+		"tpm2_pcrread sha256:0":        "  sha256:\n    0 : 0x" + strings.Repeat("F0", 32) + "\n",
+		"tpm2_pcrread sha256:2":        "  sha256:\n    2 : 0x" + strings.Repeat("F2", 32) + "\n",
+		"tpm2_pcrread sha256:4":        "  sha256:\n    4 : 0x" + strings.Repeat("F4", 32) + "\n",
+		"tpm2_pcrread sha256:12":       "  sha256:\n    12: 0x" + strings.Repeat("00", 32) + "\n",
 		"tpm2_pcrread sha256:15":       "  sha256:\n    15: 0x" + strings.ToUpper(hex.EncodeToString(pcr15)) + "\n",
 		"nft -j list ruleset":          goodNft,
 		unitsCmd:                       "sshd-not.service loaded active running x\nfoo.service loaded active running y\n",
@@ -115,14 +183,14 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 		case "tpm2_policyauthvalue":
 			return []byte(strings.Repeat("33", 32) + "\n"), true
 		case "tpm2_policyor":
-			if strings.Contains(strings.Join(args, " "), "b1.bin") {
-				return []byte(fakePE + "\n"), true
-			}
-			return []byte(fakePC + "\n"), true
+			return []byte(fakePE + "\n"), true
 		case "tpm2_policypcr":
 			for _, a := range args {
 				if a == "sha256:7,12" {
-					return []byte(fakeP + "\n"), true
+					return []byte(fakeLit + "\n"), true
+				}
+				if a == "sha256:0,2,4,12" {
+					return []byte(fakeBridge + "\n"), true
 				}
 				if a == "sha256:11" {
 					return []byte(fakePol11 + "\n"), true
@@ -135,13 +203,13 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 				}
 				return []byte(counter42), true
 			}
-		case "tpm2_readpublic": // salt key Name
-			if p := argAfter(args, "-n"); p != "" {
-				n := saltName
+		case "tpm2_readpublic": // public area of the salt key (EK)
+			if p := argAfter(args, "-o"); p != "" && argAfter(args, "-c") == "0x81000E01" {
+				pub := string(ekKey.TPM2B())
 				if s, ok := r.out["salt"]; ok {
-					n = s
+					pub = s
 				}
-				return nil, os.WriteFile(p, []byte(n), 0o600) == nil
+				return nil, os.WriteFile(p, []byte(pub), 0o600) == nil
 			}
 		}
 		return nil, false
@@ -217,7 +285,48 @@ func TestVarChecksNotOk(t *testing.T) {
 			r.out["counter"] = "\x00\x00\x00\x00\x00\x00\x00\x2b"
 		}},
 		{"var_authenticated", "salt key substituted", func(t *testing.T, root string, r *fakeRunner) {
-			r.out["salt"] = "\x00\x0b" + strings.Repeat("\x66", 32)
+			r.out["salt"] = string(otherEK.TPM2B())
+		}},
+		{"var_authenticated", "salt key is not an EK", func(t *testing.T, root string, r *fakeRunner) {
+			r.out["salt"] = "\x00\x04junk"
+		}},
+		{"var_authenticated", "EK certificate missing", func(t *testing.T, root string, r *fakeRunner) {
+			r.out["tpm2_getcap handles-nv-index"] = "- 0x1800E01\n"
+		}},
+		{"var_authenticated", "vendor CA bundle missing", func(t *testing.T, root string, r *fakeRunner) {
+			os.RemoveAll(filepath.Join(root, "usr/share/enklave/tpm-ek-ca"))
+		}},
+		{"var_rollback", "salt key substituted", func(t *testing.T, root string, r *fakeRunner) {
+			r.out["salt"] = string(otherEK.TPM2B())
+		}},
+		{"var_authenticated", "PCR policy index holds another Secure Boot state", func(t *testing.T, root string, r *fakeRunner) {
+			r.out[pcrPolicyReadCmd] = "\x00\x0b" + strings.Repeat("\x77", 32)
+		}},
+		{"var_authenticated", "PCR policy index Name differs", func(t *testing.T, root string, r *fakeRunner) {
+			r.out["tpm2_nvreadpublic 0x01800E05"] = nvPublic("0x01800E05", 0x22040002, 34, strings.Repeat("99", 32))
+		}},
+		{"var_authenticated", "PCR policy index writable by its own auth", func(t *testing.T, root string, r *fakeRunner) {
+			r.out["tpm2_nvreadpublic 0x01800E05"] = nvPublic("0x01800E05", 0x22040006, 34, fakeB1)
+		}},
+		{"efi_updates", "transition pending", func(t *testing.T, root string, r *fakeRunner) {
+			put(t, root, "run/enklave/efi-updates", "pending: 1 of 1 update(s) handed to the firmware, reboot to complete\n")
+		}},
+		{"efi_updates", "update rejected by the firmware", func(t *testing.T, root string, r *fakeRunner) {
+			put(t, root, "run/enklave/efi-updates", "failed: NOT APPLIED: dbx-x.auth: EACCES\n")
+		}},
+		{"efi_updates", "no status", func(t *testing.T, root string, r *fakeRunner) {
+			os.Remove(filepath.Join(root, "run/enklave/efi-updates"))
+		}},
+		{"state_readonly", "state volume writable", func(t *testing.T, root string, r *fakeRunner) {
+			put(t, root, "proc/self/mountinfo",
+				"20 1 253:0 / /usr ro,relatime shared:1 - erofs /dev/mapper/usr ro\n"+
+					"21 1 253:1 / /var/lib/enklave rw,nosuid,nodev,noexec,relatime shared:2 - ext4 /dev/mapper/var rw\n")
+		}},
+		{"dev_keys", "test profile without the dev marker", func(t *testing.T, root string, r *fakeRunner) {
+			put(t, root, "usr/lib/enklave/test-profile", "")
+		}},
+		{"dev_keys", "no release metadata", func(t *testing.T, root string, r *fakeRunner) {
+			os.Remove(filepath.Join(root, "usr/lib/enklave/release.json"))
 		}},
 		{"tpm_locked", "platform enabled without firmware auth", func(t *testing.T, root string, r *fakeRunner) {
 			put(t, root, "run/enklave/platform", "disabled\n")
@@ -230,6 +339,12 @@ func TestVarChecksNotOk(t *testing.T) {
 		}},
 		{"tpm_locked", "lockout auth empty", func(t *testing.T, root string, r *fakeRunner) {
 			r.out[hierCmd] = strings.Replace(lockedHier, "lockoutAuthSet:            1", "lockoutAuthSet:            0", 1)
+		}},
+		{"tpm_locked", "DA lockout enabled", func(t *testing.T, root string, r *fakeRunner) {
+			r.out[hierCmd] = strings.Replace(lockedHier, "TPM2_PT_LOCKOUT_INTERVAL: 0x0", "TPM2_PT_LOCKOUT_INTERVAL: 0x3E8", 1)
+		}},
+		{"tpm_locked", "TPM in lockout", func(t *testing.T, root string, r *fakeRunner) {
+			r.out[hierCmd] = strings.Replace(lockedHier, "inLockout:                 0", "inLockout:                 1", 1)
 		}},
 		{"pcr11_sealed", "systemd signature still valid", func(t *testing.T, root string, r *fakeRunner) {
 			put(t, root, "run/systemd/tpm2-pcr-signature.json", `{"sha256":[{"pcrs":[11],"pol":"`+fakePol11+`"}]}`)
@@ -257,6 +372,9 @@ func TestVarChecksDetails(t *testing.T) {
 		"var_authenticated": "cryptsetup:var:" + luksUUID,
 		"var_rollback":      "state version 42",
 		"pcr11_sealed":      "matches none of 2 signed",
+		"state_readonly":    "ro,nosuid",
+		"efi_updates":       "current",
+		"dev_keys":          "production keys",
 	} {
 		if x := find(t, rs, check); !x.OK || !strings.Contains(x.Detail, want) {
 			t.Errorf("%s: %+v", check, x)
@@ -264,5 +382,43 @@ func TestVarChecksDetails(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "run/enklave/selftest/work")); !errors.Is(err, os.ErrNotExist) {
 		t.Error("selftest work dir left behind")
+	}
+}
+
+func TestVarAuthenticatedDetails(t *testing.T) {
+	root, r := goodRoot(t)
+	x := find(t, RunChecks(root, r), "var_authenticated")
+	for _, want := range []string{"policy bound to PCR 7+12", "EK certificate 0x01C0000A issued by", "selftest fake TPM vendor"} {
+		if !x.OK || !strings.Contains(x.Detail, want) {
+			t.Errorf("%+v lacks %q", x, want)
+		}
+	}
+	// during a signed Secure Boot variable update the boot chain is bound instead
+	r.out[pcrPolicyReadCmd] = "\x00\x0b" + string(unhex(fakeBridge))
+	if x := find(t, RunChecks(root, r), "var_authenticated"); !x.OK || !strings.Contains(x.Detail, "PCR 0+2+4+12") {
+		t.Errorf("%+v", x)
+	}
+}
+
+// M2: dev-signed builds are reported; production acceptance rejects them.
+func TestDevKeys(t *testing.T) {
+	root, r := goodRoot(t)
+	put(t, root, "usr/lib/enklave/release.json", `{"epoch":0,"heal_below":0,"dev_keys":true}`)
+	x := find(t, RunChecks(root, r), "dev_keys")
+	if !x.OK || !strings.Contains(x.Detail, "DEV KEYS") {
+		t.Errorf("informational: %+v", x)
+	}
+	x = find(t, RunChecksWith(root, r, Options{ForbidDevKeys: true}), "dev_keys")
+	if x.OK || !strings.Contains(x.Detail, "DEV KEYS") {
+		t.Errorf("--forbid-dev-keys: %+v", x)
+	}
+	put(t, root, "usr/lib/enklave/test-profile", "")
+	if x := find(t, RunChecks(root, r), "dev_keys"); !x.OK {
+		t.Errorf("dev-signed test image: %+v", x)
+	}
+	put(t, root, "usr/lib/enklave/release.json", `{"epoch":0,"heal_below":0}`)
+	os.Remove(filepath.Join(root, "usr/lib/enklave/test-profile"))
+	if x := find(t, RunChecksWith(root, r, Options{ForbidDevKeys: true}), "dev_keys"); !x.OK || x.Detail != "production keys" {
+		t.Errorf("production: %+v", x)
 	}
 }

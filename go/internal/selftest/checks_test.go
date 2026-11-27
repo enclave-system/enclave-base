@@ -76,8 +76,8 @@ func TestAllGood(t *testing.T) {
 	root, r := goodRoot(t)
 	rs := RunChecks(root, r)
 	wantOrder := []string{"secureboot", "setupmode_off", "lockdown", "module_sig_enforce", "usr_verity", "usr_readonly",
-		"var_luks", "var_tpm_bound", "var_authenticated", "var_integrity", "var_rollback", "tpm_locked", "pcr11_sealed",
-		"no_pkg_manager", "apparmor", "nft_default_drop", "no_getty", "ipv6_absent", "no_credentials", "role", "version"}
+		"var_luks", "var_tpm_bound", "var_authenticated", "var_integrity", "var_rollback", "state_readonly", "efi_updates", "tpm_locked", "pcr11_sealed",
+		"no_pkg_manager", "apparmor", "nft_default_drop", "no_getty", "ipv6_absent", "no_credentials", "role", "version", "dev_keys"}
 	if len(rs) != len(wantOrder) {
 		t.Fatalf("got %d results: %+v", len(rs), rs)
 	}

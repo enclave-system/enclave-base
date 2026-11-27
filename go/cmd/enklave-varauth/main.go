@@ -9,10 +9,18 @@
 //	enklave-varauth state-exec -- CMD [ARGS...]       run CMD on a staged copy of the
 //	                                                  state ($ENKLAVE_STATE_DIR, "{}"
 //	                                                  in ARGS) and commit atomically
+//	enklave-varauth ek-name                           print the Names of this TPM's
+//	                                                  endorsement keys (for the signed
+//	                                                  EK allowlist of a release)
 //	enklave-varauth probe                             (tests) try to read the key after boot
+//
+// The state volume is mounted read-only. state-exec re-executes itself in a
+// private mount namespace and makes the volume writable only there, so no
+// other process (root included) can write the state through the mount.
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -30,7 +38,7 @@ func fail(what string, err error) {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: enklave-varauth repart|unlock|verify|sealed|state-exec|probe ...")
+		fmt.Fprintln(os.Stderr, "usage: enklave-varauth repart|unlock|verify|sealed|state-exec|ek-name|probe ...")
 		os.Exit(2)
 	}
 	c := varauth.DefaultConfig()
@@ -57,9 +65,17 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "enklave-varauth: %s\n", msg)
 		// One status line on the serial port, also in production (which has
-		// no serial console): evidence of a successful unlock for VM tests.
+		// no serial console): evidence of a successful unlock for VM tests,
+		// and the runtime-visible marker of a development build.
+		dev := ""
+		if id, err := varauth.LoadIdentity(c); err != nil || id.Release.DevKeys {
+			dev = " [DEV KEYS: development build, never ship]"
+		}
 		if f, err := os.OpenFile("/dev/ttyS0", os.O_WRONLY|syscall.O_NOCTTY, 0); err == nil {
-			fmt.Fprintf(f, "enklave: state volume unlocked and verified\n")
+			fmt.Fprintf(f, "enklave: state volume unlocked and verified%s\n", dev)
+			if u, err := os.ReadFile(c.EFIUpdatesFile()); err == nil {
+				fmt.Fprintf(f, "enklave: Secure Boot updates: %s", u)
+			}
 			f.Close()
 		}
 	case "sealed":
@@ -77,7 +93,18 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usage: enklave-varauth state-exec -- CMD [ARGS...]")
 			os.Exit(2)
 		}
+		if os.Getenv(nsEnv) != "1" {
+			os.Exit(reexecPrivate())
+		}
 		os.Exit(stateExec(c, r, args))
+	case "ek-name":
+		names, err := varauth.EKNames(c, r)
+		if err != nil {
+			fail("ek-name", err)
+		}
+		for _, n := range names {
+			fmt.Println(n)
+		}
 	case "probe":
 		if err := varauth.Probe(c, r); err != nil {
 			fmt.Printf("refused: %v\n", err)
@@ -91,10 +118,64 @@ func main() {
 	}
 }
 
+const (
+	nsEnv   = "ENKLAVE_STATE_NS"
+	mntBase = syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC
+)
+
+// reexecPrivate runs this command again in a new mount namespace (with
+// private propagation, set by the Go runtime for CLONE_NEWNS).
+func reexecPrivate() int {
+	cmd := exec.Command("/proc/self/exe", os.Args[1:]...)
+	cmd.Env = append(os.Environ(), nsEnv+"=1")
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Unshareflags: syscall.CLONE_NEWNS}
+	if err := cmd.Run(); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return ee.ExitCode()
+		}
+		fail("state-exec (private mount namespace)", err)
+	}
+	return 0
+}
+
+// writableState makes the state volume writable in this (private) mount
+// namespace only. It refuses to run in the mount namespace of PID 1: the
+// read-only mount everyone else sees must never change.
+func writableState(root string) (func(), error) {
+	self, err := os.Readlink("/proc/self/ns/mnt")
+	if err != nil {
+		return nil, err
+	}
+	init, err := os.Readlink("/proc/1/ns/mnt")
+	if err != nil {
+		return nil, err
+	}
+	if self == init {
+		return nil, errors.New("not in a private mount namespace")
+	}
+	if err := syscall.Mount("", root, "", syscall.MS_REMOUNT|mntBase, ""); err != nil {
+		return nil, fmt.Errorf("making %s writable in the private namespace: %w", root, err)
+	}
+	return func() {
+		syscall.Sync()
+		if err := syscall.Mount("", root, "", syscall.MS_REMOUNT|syscall.MS_RDONLY|mntBase, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "enklave-state: warning: could not return %s to read-only: %v\n", root, err)
+		}
+	}, nil
+}
+
 // stateExec runs args against a staged copy of the state and commits it.
 func stateExec(c varauth.Config, r execRunner, args []string) int {
+	restore, err := writableState(c.StateRoot)
+	if err != nil {
+		fail("state-exec", err)
+	}
+	defer restore()
 	work, err := os.MkdirTemp(c.RunDir, "state-exec-")
 	if err != nil {
+		restore()
 		fail("state-exec", err)
 	}
 	defer os.RemoveAll(work)
@@ -117,6 +198,8 @@ func stateExec(c varauth.Config, r execRunner, args []string) int {
 	}
 	s, err := varauth.OpenStore(c, r, pause)
 	if err != nil {
+		restore()
+		os.RemoveAll(work)
 		fail("state-exec", err)
 	}
 	v, err := s.Exec(func(staging string) error {
@@ -130,6 +213,8 @@ func stateExec(c varauth.Config, r execRunner, args []string) int {
 		return cmd.Run()
 	})
 	if err != nil {
+		restore()
+		os.RemoveAll(work)
 		fail("state-exec", err)
 	}
 	fmt.Fprintf(os.Stderr, "enklave-state: committed state version %d\n", v)
