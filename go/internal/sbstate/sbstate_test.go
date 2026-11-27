@@ -3,9 +3,9 @@ package sbstate
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"enklave.local/base/internal/sbstate/sbtest"
@@ -45,9 +45,17 @@ func TestParseLogAndCompare(t *testing.T) {
 		t.Error("garbage accepted")
 	}
 
-	after := func(mut func(f *sbtest.Firmware)) []Event {
+}
+
+// B3: after a signed update the Secure Boot state must be exactly the old
+// state with the update's signatures added to the updated variable.
+func TestStateDigest(t *testing.T) {
+	boot := func(mut func(f *sbtest.Firmware)) []Event {
 		f := sbtest.NewFirmware()
-		mut(f)
+		f.Vars[dbxID] = sbtest.ESL(hash("old revocation 1"), hash("old revocation 2"))
+		if mut != nil {
+			mut(f)
+		}
 		l, _ := f.Boot()
 		evs, _, err := ParseLog(l, 7)
 		if err != nil {
@@ -55,35 +63,87 @@ func TestParseLogAndCompare(t *testing.T) {
 		}
 		return evs
 	}
-	dbx := func(f *sbtest.Firmware) { f.Vars[dbxID] = sbtest.ESL(hash("revoked uki")) }
-	if err := Compare(before, after(dbx), []string{dbxID}); err != nil {
-		t.Errorf("signed dbx update refused: %v", err)
+	upd := map[string][]Signature{dbxID: {{sbtest.SHA256Type, hexOf(hash("revoked uki"))}}}
+	vars := []string{dbxID}
+	old, _ := StateDigest(boot(nil), vars, nil)
+	want, err := StateDigest(boot(nil), vars, upd)
+	if err != nil || bytes.Equal(old, want) {
+		t.Fatalf("expectation: %v", err)
 	}
-	if err := Compare(before, before, []string{dbxID}); err != nil {
-		t.Errorf("unchanged state refused: %v", err)
+	state := func(mut func(f *sbtest.Firmware)) []byte {
+		d, err := StateDigest(boot(mut), vars, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
 	}
-	for name, tc := range map[string]struct {
-		mut  func(f *sbtest.Firmware)
-		want string
-	}{
-		"dbx changed without an update": {dbx, "no signed update"},
-		"secure boot disabled":          {func(f *sbtest.Firmware) { dbx(f); f.SecureBoot = 0 }, "SecureBoot"},
-		"db key added":                  {func(f *sbtest.Firmware) { dbx(f); f.Vars["db-"+GUIDSecurity] = []byte("attacker") }, "db-"},
-		"other authority":               {func(f *sbtest.Firmware) { dbx(f); f.Authority = []byte("attacker cert") }, "type 0x800000e0"},
-		"additional event": {func(f *sbtest.Firmware) {
-			dbx(f)
-			f.Extra = []sbtest.Ev{{PCR: 7, Type: 0x800000E0, Data: []byte("second authority")}}
-		}, "events"},
+	dbx := func(sigs ...[]byte) func(f *sbtest.Firmware) {
+		return func(f *sbtest.Firmware) { f.Vars[dbxID] = sbtest.ESL(sigs...) }
+	}
+	o1, o2, n := hash("old revocation 1"), hash("old revocation 2"), hash("revoked uki")
+	for name, d := range map[string][]byte{
+		"appended as one list":  state(dbx(o1, o2, n)),
+		"reordered by firmware": state(dbx(n, o2, o1)),
+		"appended as a second list": state(func(f *sbtest.Firmware) {
+			f.Vars[dbxID] = append(sbtest.ESL(o1, o2), sbtest.ESL(n)...)
+		}),
 	} {
-		upd := []string{dbxID}
-		if name == "dbx changed without an update" {
-			upd = nil
+		if !bytes.Equal(d, want) {
+			t.Errorf("%s: not accepted as the updated state", name)
 		}
-		if err := Compare(before, after(tc.mut), upd); err == nil || !strings.Contains(err.Error(), tc.want) {
-			t.Errorf("%s: err = %v, want %q", name, err, tc.want)
+	}
+	if !bytes.Equal(state(nil), old) {
+		t.Error("unchanged state differs from the old digest")
+	}
+	for name, mut := range map[string]func(f *sbtest.Firmware){
+		"older dbx entry dropped":       dbx(o1, n),
+		"all older entries dropped":     dbx(n),
+		"foreign dbx entry added":       dbx(o1, o2, n, hash("x")),
+		"update missing, entry dropped": dbx(o1),
+		"dbx emptied":                   dbx(),
+		"secure boot disabled":          func(f *sbtest.Firmware) { dbx(o1, o2, n)(f); f.SecureBoot = 0 },
+		"db key added":                  func(f *sbtest.Firmware) { dbx(o1, o2, n)(f); f.Vars["db-"+GUIDSecurity] = []byte("attacker") },
+		"KEK replaced":                  func(f *sbtest.Firmware) { dbx(o1, o2, n)(f); f.Vars["KEK-"+GUIDGlobal] = []byte("attacker") },
+		"other authority":               func(f *sbtest.Firmware) { dbx(o1, o2, n)(f); f.Authority = []byte("attacker cert") },
+		"additional event": func(f *sbtest.Firmware) {
+			dbx(o1, o2, n)(f)
+			f.Extra = []sbtest.Ev{{PCR: 7, Type: 0x800000E0, Data: []byte("second authority")}}
+		},
+	} {
+		if d := state(mut); bytes.Equal(d, want) || bytes.Equal(d, old) {
+			t.Errorf("%s: accepted", name)
 		}
+	}
+	// db and KEK appends follow the same rule
+	for _, id := range []string{"db-" + GUIDSecurity, "KEK-" + GUIDGlobal} {
+		f := sbtest.NewFirmware()
+		f.Vars[id] = sbtest.ESL(hash("key 1"))
+		l, _ := f.Boot()
+		before, _, _ := ParseLog(l, 7)
+		add := map[string][]Signature{id: {{sbtest.SHA256Type, hexOf(hash("key 2"))}}}
+		want, _ := StateDigest(before, []string{id}, add)
+		for content, ok := range map[string]bool{
+			string(sbtest.ESL(hash("key 1"), hash("key 2"))):                true,
+			string(sbtest.ESL(hash("key 2"))):                               false, // replaced instead of appended
+			string(sbtest.ESL(hash("key 1"), hash("key 2"), hash("key 3"))): false,
+		} {
+			f.Vars[id] = []byte(content)
+			l, _ := f.Boot()
+			after, _, _ := ParseLog(l, 7)
+			got, err := StateDigest(after, []string{id}, nil)
+			if err != nil || bytes.Equal(got, want) != ok {
+				t.Errorf("%s: accepted=%v, want %v (%v)", id, bytes.Equal(got, want), ok, err)
+			}
+		}
+	}
+	// a variable that is not a signature list cannot be an update target
+	bad := boot(func(f *sbtest.Firmware) { f.Vars[dbxID] = []byte("garbage that is not a list ....") })
+	if _, err := StateDigest(bad, vars, nil); err == nil {
+		t.Error("malformed variable accepted")
 	}
 }
+
+func hexOf(b []byte) string { return hex.EncodeToString(b) }
 
 func TestUpdates(t *testing.T) {
 	d := t.TempDir()

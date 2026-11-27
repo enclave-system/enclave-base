@@ -116,7 +116,16 @@ var (
 		attrOwnerWrite | attrAuthRead | attrNoDA,
 		attrOwnerWrite | attrAuthRead | attrNoDA | attrWritten}
 
-	allIndices = []Index{Record, Secret, Counter, Epoch, PCRPolicy}
+	// Transition (T): state of a Secure Boot variable update in progress,
+	// written through the owner hierarchy only (under P): the digest of the
+	// Secure Boot state before the update, the digest of the only state the
+	// update may lead to, and a state byte (idle, armed, applied, rolled
+	// back). It is read before the volume key is released.
+	Transition = Index{"transition", "0x01800E06", 72,
+		attrOwnerWrite | attrAuthRead | attrNoDA,
+		attrOwnerWrite | attrAuthRead | attrNoDA | attrWritten}
+
+	allIndices = []Index{Record, Secret, Counter, Epoch, PCRPolicy, Transition}
 )
 
 // Config holds the paths used at runtime.
@@ -132,7 +141,7 @@ type Config struct {
 
 	EKCADir     string // TPM vendor EK CAs (verity /usr)
 	EKTestCADir string // test CA for emulated TPMs; honoured in the test profile only
-	EKAllowlist string // signed allowlist of EK Names (verity /usr), may be absent
+	WritersDir  string // state writers allowed by the image (verity /usr)
 	UpdatesDir  string // signed Secure Boot variable updates shipped by the release
 	EventLog    string // TCG event log of this boot
 	EFI         sbstate.Vars
@@ -151,7 +160,7 @@ func DefaultConfig() Config {
 		StateRoot:   "/var/lib/enklave",
 		EKCADir:     "/usr/share/enklave/tpm-ek-ca",
 		EKTestCADir: "/usr/share/enklave/tpm-ek-ca-test",
-		EKAllowlist: "/usr/lib/enklave/ek-allowlist",
+		WritersDir:  "/usr/lib/enklave/state-writers.d",
 		UpdatesDir:  "/usr/lib/enklave/efi-updates",
 		EventLog:    "/sys/kernel/security/tpm0/binary_bios_measurements",
 		EFI:         sbstate.EFIVarFS{Dir: "/sys/firmware/efi/efivars"},
@@ -183,7 +192,13 @@ func (c Config) CreatedFlag() string { return filepath.Join(c.RunDir, "var-creat
 // ProvisionedFlag is written by Unlock after (re-)provisioning in this boot.
 func (c Config) ProvisionedFlag() string { return filepath.Join(c.RunDir, "var-provisioned") }
 
-// StateKeyFile holds the derived state MAC key and counter auth for runtime writers.
+// StateSocket is where the state service listens (authorized commits,
+// verified reads).
+func (c Config) StateSocket() string { return filepath.Join(c.RunDir, "state.sock") }
+
+// StateKeyFile hands the derived state MAC key and counter auth from the
+// unlock to the verify step and to the state service, which deletes it
+// before anything else in the system starts.
 func (c Config) StateKeyFile() string { return filepath.Join(c.RunDir, "state.key") }
 
 // ResultFile records the authenticated PCR 15 value (hex).
@@ -212,7 +227,20 @@ func LoadIdentity(c Config) (Identity, error) {
 		return id, err
 	}
 	id.Role = strings.TrimSpace(string(b))
+	b, err = os.ReadFile(c.ReleaseFile)
+	if err != nil {
+		return id, err
+	}
+	if err := json.Unmarshal(b, &id.Release); err != nil {
+		return id, fmt.Errorf("release.json: %w", err)
+	}
+	// prod: production keys. dev: the same configuration signed with a
+	// development PKI (its own policyRef: it can never open production
+	// state, and only dev and test refs may admit emulated TPMs).
 	id.Profile = "prod"
+	if id.Release.DevKeys {
+		id.Profile = "dev"
+	}
 	if _, err := os.Stat(c.TestMarker); err == nil {
 		id.Profile = "test"
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -220,13 +248,6 @@ func LoadIdentity(c Config) (Identity, error) {
 	}
 	if id.Ref, err = tpmpolicy.Ref(id.Role, id.Profile); err != nil {
 		return id, err
-	}
-	b, err = os.ReadFile(c.ReleaseFile)
-	if err != nil {
-		return id, err
-	}
-	if err := json.Unmarshal(b, &id.Release); err != nil {
-		return id, fmt.Errorf("release.json: %w", err)
 	}
 	return id, id.Release.Validate()
 }

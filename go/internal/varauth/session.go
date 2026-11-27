@@ -48,6 +48,13 @@ type tpm struct {
 	salt                                     *ekcert.Key // authenticated salt key
 	saltSource                               string
 	pauseAt                                  string
+
+	ref    string                    // policyRef of this device (setRef)
+	av     []byte                    // PolicyAuthValue digest
+	files  map[string]tpmpolicy.File // signed policies of the running UKI by ref (ESP)
+	raw    map[string][]byte
+	ekName []byte       // Name of the authenticated endorsement key (chooseEK)
+	ekAlgs []ekcert.Alg // its algorithm (both when only the Name is known)
 }
 
 func newTPM(c Config, r Runner) (*tpm, error) {
@@ -113,13 +120,10 @@ func (t *tpm) pcrValues(file string, pcrs []int) error {
 	return t.put(file, vals)
 }
 
-// prepare loads the PCR key and computes the expected policies. Everything
-// that depends on the Name of index V is computed locally.
+// prepare loads the PCR key and computes what does not depend on the
+// policyRef. setRef completes it once the device's ref is known.
 func (t *tpm) prepare() error {
 	if err := os.MkdirAll(t.c.work(), 0o700); err != nil {
-		return err
-	}
-	if err := t.put("ref.bin", []byte(t.id.Ref)); err != nil {
 		return err
 	}
 	if _, err := t.run("tpm2_loadexternal", "-C", "o", "-G", "rsa", "-u", t.c.PubKey,
@@ -130,6 +134,31 @@ func (t *tpm) prepare() error {
 		return err
 	}
 	if err := t.pcrValues("pcrs-bridge.bin", pcrsBridge); err != nil {
+		return err
+	}
+	b2, err := t.trial([]string{"tpm2_policycommandcode", "TPM2_CC_NV_SetBits"}, []string{"tpm2_policynvwritten", "c"})
+	if err != nil {
+		return err
+	}
+	if t.av, err = t.trial([]string{"tpm2_policyauthvalue"}); err != nil {
+		return err
+	}
+	if err := t.put("b2.bin", b2); err != nil {
+		return err
+	}
+	if err := t.put("av.bin", t.av); err != nil {
+		return err
+	}
+	t.pcr11, err = t.trial([]string{"tpm2_policypcr", "-l", "sha256:11"})
+	return err
+}
+
+// setRef computes the policies for a policyRef: the base ref of role and
+// profile, or the per-device ref of an admitted endorsement key. Everything
+// that depends on the Name of index V is computed locally.
+func (t *tpm) setRef(ref string) error {
+	t.ref = ref
+	if err := t.put("ref.bin", []byte(ref)); err != nil {
 		return err
 	}
 	auth := []string{"tpm2_policyauthorize", "-n", t.w("key.name"), "-q", t.w("ref.bin")}
@@ -143,22 +172,14 @@ func (t *tpm) prepare() error {
 	if t.b1, err = t.trial(auth); err != nil {
 		return err
 	}
-	b2, err := t.trial([]string{"tpm2_policycommandcode", "TPM2_CC_NV_SetBits"}, []string{"tpm2_policynvwritten", "c"})
-	if err != nil {
-		return err
-	}
-	av, err := t.trial([]string{"tpm2_policyauthvalue"})
-	if err != nil {
-		return err
-	}
 	vName := tpmpolicy.NVName(uint32(handleNum(PCRPolicy.Handle)), PCRPolicy.Final, t.b1, PCRPolicy.Size)
 	t.policy = tpmpolicy.PolicyAuthorizeNV(vName)
 	// Counter admin branch: NV_ChangeAuth needs the ADMIN role, which requires
 	// PolicyCommandCode in the session.
 	pca := tpmpolicy.PolicyCommandCode(t.policy, tpmpolicy.CCNVChangeAuth)
-	t.pc = tpmpolicy.PolicyOR(pca, av)
+	t.pc = tpmpolicy.PolicyOR(pca, t.av)
 	for n, d := range map[string][]byte{
-		"p.bin": t.policy, "b1.bin": t.b1, "b2.bin": b2, "av.bin": av, "pca.bin": pca, "pc.bin": t.pc,
+		"p.bin": t.policy, "b1.bin": t.b1, "pca.bin": pca, "pc.bin": t.pc,
 		"v-steady.bin": tpmpolicy.DigestNV(t.plit), "v-bridge.bin": tpmpolicy.DigestNV(t.pbridge),
 	} {
 		if err := t.put(n, d); err != nil {
@@ -168,11 +189,7 @@ func (t *tpm) prepare() error {
 	if t.pe, err = t.trial([]string{"tpm2_policyor", "-l", "sha256:" + t.w("b1.bin") + "," + t.w("b2.bin")}); err != nil {
 		return err
 	}
-	if err := t.put("pe.bin", t.pe); err != nil {
-		return err
-	}
-	t.pcr11, err = t.trial([]string{"tpm2_policypcr", "-l", "sha256:11"})
-	return err
+	return t.put("pe.bin", t.pe)
 }
 
 // Policies are the expected policy digests for this boot.
@@ -183,7 +200,8 @@ type Policies struct {
 	Bridge    []byte // content of V during a PCR 7 transition started with this boot chain
 }
 
-// ExpectedPolicies returns the policies of this boot.
+// ExpectedPolicies returns the policies of this boot for this device (its
+// policyRef follows from how its endorsement key is authenticated).
 func ExpectedPolicies(c Config, r Runner) (Policies, error) {
 	t, err := newTPM(c, r)
 	if err != nil {
@@ -193,19 +211,25 @@ func ExpectedPolicies(c Config, r Runner) (Policies, error) {
 	if err := t.prepare(); err != nil {
 		return Policies{}, err
 	}
+	if err := t.runtimeEK(); err != nil {
+		return Policies{}, err
+	}
 	return Policies{t.policy, t.pe, t.pc, t.b1, tpmpolicy.DigestNV(t.plit), tpmpolicy.DigestNV(t.pbridge)}, nil
 }
 
-func (t *tpm) selectPolicy(espDev string) (tpmpolicy.File, error) {
-	var f tpmpolicy.File
+// loadPolicies reads every signed approved policy for the running UKI from
+// the ESP (the base policy and per-device admissions), keyed by policyRef,
+// and the test hooks (test profile only). The ESP is unauthenticated; each
+// policy is verified by the TPM when it is used.
+func (t *tpm) loadPolicies(espDev string) error {
 	if err := os.MkdirAll(t.c.espMount(), 0o700); err != nil {
-		return f, err
+		return err
 	}
 	// Not "ro": systemd-boot-random-seed may already have mounted the ESP
 	// read-write via the /efi automount, and a read-only second mount of the
 	// same superblock fails with EBUSY. Nothing is written.
 	if _, err := t.run("mount", "-t", "vfat", "-o", "nosuid,nodev,noexec,umask=077", espDev, t.c.espMount()); err != nil {
-		return f, err
+		return err
 	}
 	defer t.r.Run("umount", t.c.espMount()) //nolint:errcheck
 	if t.id.Profile == "test" {
@@ -213,13 +237,19 @@ func (t *tpm) selectPolicy(espDev string) (tpmpolicy.File, error) {
 			t.pauseAt = strings.TrimSpace(string(b))
 			// Verify runs as a separate process (test profile only)
 			if err := os.WriteFile(filepath.Join(t.c.RunDir, "test-pause"), b, 0o600); err != nil {
-				return f, err
+				return err
 			}
+		}
+		// models firmware whose event log is unusable (B7 proof)
+		if _, err := os.Stat(filepath.Join(t.c.espMount(), "EFI/enklave/test-no-eventlog")); err == nil {
+			t.c.EventLog = filepath.Join(t.c.RunDir, "test-no-eventlog")
 		}
 	}
 	files, _ := filepath.Glob(filepath.Join(t.c.espMount(), t.c.PolicyDir, "*.json"))
 	sort.Strings(files)
 	want := hex.EncodeToString(t.pcr11)
+	t.files = map[string]tpmpolicy.File{}
+	t.raw = map[string][]byte{}
 	for _, p := range files {
 		b, err := os.ReadFile(p)
 		if err != nil {
@@ -227,13 +257,25 @@ func (t *tpm) selectPolicy(espDev string) (tpmpolicy.File, error) {
 		}
 		var cand tpmpolicy.File
 		if json.Unmarshal(b, &cand) == nil && strings.EqualFold(cand.PCR11Policy, want) {
-			if err := os.WriteFile(t.c.policyCache(), b, 0o600); err != nil {
-				return f, err
+			if _, dup := t.files[cand.Ref]; !dup {
+				t.files[cand.Ref], t.raw[cand.Ref] = cand, b
 			}
-			return cand, nil
 		}
 	}
-	return f, fmt.Errorf("no signed approved policy for the running UKI (PCR 11 policy %s) in ESP:/%s", want, t.c.PolicyDir)
+	if len(t.files) == 0 {
+		return fmt.Errorf("no signed approved policy for the running UKI (PCR 11 policy %s) in ESP:/%s", want, t.c.PolicyDir)
+	}
+	return nil
+}
+
+// policy returns the signed policy for the device's policyRef and caches it
+// for the later steps of this boot.
+func (t *tpm) selectedPolicy() (tpmpolicy.File, error) {
+	f, ok := t.files[t.ref]
+	if !ok {
+		return f, fmt.Errorf("no signed approved policy for policyRef %q of the running UKI in ESP:/%s", t.ref, t.c.PolicyDir)
+	}
+	return f, os.WriteFile(t.c.policyCache(), t.raw[t.ref], 0o600)
 }
 
 func (t *tpm) cachedPolicy() (tpmpolicy.File, error) {
@@ -247,7 +289,10 @@ func (t *tpm) cachedPolicy() (tpmpolicy.File, error) {
 
 // authorize checks E, recomputes the approved digest and obtains the ticket.
 func (t *tpm) authorize(f tpmpolicy.File) error {
-	pcr11, approved, err := f.Decode(t.id.Role, t.id.Profile)
+	if t.ref == "" {
+		return errors.New("policyRef of this device not determined")
+	}
+	pcr11, approved, err := f.DecodeRef(t.id.Role, t.id.Profile, t.ref)
 	if err != nil {
 		return err
 	}
@@ -277,7 +322,7 @@ func (t *tpm) authorize(f tpmpolicy.File) error {
 	}
 	op, _ := tpmpolicy.EpochOperand(f.Epoch)
 	for name, data := range map[string][]byte{
-		"approved.bin": approved, "msg.bin": tpmpolicy.SignedMessage(approved, t.id.Ref), "sig.bin": sig, "epochop.bin": op,
+		"approved.bin": approved, "msg.bin": tpmpolicy.SignedMessage(approved, t.ref), "sig.bin": sig, "epochop.bin": op,
 	} {
 		if err := t.put(name, data); err != nil {
 			return err
@@ -329,10 +374,18 @@ func (t *tpm) sel() (string, string) {
 
 // writePCRPolicy rewrites index V through the owner hierarchy (policy P).
 func (t *tpm) writePCRPolicy(file, newMode string) error {
-	if _, err := t.session(sessP, "", "tpm2_nvwrite", PCRPolicy.Handle, "-C", "o", "-i", t.w(file), "-P"); err != nil {
-		return fmt.Errorf("writing the PCR policy index: %w", err)
+	if err := t.writeIndex(PCRPolicy, file); err != nil {
+		return err
 	}
 	t.mode = newMode
+	return nil
+}
+
+// writeIndex rewrites an owner-written index (V or T) under policy P.
+func (t *tpm) writeIndex(ix Index, file string) error {
+	if _, err := t.session(sessP, "", "tpm2_nvwrite", ix.Handle, "-C", "o", "-i", t.w(file), "-P"); err != nil {
+		return fmt.Errorf("writing NV %s %s: %w", ix.Name, ix.Handle, err)
+	}
 	return nil
 }
 
@@ -484,7 +537,7 @@ type certifiedEK struct {
 type ekTrust struct {
 	certified []certifiedEK
 	problems  []string
-	allow     map[string]bool
+	discrete  bool // refused because the release requires a firmware TPM
 }
 
 // now is the clock used for certificate validity. A clock behind the build
@@ -501,8 +554,8 @@ func (t *tpm) now() time.Time {
 }
 
 // loadEKTrust validates the EK certificates found in the TPM against the
-// vendor CAs of the image and loads the signed allowlist. The certificates
-// travel over the unauthenticated bus; their signatures are what counts.
+// vendor CAs of the image. The certificates travel over the unauthenticated
+// bus; their signatures are what counts.
 func (t *tpm) loadEKTrust(nv map[uint64]bool) (ekTrust, error) {
 	var tr ekTrust
 	store := ekcert.NewStore()
@@ -542,7 +595,7 @@ func (t *tpm) loadEKTrust(nv map[uint64]bool) (ekTrust, error) {
 			tr.problems = append(tr.problems, fmt.Sprintf("%s: %v", h, err))
 			continue
 		}
-		k, c, err := store.Verify(der, at)
+		k, info, err := store.Verify(der, at)
 		if err != nil {
 			tr.problems = append(tr.problems, fmt.Sprintf("%s: %v", h, err))
 			continue
@@ -551,39 +604,151 @@ func (t *tpm) loadEKTrust(nv map[uint64]bool) (ekTrust, error) {
 			tr.problems = append(tr.problems, fmt.Sprintf("%s holds a certificate for an %s key", h, k.Alg))
 			continue
 		}
-		tr.certified = append(tr.certified, certifiedEK{k, fmt.Sprintf("EK certificate %s issued by %q", h, c.Issuer.String())})
+		if t.id.Release.RequireFTPM && !info.Firmware() {
+			tr.problems = append(tr.problems, fmt.Sprintf("%s: this release requires a firmware TPM (require_ftpm) and the EK certificate is from the discrete-TPM vendor directory %q (issuer %q)", h, info.Vendor, info.Issuer))
+			tr.discrete = true
+			continue
+		}
+		tr.certified = append(tr.certified, certifiedEK{k, fmt.Sprintf("EK certificate %s issued by %q", h, info.Issuer)})
 	}
 	if len(tr.certified) == 0 && len(tr.problems) == 0 {
 		tr.problems = []string{"the TPM holds no EK certificate (NV 0x01C0000A / 0x01C00002)"}
 	}
-	b, err := os.ReadFile(t.c.EKAllowlist)
-	switch {
-	case err == nil:
-		if tr.allow, err = ekcert.ParseAllowlist(b); err != nil {
-			return tr, err
-		}
-	case !errors.Is(err, os.ErrNotExist):
-		return tr, err
-	}
 	return tr, nil
 }
 
-// accept decides whether k is the authentic endorsement key.
-func (tr ekTrust) accept(k ekcert.Key) (string, error) {
-	for _, c := range tr.certified {
-		if bytes.Equal(c.key.Name(), k.Name()) {
-			return c.desc, nil
+// chooseEK decides how this device's endorsement key is authenticated and,
+// with it, the device's policyRef (B1):
+//
+//   - A TPM with a valid EK certificate uses the base ref of role and
+//     profile, and its EK must be the certified key. Admissions are not
+//     consulted at all.
+//   - A TPM without a valid certificate needs a per-device admission: a
+//     policy signed for RefEK(base, Name of this EK), shipped next to the
+//     release's policy on the ESP. All its TPM objects are then bound to that
+//     ref. An admission is useless on any other device, and an interposer
+//     that hides the certificate of a certified device ends up under another
+//     ref, whose policy opens none of that device's objects.
+func (t *tpm) chooseEK(st tpmState, first bool) error {
+	trust, err := t.loadEKTrust(st.nv)
+	if err != nil {
+		return err
+	}
+	if len(trust.certified) > 0 {
+		c := trust.certified[0]
+		t.ekName, t.ekAlgs, t.saltSource = c.key.Name(), []ekcert.Alg{c.key.Alg}, c.desc
+		return t.setRef(t.id.Ref)
+	}
+	why := strings.Join(trust.problems, "; ")
+	if trust.discrete {
+		return errors.New("the TPM's endorsement key is refused: " + why)
+	}
+	admit := func(k ekcert.Key) (bool, error) {
+		ref := tpmpolicy.RefEK(t.id.Ref, k.Name())
+		if _, ok := t.files[ref]; !ok {
+			return false, nil
+		}
+		t.ekName, t.ekAlgs = k.Name(), []ekcert.Alg{k.Alg}
+		t.saltSource = fmt.Sprintf("signed per-device admission of EK %x", k.Name())
+		return true, t.setRef(ref)
+	}
+	var names []string
+	switch {
+	case st.pers[handleNum(SaltHandle)]:
+		k, err := t.readEK(SaltHandle)
+		if err != nil {
+			return fmt.Errorf("salt key %s: %w", SaltHandle, err)
+		}
+		if ok, err := admit(k); ok || err != nil {
+			return err
+		}
+		names = append(names, hex.EncodeToString(k.Name()))
+	case first:
+		// fresh TPM: its endorsement keys, as the TPM reports them; only a
+		// signature for exactly one of these Names admits the device
+		for _, alg := range ekcert.Algs {
+			if _, err := t.run("tpm2_createek", "-G", alg.Tool(), "-c", t.w("ek.ctx"), "-u", t.w("ek-created.pub")); err != nil {
+				return err
+			}
+			k, err := t.readEK(t.w("ek.ctx"))
+			t.r.Run("tpm2_flushcontext", "-t") //nolint:errcheck
+			if err != nil {
+				continue
+			}
+			if ok, err := admit(k); ok || err != nil {
+				return err
+			}
+			names = append(names, hex.EncodeToString(k.Name()))
+		}
+	default:
+		// locked TPM without its salt key (interrupted healing): the admission
+		// under which index V was created
+		pub, err := ReadPublic(t.r, PCRPolicy)
+		if err != nil {
+			return err
+		}
+		prefix := t.id.Ref + ":ek:"
+		for ref := range t.files {
+			if !strings.HasPrefix(ref, prefix) {
+				continue
+			}
+			name, err := hex.DecodeString(strings.TrimPrefix(ref, prefix))
+			if err != nil {
+				continue
+			}
+			if err := t.setRef(ref); err != nil {
+				return err
+			}
+			if bytes.Equal(t.b1, pub.AuthPolicy) {
+				t.ekName, t.ekAlgs = name, ekcert.Algs
+				t.saltSource = fmt.Sprintf("signed per-device admission of EK %x", name)
+				return nil
+			}
 		}
 	}
-	if tr.allow[hex.EncodeToString(k.Name())] {
-		return "signed EK allowlist of the release", nil
+	return fmt.Errorf("the TPM's endorsement key cannot be authenticated: %s; and no signed per-device admission for this TPM's endorsement key (%s) accompanies the release",
+		why, strings.Join(names, ", "))
+}
+
+// runtimeEK is chooseEK for the steps after the unlock (verify, state
+// service, selftest): the persistent salt key exists, and the policy chosen
+// at unlock is checked against the ref computed here.
+func (t *tpm) runtimeEK() error {
+	nv, err := DefinedIndices(t.r)
+	if err != nil {
+		return err
 	}
-	if len(tr.certified) > 0 {
-		return "", fmt.Errorf("endorsement key %x (%s) is not the key of this TPM's EK certificate (%s): substituted key or foreign certificate",
-			k.Name(), k.Alg, tr.certified[0].desc)
+	trust, err := t.loadEKTrust(nv)
+	if err != nil {
+		return err
 	}
-	return "", fmt.Errorf("endorsement key %x (%s) is not authentic: no valid EK certificate (%s) and not in the signed EK allowlist",
-		k.Name(), k.Alg, strings.Join(tr.problems, "; "))
+	if len(trust.certified) > 0 {
+		c := trust.certified[0]
+		t.ekName, t.ekAlgs, t.saltSource = c.key.Name(), []ekcert.Alg{c.key.Alg}, c.desc
+		return t.setRef(t.id.Ref)
+	}
+	if trust.discrete {
+		return errors.New("the TPM's endorsement key is refused: " + strings.Join(trust.problems, "; "))
+	}
+	k, err := t.readEK(SaltHandle)
+	if err != nil {
+		return fmt.Errorf("salt key %s: %w", SaltHandle, err)
+	}
+	t.ekName, t.ekAlgs = k.Name(), []ekcert.Alg{k.Alg}
+	t.saltSource = fmt.Sprintf("signed per-device admission of EK %x", k.Name())
+	return t.setRef(tpmpolicy.RefEK(t.id.Ref, k.Name()))
+}
+
+// acceptEK decides whether k is this device's authenticated endorsement key.
+func (t *tpm) acceptEK(k ekcert.Key) error {
+	if len(t.ekName) == 0 {
+		return errors.New("endorsement key not authenticated yet")
+	}
+	if !bytes.Equal(k.Name(), t.ekName) {
+		return fmt.Errorf("endorsement key %x (%s) is not the authenticated key of this TPM (%x, %s): substituted key or foreign certificate",
+			k.Name(), k.Alg, t.ekName, t.saltSource)
+	}
+	return nil
 }
 
 // readEK reads a public area (persistent handle or context file) and
@@ -605,13 +770,12 @@ func (t *tpm) readEK(ref string) (ekcert.Key, error) {
 // the authenticated public area: ESYS then issues no TPM2_ReadPublic, so
 // nothing an interposer answers later can change the key the salt is
 // encrypted to. recorded, if not nil, is the Name pinned in record A.
-func (t *tpm) useSalt(tr ekTrust, recorded []byte) error {
+func (t *tpm) useSalt(recorded []byte) error {
 	k, err := t.readEK(SaltHandle)
 	if err != nil {
 		return fmt.Errorf("salt key %s: %w", SaltHandle, err)
 	}
-	src, err := tr.accept(k)
-	if err != nil {
+	if err := t.acceptEK(k); err != nil {
 		return fmt.Errorf("salt key %s: %w", SaltHandle, err)
 	}
 	if recorded != nil && !bytes.Equal(k.Name(), recorded) {
@@ -620,19 +784,14 @@ func (t *tpm) useSalt(tr ekTrust, recorded []byte) error {
 	if err := t.put("salt.tr", k.SerializedTR(uint32(handleNum(SaltHandle)))); err != nil {
 		return err
 	}
-	t.salt, t.saltSource = &k, src
+	t.salt = &k
 	return nil
 }
 
 // recordedSalt authenticates the salt key against the trust anchors and
-// record A (runtime users: state commits, selftest).
+// record A (runtime users: state service, selftest).
 func (t *tpm) recordedSalt() error {
-	nv, err := DefinedIndices(t.r)
-	if err != nil {
-		return err
-	}
-	tr, err := t.loadEKTrust(nv)
-	if err != nil {
+	if err := t.runtimeEK(); err != nil {
 		return err
 	}
 	rec, err := ReadNV(t.r, Record)
@@ -643,24 +802,15 @@ func (t *tpm) recordedSalt() error {
 	if err != nil {
 		return err
 	}
-	return t.useSalt(tr, rd.SaltName)
+	return t.useSalt(rd.SaltName)
 }
 
-// installSalt creates the authentic endorsement key and persists it at
+// installSalt creates the authenticated endorsement key and persists it at
 // SaltHandle. policy selects authorization by policy P (locked TPM) instead
 // of the empty hierarchy auth of a fresh TPM.
-func (t *tpm) installSalt(tr ekTrust, policy bool) error {
-	algs := ekcert.Algs
-	if len(tr.certified) > 0 {
-		algs = nil
-		for _, c := range tr.certified {
-			algs = append(algs, c.key.Alg)
-		}
-	} else if len(tr.allow) == 0 {
-		return fmt.Errorf("the TPM's endorsement key cannot be authenticated: %s; no signed EK allowlist in this release", strings.Join(tr.problems, "; "))
-	}
+func (t *tpm) installSalt(policy bool) error {
 	var problems []string
-	for _, alg := range algs {
+	for _, alg := range t.ekAlgs {
 		if _, err := t.run("tpm2_flushcontext", "-t"); err != nil {
 			return err
 		}
@@ -677,7 +827,7 @@ func (t *tpm) installSalt(tr ekTrust, policy bool) error {
 		}
 		k, err := t.readEK(t.w("ek.ctx"))
 		if err == nil {
-			_, err = tr.accept(k)
+			err = t.acceptEK(k)
 		}
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s: %v", alg, err))
@@ -695,7 +845,7 @@ func (t *tpm) installSalt(tr ekTrust, policy bool) error {
 		if _, err := t.run("tpm2_flushcontext", "-t"); err != nil {
 			return err
 		}
-		return t.useSalt(tr, nil)
+		return t.useSalt(nil)
 	}
 	t.r.Run("tpm2_flushcontext", "-t") //nolint:errcheck
 	return errors.New(strings.Join(problems, "; "))
@@ -901,4 +1051,66 @@ func (t *tpm) disableDA(policy bool) error {
 		return errors.New("the TPM stays in dictionary-attack lockout")
 	}
 	return nil
+}
+
+// checkSignature has the TPM verify the signature of a policy for the
+// device's policyRef. The first boot calls it before it creates anything,
+// so that a forged policy or admission leaves the TPM untouched.
+func (t *tpm) checkSignature(f tpmpolicy.File) error {
+	_, approved, err := f.DecodeRef(t.id.Role, t.id.Profile, t.ref)
+	if err != nil {
+		return err
+	}
+	sig, err := base64.StdEncoding.DecodeString(f.Signature)
+	if err != nil {
+		return fmt.Errorf("bad signature encoding: %w", err)
+	}
+	if err := t.put("pre-msg.bin", tpmpolicy.SignedMessage(approved, t.ref)); err != nil {
+		return err
+	}
+	if err := t.put("pre-sig.bin", sig); err != nil {
+		return err
+	}
+	if _, err := t.run("tpm2_verifysignature", "-c", t.w("key.ctx"), "-g", "sha256", "-m", t.w("pre-msg.bin"),
+		"-s", t.w("pre-sig.bin"), "-f", "rsassa", "-t", t.w("pre-ticket.bin")); err != nil {
+		return fmt.Errorf("approved policy signature rejected: %w", err)
+	}
+	_, err = t.run("tpm2_flushcontext", "-t")
+	return err
+}
+
+// ForeignObjects lists TPM objects that enklave does not account for. The
+// dictionary-attack lockout is disabled, which is sound only while nothing
+// in the TPM is protected by a guessable authValue: every enklave object is
+// NO_DA with a 256-bit or empty-and-policy-only authorization, the
+// hierarchies have random 256-bit authValues, and the only other objects
+// allowed are the vendor's EK certificates and keys (TCG-reserved ranges,
+// no secret authValue) and the storage root key systemd creates at
+// 0x81000001 (empty authValue by design, protects nothing of enklave's).
+func ForeignObjects(r Runner) ([]string, error) {
+	nv, err := DefinedIndices(r)
+	if err != nil {
+		return nil, err
+	}
+	pers, err := handles(r, "handles-persistent")
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for h := range nv {
+		known := h >= 0x01C00000 && h <= 0x01C0FFFF
+		for _, ix := range allIndices {
+			known = known || h == handleNum(ix.Handle)
+		}
+		if !known {
+			out = append(out, fmt.Sprintf("NV 0x%08X", h))
+		}
+	}
+	for h := range pers {
+		if h != handleNum(SaltHandle) && h != 0x81000001 && !(h >= 0x81010000 && h <= 0x8101FFFF) {
+			out = append(out, fmt.Sprintf("persistent 0x%08X", h))
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }

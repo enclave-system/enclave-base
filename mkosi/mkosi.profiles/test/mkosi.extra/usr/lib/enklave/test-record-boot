@@ -1,7 +1,8 @@
 #!/bin/sh
 # Test profile only: record this boot in the authenticated state store
-# through enklave-varauth state-exec. ESP:/EFI/enklave/test-pause-state may
-# name a commit phase at which state-exec pauses (crash-consistency proofs).
+# through the state service (writer "test-record", reserved for
+# enklave-test-marker.service). ESP:/EFI/enklave/test-pause-state may name a
+# commit phase at which the service pauses (crash-consistency proofs).
 set -eu
 pause=""
 esp=/run/enklave-test-esp
@@ -11,7 +12,5 @@ if mount -t vfat -o nosuid,nodev,noexec /dev/disk/by-partlabel/esp "$esp" 2>/dev
     umount "$esp"
 fi
 export ENKLAVE_STATE_PAUSE="$pause"
-/usr/lib/enklave/enklave-varauth state-exec -- /bin/sh -c '
-    [ -e "$ENKLAVE_STATE_DIR/marker" ] || : > "$ENKLAVE_STATE_DIR/marker"
-    head -c 6000 /dev/urandom | od -An -tx1 >> "$ENKLAVE_STATE_DIR/bootlog"'
+/usr/lib/enklave/enklave-varauth state-exec test-record < /dev/null
 echo "enklave-test-marker: present" > /dev/ttyS0

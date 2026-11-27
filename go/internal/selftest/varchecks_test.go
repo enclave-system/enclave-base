@@ -20,6 +20,7 @@ import (
 
 	"enklave.local/base/internal/ekcert"
 	"enklave.local/base/internal/tpmpolicy"
+	"enklave.local/base/internal/varauth"
 )
 
 const (
@@ -78,10 +79,15 @@ func newEK() (ekcert.Key, []byte, []byte) {
 	}
 	ca, _ := x509.ParseCertificate(caDER)
 	ek, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	name, _ := asn1.Marshal(pkix.Name{CommonName: "tpm"}.ToRDNSequence())
+	var rdn pkix.RDNSequence
+	for _, last := range []int{1, 2, 3} {
+		rdn = append(rdn, pkix.RelativeDistinguishedNameSET{{Type: asn1.ObjectIdentifier{2, 23, 133, 2, last}, Value: "id:00001014"}})
+	}
+	name, _ := asn1.Marshal(rdn)
 	san, _ := asn1.Marshal([]asn1.RawValue{{Class: asn1.ClassContextSpecific, Tag: 4, IsCompound: true, Bytes: name}})
 	tpl := &x509.Certificate{SerialNumber: big.NewInt(2), NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour),
-		ExtraExtensions: []pkix.Extension{{Id: asn1.ObjectIdentifier{2, 5, 29, 17}, Critical: true, Value: san}}}
+		UnknownExtKeyUsage: []asn1.ObjectIdentifier{{2, 23, 133, 8, 1}},
+		ExtraExtensions:    []pkix.Extension{{Id: asn1.ObjectIdentifier{2, 5, 29, 17}, Critical: true, Value: san}}}
 	der, err := x509.CreateCertificate(rand.Reader, tpl, ca, &ek.PublicKey, caKey)
 	if err != nil {
 		panic(err)
@@ -115,9 +121,29 @@ func measureLog(events ...string) (string, []byte) {
 	return b.String(), v
 }
 
+// state service as the selftest sees it
+var (
+	stateReply varauth.StateReply
+	stateErr   error
+	stateFiles map[string]bool
+)
+
+func init() {
+	StateCall = func(root string, req varauth.StateRequest) (varauth.StateReply, error) {
+		if stateErr != nil {
+			return varauth.StateReply{}, stateErr
+		}
+		if req.Op == "read" && !stateFiles[req.Path] {
+			return varauth.StateReply{}, errors.New(req.Path + ": file does not exist")
+		}
+		return stateReply, nil
+	}
+}
+
 // goodRoot builds a fully passing fake root and runner.
 func goodRoot(t *testing.T) (string, *fakeRunner) {
 	root := t.TempDir()
+	stateReply, stateErr, stateFiles = varauth.StateReply{OK: true, Version: 42, Counter: 42}, nil, map[string]bool{}
 	put(t, root, sbPath, "\x06\x00\x00\x00\x01")
 	put(t, root, smPath, "\x06\x00\x00\x00\x00")
 	put(t, root, "sys/kernel/security/lockdown", "none integrity [confidentiality]\n")
@@ -143,32 +169,33 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 	put(t, root, "run/enklave/var-authenticated", strings.Repeat("15", 32)+"\n")
 	put(t, root, "run/enklave/var-counter", "42\n")
 	put(t, root, "run/enklave/platform", "firmware-auth\n")
-	put(t, root, "run/enklave/state.key", strings.Repeat("k", 64))
 	put(t, root, "var/lib/enklave/.manifest", `{"version":42,"entries":[],"mac":"00"}`)
 	put(t, root, "run/systemd/tpm2-pcr-signature.json", `{"sha256":[{"pcrs":[11],"pol":"`+strings.Repeat("dd", 32)+`"}]}`)
 	put(t, root, "run/enklave/policy.json", `{"version":2,"pcr11_policy":"`+strings.Repeat("ee", 32)+`"}`)
 	log, pcr15 := measureLog("cryptsetup:var:"+luksUUID, "machine-id:0123")
 	put(t, root, "run/log/systemd/tpm2-measure.log", log)
 	r := &fakeRunner{out: map[string]string{
-		luksDumpCmd:                    goodLuksDump,
-		"tpm2_nvreadpublic 0x01800E01": nvPublic("0x01800E01", 0x22042808, 74, fakeP),
-		"tpm2_nvreadpublic 0x01800E02": nvPublic("0x01800E02", 0xB2082808, 64, fakeP),
-		"tpm2_nvreadpublic 0x01800E03": nvPublic("0x01800E03", 0x22080018, 8, fakePC),
-		"tpm2_nvreadpublic 0x01800E04": nvPublic("0x01800E04", 0x22040028, 8, fakePE),
-		"tpm2_nvreadpublic 0x01800E05": nvPublic("0x01800E05", 0x22040002, 34, fakeB1),
-		pcrPolicyReadCmd:               "\x00\x0b" + string(unhex(fakeLit)),
-		"tpm2_getcap handles-nv-index": "- 0x1800E01\n- 0x1800E02\n- 0x1800E03\n- 0x1800E04\n- 0x1800E05\n- 0x1C0000A\n",
-		ekCertReadCmd:                  string(ekCert) + strings.Repeat("\x00", 32),
-		recordReadCmd:                  recordVal,
-		hierCmd:                        lockedHier,
-		"tpm2_pcrread sha256:7":        "  sha256:\n    7 : 0x" + strings.Repeat("07", 32) + "\n",
-		"tpm2_pcrread sha256:0":        "  sha256:\n    0 : 0x" + strings.Repeat("F0", 32) + "\n",
-		"tpm2_pcrread sha256:2":        "  sha256:\n    2 : 0x" + strings.Repeat("F2", 32) + "\n",
-		"tpm2_pcrread sha256:4":        "  sha256:\n    4 : 0x" + strings.Repeat("F4", 32) + "\n",
-		"tpm2_pcrread sha256:12":       "  sha256:\n    12: 0x" + strings.Repeat("00", 32) + "\n",
-		"tpm2_pcrread sha256:15":       "  sha256:\n    15: 0x" + strings.ToUpper(hex.EncodeToString(pcr15)) + "\n",
-		"nft -j list ruleset":          goodNft,
-		unitsCmd:                       "sshd-not.service loaded active running x\nfoo.service loaded active running y\n",
+		luksDumpCmd:                      goodLuksDump,
+		"tpm2_nvreadpublic 0x01800E01":   nvPublic("0x01800E01", 0x22042808, 74, fakeP),
+		"tpm2_nvreadpublic 0x01800E02":   nvPublic("0x01800E02", 0xB2082808, 64, fakeP),
+		"tpm2_nvreadpublic 0x01800E03":   nvPublic("0x01800E03", 0x22080018, 8, fakePC),
+		"tpm2_nvreadpublic 0x01800E04":   nvPublic("0x01800E04", 0x22040028, 8, fakePE),
+		"tpm2_nvreadpublic 0x01800E05":   nvPublic("0x01800E05", 0x22040002, 34, fakeB1),
+		pcrPolicyReadCmd:                 "\x00\x0b" + string(unhex(fakeLit)),
+		"tpm2_nvreadpublic 0x01800E06":   nvPublic("0x01800E06", 0x22040002, 72, fakeB1),
+		"tpm2_getcap handles-nv-index":   "- 0x1800E01\n- 0x1800E02\n- 0x1800E03\n- 0x1800E04\n- 0x1800E05\n- 0x1800E06\n- 0x1C0000A\n",
+		"tpm2_getcap handles-persistent": "- 0x81000001\n- 0x81000E01\n- 0x81010001\n",
+		ekCertReadCmd:                    string(ekCert) + strings.Repeat("\x00", 32),
+		recordReadCmd:                    recordVal,
+		hierCmd:                          lockedHier,
+		"tpm2_pcrread sha256:7":          "  sha256:\n    7 : 0x" + strings.Repeat("07", 32) + "\n",
+		"tpm2_pcrread sha256:0":          "  sha256:\n    0 : 0x" + strings.Repeat("F0", 32) + "\n",
+		"tpm2_pcrread sha256:2":          "  sha256:\n    2 : 0x" + strings.Repeat("F2", 32) + "\n",
+		"tpm2_pcrread sha256:4":          "  sha256:\n    4 : 0x" + strings.Repeat("F4", 32) + "\n",
+		"tpm2_pcrread sha256:12":         "  sha256:\n    12: 0x" + strings.Repeat("00", 32) + "\n",
+		"tpm2_pcrread sha256:15":         "  sha256:\n    15: 0x" + strings.ToUpper(hex.EncodeToString(pcr15)) + "\n",
+		"nft -j list ruleset":            goodNft,
+		unitsCmd:                         "sshd-not.service loaded active running x\nfoo.service loaded active running y\n",
 	}}
 	r.fn = func(name string, args []string) ([]byte, bool) {
 		switch name {
@@ -282,7 +309,22 @@ func TestVarChecksNotOk(t *testing.T) {
 			r.out[luksDumpCmd] = strings.Replace(goodLuksDump, "cipher: aes-xts-plain64", "cipher: aes-cbc-essiv:sha256", 1)
 		}},
 		{"var_rollback", "counter ahead", func(t *testing.T, root string, r *fakeRunner) {
-			r.out["counter"] = "\x00\x00\x00\x00\x00\x00\x00\x2b"
+			stateReply.Counter = 43
+		}},
+		{"var_rollback", "state keys left in /run", func(t *testing.T, root string, r *fakeRunner) {
+			put(t, root, "run/enklave/state.key", strings.Repeat("k", 64))
+		}},
+		{"var_rollback", "state service not reachable", func(t *testing.T, root string, r *fakeRunner) {
+			stateErr = errors.New("state service: connection refused")
+		}},
+		{"tpm_locked", "foreign NV index while the DA lockout is off", func(t *testing.T, root string, r *fakeRunner) {
+			r.out["tpm2_getcap handles-nv-index"] += "- 0x1500016\n"
+		}},
+		{"tpm_locked", "foreign persistent key while the DA lockout is off", func(t *testing.T, root string, r *fakeRunner) {
+			r.out["tpm2_getcap handles-persistent"] += "- 0x81000002\n"
+		}},
+		{"var_authenticated", "transition index Name differs", func(t *testing.T, root string, r *fakeRunner) {
+			r.out["tpm2_nvreadpublic 0x01800E06"] = nvPublic("0x01800E06", 0x22040002, 72, strings.Repeat("99", 32))
 		}},
 		{"var_authenticated", "salt key substituted", func(t *testing.T, root string, r *fakeRunner) {
 			r.out["salt"] = string(otherEK.TPM2B())
@@ -290,14 +332,8 @@ func TestVarChecksNotOk(t *testing.T) {
 		{"var_authenticated", "salt key is not an EK", func(t *testing.T, root string, r *fakeRunner) {
 			r.out["salt"] = "\x00\x04junk"
 		}},
-		{"var_authenticated", "EK certificate missing", func(t *testing.T, root string, r *fakeRunner) {
-			r.out["tpm2_getcap handles-nv-index"] = "- 0x1800E01\n"
-		}},
 		{"var_authenticated", "vendor CA bundle missing", func(t *testing.T, root string, r *fakeRunner) {
 			os.RemoveAll(filepath.Join(root, "usr/share/enklave/tpm-ek-ca"))
-		}},
-		{"var_rollback", "salt key substituted", func(t *testing.T, root string, r *fakeRunner) {
-			r.out["salt"] = string(otherEK.TPM2B())
 		}},
 		{"var_authenticated", "PCR policy index holds another Secure Boot state", func(t *testing.T, root string, r *fakeRunner) {
 			r.out[pcrPolicyReadCmd] = "\x00\x0b" + strings.Repeat("\x77", 32)
@@ -330,9 +366,6 @@ func TestVarChecksNotOk(t *testing.T) {
 		}},
 		{"tpm_locked", "platform enabled without firmware auth", func(t *testing.T, root string, r *fakeRunner) {
 			put(t, root, "run/enklave/platform", "disabled\n")
-		}},
-		{"var_rollback", "no file", func(t *testing.T, root string, r *fakeRunner) {
-			os.Remove(filepath.Join(root, "var/lib/enklave/.manifest"))
 		}},
 		{"tpm_locked", "owner auth empty", func(t *testing.T, root string, r *fakeRunner) {
 			r.out[hierCmd] = strings.Replace(lockedHier, "ownerAuthSet:              1", "ownerAuthSet:              0", 1)
@@ -420,5 +453,16 @@ func TestDevKeys(t *testing.T) {
 	os.Remove(filepath.Join(root, "usr/lib/enklave/test-profile"))
 	if x := find(t, RunChecksWith(root, r, Options{ForbidDevKeys: true}), "dev_keys"); !x.OK || x.Detail != "production keys" {
 		t.Errorf("production: %+v", x)
+	}
+}
+
+// Without an EK certificate the device is one that was admitted per device:
+// the selftest reports that, and its policies are those of the device's own ref.
+func TestAdmittedDeviceReported(t *testing.T) {
+	root, r := goodRoot(t)
+	r.out["tpm2_getcap handles-nv-index"] = "- 0x1800E01\n- 0x1800E02\n- 0x1800E03\n- 0x1800E04\n- 0x1800E05\n- 0x1800E06\n"
+	x := find(t, RunChecks(root, r), "var_authenticated")
+	if !x.OK || !strings.Contains(x.Detail, "signed per-device admission of EK") {
+		t.Errorf("%+v", x)
 	}
 }

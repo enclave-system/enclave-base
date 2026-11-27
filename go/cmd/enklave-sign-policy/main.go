@@ -12,15 +12,19 @@
 //
 // It refuses to sign when the release metadata that went into the image
 // (--release, the verity-protected release.json) disagrees with the PKI
-// about the dev-key marker or with --epoch, a test-profile image with
-// non-dev keys, and a prod image with dev keys unless
-// --allow-dev-key-for-prod is given (development builds only).
+// about the dev-key marker or with --epoch, and when profile and PKI do not
+// fit: "prod" needs production keys, "dev" (production configuration, dev
+// keys) and "test" need a DEV-KEYS PKI.
+//
+// With --admit-ek it also signs one policy per listed endorsement-key Name,
+// for the per-device ref "<ref>:ek:<Name>" (B1): the admission of a TPM
+// without EK certificate. FAT names: <uki>.ek-<first 8 Name bytes>.json.
 //
 // Usage:
 //
 //	enklave-sign-policy --uki X.efi --key pcr-signing.key --pub pcr-signing.pub \
 //	    --epoch N --role R --profile prod|test --pki DIR --release release.json \
-//	    --out X.policy.json [--image X.raw] [--allow-dev-key-for-prod]
+//	    --out X.policy.json [--image X.raw] [--admit-ek names.txt]
 package main
 
 import (
@@ -43,10 +47,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"enklave.local/base/internal/ekcert"
 	"enklave.local/base/internal/tpmpolicy"
 	"enklave.local/base/internal/varauth"
 )
@@ -315,9 +321,9 @@ func main() {
 	out := flag.String("out", "", "output JSON")
 	image := flag.String("image", "", "disk image whose ESP receives the JSON (optional)")
 	role := flag.String("role", "", "image role (ref, client, ...)")
-	profile := flag.String("profile", "", "prod or test")
+	profile := flag.String("profile", "", "prod, dev or test")
 	pkiDir := flag.String("pki", "", "PKI directory (checked for the DEV-KEYS marker)")
-	allowDevProd := flag.Bool("allow-dev-key-for-prod", false, "development only: sign a prod image with dev keys")
+	admit := flag.String("admit-ek", "", "file with EK Names (one per line): sign a per-device admission for each (TPMs without EK certificate)")
 	releasePath := flag.String("release", "", "release.json that went into the image (checked for the dev-key marker and epoch)")
 	flag.Parse()
 	if *uki == "" || *keyPath == "" || *pub == "" || *epoch < 0 || *out == "" || *pkiDir == "" || *releasePath == "" {
@@ -328,16 +334,39 @@ func main() {
 	if err != nil {
 		die("%v", err)
 	}
-	// OOS-1: test images only with dev keys, prod images never with dev keys.
+	// OOS-1 / B1: the profile is part of the policyRef. "prod" exists only
+	// with production keys; a production configuration signed with a
+	// development PKI is "dev"; "test" and "dev" exist only with dev keys.
 	_, devErr := os.Stat(filepath.Join(*pkiDir, "DEV-KEYS"))
 	dev := devErr == nil
 	switch {
-	case *profile == "test" && !dev:
-		die("refusing to sign a test-profile image with non-dev keys (%s has no DEV-KEYS marker)", *pkiDir)
-	case *profile == "prod" && dev && !*allowDevProd:
-		die("refusing to sign a prod image with dev keys (%s/DEV-KEYS); use --allow-dev-key-for-prod for development builds only", *pkiDir)
+	case *profile != "prod" && !dev:
+		die("refusing to sign a %s-profile image with non-dev keys (%s has no DEV-KEYS marker)", *profile, *pkiDir)
 	case *profile == "prod" && dev:
-		fmt.Fprintln(os.Stderr, "enklave-sign-policy: WARNING: prod image signed with DEV keys (development build, never ship)")
+		die("refusing to sign a prod image with dev keys (%s/DEV-KEYS); a development build of the production configuration has profile dev (make ENKLAVE_DEV_PROD=1)", *pkiDir)
+	case *profile == "dev":
+		fmt.Fprintln(os.Stderr, "enklave-sign-policy: WARNING: production configuration signed with DEV keys (profile dev, development build, never ship)")
+	}
+	// B1: per-device admissions. Each is a policy signed for the ref that
+	// names ONE endorsement key; it is useless on any other device.
+	var admitted [][]byte
+	if *admit != "" {
+		ab, err := os.ReadFile(*admit)
+		if err != nil {
+			die("%v", err)
+		}
+		names, err := ekcert.ParseAllowlist(ab)
+		if err != nil {
+			die("%s: %v", *admit, err)
+		}
+		for n := range names {
+			b, _ := hex.DecodeString(n)
+			admitted = append(admitted, b)
+		}
+		sort.Slice(admitted, func(i, j int) bool { return bytes.Compare(admitted[i], admitted[j]) < 0 })
+		if *profile == "prod" && len(admitted) > 0 {
+			fmt.Fprintf(os.Stderr, "enklave-sign-policy: WARNING: signing %d per-device admission(s) with PRODUCTION keys. Admit only endorsement keys read from real hardware in a trusted environment; never the key of an emulated TPM (its private key is a file).\n", len(admitted))
+		}
 	}
 	// M2: the image must carry the truth about its keys (verity-protected
 	// release.json, covered by PCR 11 through the usr root hash).
@@ -397,39 +426,51 @@ func main() {
 		die(".pcrsig policy %x is not the %s phase (%x)", pol, phase, want)
 	}
 
-	name, err := epochName(*pub, ref, tmp)
-	if err != nil {
-		die("epoch index name: %v", err)
-	}
-	approved, err := tpmpolicy.Approved(pol, *epoch, name)
-	if err != nil {
-		die("%v", err)
-	}
 	key, err := loadKey(*keyPath)
 	if err != nil {
-		die("%v", err)
-	}
-	h := sha256.Sum256(tpmpolicy.SignedMessage(approved, ref))
-	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, h[:])
-	if err != nil {
-		die("%v", err)
-	}
-	doc := tpmpolicy.File{Version: 2, Role: *role, Profile: *profile, Epoch: *epoch, PCR11Policy: hex.EncodeToString(pol),
-		Approved: hex.EncodeToString(approved), Ref: ref, Signature: base64.StdEncoding.EncodeToString(signature), DevKeys: dev}
-	b, _ := json.MarshalIndent(doc, "", "  ")
-	if err := os.WriteFile(*out, append(b, '\n'), 0o644); err != nil {
 		die("%v", err)
 	}
 	keys := "production keys"
 	if dev {
 		keys = "DEV KEYS"
 	}
-	fmt.Printf("enklave-sign-policy: %s: phase %s proven, ref %s, epoch %d, %s, approved %x\n", filepath.Base(*uki), phase, ref, *epoch, keys, approved)
-	if *image != "" {
-		n := strings.TrimSuffix(filepath.Base(*uki), ".efi") + ".json"
-		if err := embed(*image, *out, n); err != nil {
-			die("embedding into %s: %v", *image, err)
+	base := strings.TrimSuffix(filepath.Base(*uki), ".efi")
+	// sign signs the approved policy for one policyRef and embeds it.
+	sign := func(ref, outPath, espName string, n int) {
+		etmp := filepath.Join(tmp, fmt.Sprintf("epoch-%d", n))
+		if err := os.MkdirAll(etmp, 0o700); err != nil {
+			die("%v", err)
 		}
-		fmt.Printf("enklave-sign-policy: embedded as ESP:/EFI/enklave/policy/%s\n", n)
+		name, err := epochName(*pub, ref, etmp)
+		if err != nil {
+			die("epoch index name: %v", err)
+		}
+		approved, err := tpmpolicy.Approved(pol, *epoch, name)
+		if err != nil {
+			die("%v", err)
+		}
+		h := sha256.Sum256(tpmpolicy.SignedMessage(approved, ref))
+		signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, h[:])
+		if err != nil {
+			die("%v", err)
+		}
+		doc := tpmpolicy.File{Version: 2, Role: *role, Profile: *profile, Epoch: *epoch, PCR11Policy: hex.EncodeToString(pol),
+			Approved: hex.EncodeToString(approved), Ref: ref, Signature: base64.StdEncoding.EncodeToString(signature), DevKeys: dev}
+		b, _ := json.MarshalIndent(doc, "", "  ")
+		if err := os.WriteFile(outPath, append(b, '\n'), 0o644); err != nil {
+			die("%v", err)
+		}
+		fmt.Printf("enklave-sign-policy: %s: phase %s proven, ref %s, epoch %d, %s, approved %x\n", filepath.Base(*uki), phase, ref, *epoch, keys, approved)
+		if *image != "" {
+			if err := embed(*image, outPath, espName); err != nil {
+				die("embedding into %s: %v", *image, err)
+			}
+			fmt.Printf("enklave-sign-policy: embedded as ESP:/EFI/enklave/policy/%s\n", espName)
+		}
+	}
+	sign(ref, *out, base+".json", 0)
+	for i, name := range admitted {
+		short := hex.EncodeToString(name[2:10])
+		sign(tpmpolicy.RefEK(ref, name), strings.TrimSuffix(*out, ".json")+".ek-"+short+".json", base+".ek-"+short+".json", i+1)
 	}
 }

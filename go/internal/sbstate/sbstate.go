@@ -54,6 +54,8 @@ type Event struct {
 	// Var is "<name>-<guid>" for an EV_EFI_VARIABLE_DRIVER_CONFIG event whose
 	// logged data matches its digest; empty otherwise.
 	Var string `json:"var,omitempty"`
+	// Data is the variable content of such an event (authenticated by Digest).
+	Data []byte `json:"-"`
 }
 
 func guidString(b []byte) string {
@@ -61,21 +63,22 @@ func guidString(b []byte) string {
 		binary.LittleEndian.Uint16(b[6:8]), b[8:10], b[10:16])
 }
 
-// variableName parses a UEFI_VARIABLE_DATA event and returns "<name>-<guid>".
-func variableName(data []byte) string {
+// variableName parses a UEFI_VARIABLE_DATA event and returns "<name>-<guid>"
+// and the variable data.
+func variableName(data []byte) (string, []byte) {
 	if len(data) < 32 {
-		return ""
+		return "", nil
 	}
 	nameLen := binary.LittleEndian.Uint64(data[16:24])
 	dataLen := binary.LittleEndian.Uint64(data[24:32])
 	if nameLen > 256 || dataLen > uint64(len(data)) || 32+nameLen*2+dataLen != uint64(len(data)) {
-		return ""
+		return "", nil
 	}
 	u := make([]uint16, nameLen)
 	for i := range u {
 		u[i] = binary.LittleEndian.Uint16(data[32+2*i:])
 	}
-	return string(utf16.Decode(u)) + "-" + guidString(data[:16])
+	return string(utf16.Decode(u)) + "-" + guidString(data[:16]), data[32+nameLen*2:]
 }
 
 type reader struct {
@@ -158,7 +161,7 @@ func ParseLog(log []byte, pcr uint32) ([]Event, []byte, error) {
 		value = s[:]
 		e := Event{Type: typ, Digest: hex.EncodeToString(digest)}
 		if d := sha256.Sum256(data); typ == EvVariableDriverCfg && bytes.Equal(d[:], digest) {
-			e.Var = variableName(data)
+			e.Var, e.Data = variableName(data)
 		}
 		out = append(out, e)
 	}
@@ -182,35 +185,49 @@ func HasVariables(evs []Event, vars []string) error {
 	return nil
 }
 
-// Compare checks that the PCR 7 events after a variable update equal those
-// before it, except for the content of the updated variables: same number
-// and types of events, every other event with an identical digest. Any other
-// difference means a different Secure Boot configuration (other keys, Secure
-// Boot disabled, another signing authority) and is refused.
-func Compare(before, after []Event, updated []string) error {
-	if len(before) != len(after) {
-		return fmt.Errorf("PCR 7 has %d events, had %d before the update", len(after), len(before))
-	}
-	allowed := map[string]bool{}
+// StateDigest is a canonical digest of a Secure Boot state as measured into
+// PCR 7. Every event contributes its type and digest, except the variables
+// named in updated: those contribute the SET of their signatures (type and
+// data, without owner and list layout), united with add[variable].
+//
+// It is used to pin, before a signed variable update is handed to the
+// firmware, exactly two states that may follow: the unchanged one
+// (StateDigest(old, vars, nil)) and the one in which each updated variable
+// holds exactly its old signatures plus those of the signed update
+// (StateDigest(old, vars, update)). After the update the same function over
+// the new event log with add == nil must give the second value. Any other
+// change (Secure Boot off, other PK/KEK/db, another signing authority, a
+// dropped or foreign dbx entry, an additional or missing event) gives a
+// different digest.
+func StateDigest(evs []Event, updated []string, add map[string][]Signature) ([]byte, error) {
+	upd := map[string]bool{}
 	for _, v := range updated {
-		allowed[v] = true
+		upd[v] = true
 	}
-	for i := range before {
-		b, a := before[i], after[i]
-		switch {
-		case b.Type != a.Type || b.Var != a.Var:
-			return fmt.Errorf("PCR 7 event %d changed its kind (type 0x%x %q, was 0x%x %q)", i, a.Type, a.Var, b.Type, b.Var)
-		case b.Digest == a.Digest:
-		case a.Var != "" && allowed[a.Var]:
-		default:
-			what := a.Var
-			if what == "" {
-				what = fmt.Sprintf("type 0x%x", a.Type)
-			}
-			return fmt.Errorf("PCR 7 event %d (%s) changed although no signed update covers it", i, what)
+	h := sha256.New()
+	fmt.Fprintf(h, "enklave-sb-state-v1\x00%d\x00", len(evs))
+	for _, e := range evs {
+		fmt.Fprintf(h, "%08x\x00", e.Type)
+		if e.Var == "" || !upd[e.Var] {
+			fmt.Fprintf(h, "d\x00%s\x00", e.Digest)
+			continue
 		}
+		sigs, err := ParseESL(e.Data)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", e.Var, err)
+		}
+		set := map[string]bool{}
+		for _, s := range append(sigs, add[e.Var]...) {
+			set[s.Type+":"+s.Data] = true
+		}
+		keys := make([]string, 0, len(set))
+		for k := range set {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Fprintf(h, "v\x00%s\x00%d\x00%s\x00", e.Var, len(keys), strings.Join(keys, "\x00"))
 	}
-	return nil
+	return h.Sum(nil), nil
 }
 
 // ---------------------------------------------------------------- signature lists

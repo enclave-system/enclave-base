@@ -304,7 +304,11 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 				return nil, errors.New("TPM_RC_HANDLE (salt key)")
 			}
 			if !bytes.Equal(seen, f.pers[handle]) {
+				// the salt was encrypted to a key the TPM does not hold: whoever
+				// holds that key learns the session key; the TPM itself cannot
+				// decrypt the salt and refuses (0x2C4 on swtpm)
 				f.violate("session salted to a substituted key (bus interposer learns the session key)")
+				return nil, errors.New("TPM_RC_VALUE 0x2C4 (salt not decryptable by the TPM)")
 			}
 			if f.inLockout() {
 				return nil, errors.New("TPM_RC_LOCKOUT 0x921: the TPM is in DA lockout mode")
@@ -726,14 +730,23 @@ func vendorCA() *testCA {
 }
 
 // ekCertificate issues an EK certificate like TPM vendors do (critical
-// directoryName subjectAltName, EK extended key usage).
-func (ca *testCA) ekCertificate(pub *ecdsa.PublicKey) []byte {
-	name, _ := asn1.Marshal(pkix.Name{CommonName: "fake tpm"}.ToRDNSequence())
+// directoryName subjectAltName with the TPM attributes, EK extended key usage).
+func (ca *testCA) ekCertificate(pub *ecdsa.PublicKey) []byte { return ca.certificate(pub, nil) }
+
+func (ca *testCA) certificate(pub *ecdsa.PublicKey, mut func(*x509.Certificate)) []byte {
+	var rdn pkix.RDNSequence
+	for _, last := range []int{1, 2, 3} { // tcg-at-tpmManufacturer, -Model, -Version
+		rdn = append(rdn, pkix.RelativeDistinguishedNameSET{{Type: asn1.ObjectIdentifier{2, 23, 133, 2, last}, Value: "id:00001014"}})
+	}
+	name, _ := asn1.Marshal(rdn)
 	san, _ := asn1.Marshal([]asn1.RawValue{{Class: asn1.ClassContextSpecific, Tag: 4, IsCompound: true, Bytes: name}})
 	tpl := &x509.Certificate{SerialNumber: big.NewInt(2), NotBefore: testNow.Add(-time.Hour), NotAfter: testNow.Add(time.Hour),
 		KeyUsage:           x509.KeyUsageKeyAgreement,
 		UnknownExtKeyUsage: []asn1.ObjectIdentifier{{2, 23, 133, 8, 1}},
 		ExtraExtensions:    []pkix.Extension{{Id: asn1.ObjectIdentifier{2, 5, 29, 17}, Critical: true, Value: san}}}
+	if mut != nil {
+		mut(tpl)
+	}
 	der, err := x509.CreateCertificate(rand.Reader, tpl, ca.cert, pub, ca.key)
 	if err != nil {
 		panic(err)
@@ -760,6 +773,14 @@ type env struct {
 	dev string
 	// pcr7, if set, overrides the PCR 7 the firmware would produce
 	pcr7 []byte
+	// badLog makes the firmware hand out an unusable event log
+	badLog bool
+
+	role, profile string
+	epoch         int
+	admitted      [][]byte // EK Names with a signed per-device admission
+	requireFTPM   bool
+	srv           *StateServer
 }
 
 func refOf(role, profile string) string { r, _ := tpmpolicy.Ref(role, profile); return r }
@@ -772,7 +793,13 @@ func fakePE(ref string) []byte {
 
 func signed(t *testing.T, pcr11 []byte, epoch int, role, profile string) tpmpolicy.File {
 	t.Helper()
-	ref := refOf(role, profile)
+	return signedRef(t, pcr11, epoch, role, profile, refOf(role, profile))
+}
+
+// signedRef signs the approved policy for an explicit policyRef (the base
+// ref, or the per-device ref of an admitted endorsement key).
+func signedRef(t *testing.T, pcr11 []byte, epoch int, role, profile, ref string) tpmpolicy.File {
+	t.Helper()
 	eName := tpmpolicy.NVName(uint32(handleNum(Epoch.Handle)), Epoch.Final, fakePE(ref), Epoch.Size)
 	approved, err := tpmpolicy.Approved(fakePol11(pcr11), epoch, eName)
 	if err != nil {
@@ -788,14 +815,17 @@ func newEnv(t *testing.T, profile string) *env {
 	c := Config{
 		RunDir: filepath.Join(d, "run"), PubKey: filepath.Join(d, "pub.pem"), PolicyDir: "EFI/enklave/policy",
 		RoleFile: filepath.Join(d, "usr/role"), TestMarker: filepath.Join(d, "usr/test-profile"),
-		ReleaseFile: filepath.Join(d, "usr/release.json"), StateRoot: filepath.Join(d, "state"),
+		ReleaseFile: filepath.Join(d, "usr/release.json"), StateRoot: filepath.Join(d, "run", "statecheck"), // the fake "mount" is the check mount point
 		EKCADir: filepath.Join(d, "usr/tpm-ek-ca"), EKTestCADir: filepath.Join(d, "usr/tpm-ek-ca-test"),
-		EKAllowlist: filepath.Join(d, "usr/ek-allowlist"), UpdatesDir: filepath.Join(d, "usr/efi-updates"),
+		WritersDir: filepath.Join(d, "usr/state-writers.d"), UpdatesDir: filepath.Join(d, "usr/efi-updates"),
 		EventLog: filepath.Join(d, "sys/binary_bios_measurements"),
 		Now:      func() time.Time { return testNow },
 	}
 	e := &env{c: c, f: newFakeTPM(t, c.stateMount()), fw: sbtest.NewFirmware(), dev: "/dev/vda8"}
 	e.c.EFI = e.fw
+	os.MkdirAll(c.WritersDir, 0o755)
+	os.WriteFile(filepath.Join(c.WritersDir, "config.json"),
+		[]byte(`{"unit":"enklave-config.service","exec":["/bin/sh","-c","cat > \"$ENKLAVE_STATE_DIR/config\""]}`), 0o644)
 	os.MkdirAll(filepath.Join(c.EKCADir, "Vendor/RootCA"), 0o755)
 	os.MkdirAll(filepath.Dir(c.EventLog), 0o755)
 	os.WriteFile(filepath.Join(c.EKCADir, "Vendor/RootCA/ca.cer"), vendorCA().cert.Raw, 0o644)
@@ -804,7 +834,6 @@ func newEnv(t *testing.T, profile string) *env {
 	return e
 }
 
-// setImage simulates booting a given image (role/profile/epoch/heal).
 func (e *env) setImage(t *testing.T, role, profile string, epoch, heal int) {
 	t.Helper()
 	os.MkdirAll(filepath.Dir(e.c.RoleFile), 0o755)
@@ -813,9 +842,28 @@ func (e *env) setImage(t *testing.T, role, profile string, epoch, heal int) {
 	if profile == "test" {
 		os.WriteFile(e.c.TestMarker, nil, 0o644)
 	}
-	os.WriteFile(e.c.ReleaseFile, []byte(fmt.Sprintf(`{"epoch":%d,"heal_below":%d}`, epoch, heal)), 0o644)
+	// prod: production keys; dev and test images are signed with a development PKI
+	os.WriteFile(e.c.ReleaseFile, []byte(fmt.Sprintf(`{"epoch":%d,"heal_below":%d,"dev_keys":%v,"require_ftpm":%v}`,
+		epoch, heal, profile != "prod", e.requireFTPM)), 0o644)
+	e.role, e.profile, e.epoch = role, profile, epoch
 	e.f.pcr[11] = h([]byte("uki"), []byte(fmt.Sprintf("%s/%s/%d", role, profile, epoch)))
 	e.install(t, signed(t, e.f.pcr[11], epoch, role, profile))
+	for _, name := range e.admitted {
+		e.install(t, signedRef(t, e.f.pcr[11], epoch, role, profile, tpmpolicy.RefEK(refOf(role, profile), name)))
+	}
+}
+
+// admit ships a signed per-device admission for the EK with the given Name
+// with this and every later release (B1).
+func (e *env) admit(t *testing.T, name []byte) {
+	t.Helper()
+	e.admitted = append(e.admitted, name)
+	e.install(t, signedRef(t, e.f.pcr[11], e.epoch, e.role, e.profile, tpmpolicy.RefEK(refOf(e.role, e.profile), name)))
+}
+
+func (e *env) ekName() []byte {
+	k, _ := ekcert.FromPublicKey(&e.f.ek.PublicKey)
+	return k.Name()
 }
 
 func (e *env) install(t *testing.T, p tpmpolicy.File) {
@@ -823,7 +871,7 @@ func (e *env) install(t *testing.T, p tpmpolicy.File) {
 	dir := filepath.Join(e.c.espMount(), e.c.PolicyDir)
 	os.MkdirAll(dir, 0o700)
 	b := mustJSON(p)
-	if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%s-%s-%d.json", p.Role, p.Profile, p.Epoch)), b, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%s-%s-%d-%x.json", p.Role, p.Profile, p.Epoch, h([]byte(p.Ref))[:6])), b, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -841,8 +889,12 @@ func (e *env) boot(t *testing.T) error {
 		ix.attrs &^= attrReadLocked
 	}
 	e.f.pcr[15] = make([]byte, 32)
+	e.srv = nil
 	// the firmware measures the Secure Boot variables of this boot into PCR 7
 	log, pcr7 := e.fw.Boot()
+	if e.badLog {
+		log = log[:len(log)/2]
+	}
 	if err := os.WriteFile(e.c.EventLog, log, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -871,17 +923,32 @@ func (e *env) counter() uint64 {
 	return binary.BigEndian.Uint64(e.f.nv[handleNum(Counter.Handle)].data)
 }
 
+// state returns the state service of this boot (it takes the keys out of /run).
+func (e *env) state(t *testing.T) *StateServer {
+	t.Helper()
+	if e.srv == nil {
+		s, err := NewStateServer(e.c, e.f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.srv = s
+	}
+	return e.srv
+}
+
+// commit writes data/config through the image's test writer, called from
+// the unit the writer is reserved for.
 func (e *env) commit(t *testing.T, rel, content string) {
 	t.Helper()
-	s, err := OpenStore(e.c, e.f, nil)
-	if err != nil {
-		t.Fatal(err)
+	if rel != "config" {
+		t.Fatalf("the test writer writes config only, not %s", rel)
 	}
-	s.Root = e.c.stateMount() // the fake "mount" is the check mount point
-	if _, err := s.Exec(func(st string) error {
-		return os.WriteFile(filepath.Join(st, rel), []byte(content), 0o644)
-	}); err != nil {
-		t.Fatal(err)
+	in := filepath.Join(t.TempDir(), "in")
+	os.WriteFile(in, []byte(content), 0o600)
+	f, _ := os.Open(in)
+	defer f.Close()
+	if rep := e.state(t).Handle(StateRequest{Op: "exec", Writer: "config"}, "enklave-config.service", f); !rep.OK {
+		t.Fatal(rep.Error)
 	}
 }
 

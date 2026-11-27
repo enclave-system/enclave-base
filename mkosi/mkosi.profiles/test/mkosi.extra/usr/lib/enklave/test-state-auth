@@ -1,0 +1,23 @@
+#!/bin/sh
+# Test profile only (B8): root in a unit that no state writer is reserved for
+# tries to commit state. Every attempt must be refused:
+#  1. the image's writer, called from this (other) unit,
+#  2. the same from a transient unit started with systemd-run,
+#  3. a writer that the image does not define,
+#  4. the state keys: the file must be gone from /run.
+# A verified read is allowed for any root caller and must work.
+V=/usr/lib/enklave/enklave-varauth
+r="ok"
+last=""
+try() { # <label> <command...>: the command must fail
+    label="$1"; shift
+    if out=$("$@" 2>&1 < /dev/null); then r="BAD: $label succeeded"; fi
+    last="$(printf '%s' "$out" | tail -n 1)"
+    echo "enklave-test-state-auth: $label -> ${last#*FAILED: }" > /dev/ttyS0
+}
+try "writer test-record from enklave-test-state-auth.service" $V state-exec test-record
+try "writer test-record from a transient unit (systemd-run)" systemd-run --quiet --wait --pipe --collect $V state-exec test-record
+try "writer not defined by the image" $V state-exec sh
+if [ -e /run/enklave/state.key ]; then r="BAD: state keys readable in /run"; fi
+if ! $V state-status > /dev/null 2>&1; then r="BAD: state-status failed"; fi
+echo "enklave-test-state-auth: $r: state keys in /run: $(ls /run/enklave/state.key 2>/dev/null || echo none); $($V state-status 2>&1 | tail -n 1)" > /dev/ttyS0

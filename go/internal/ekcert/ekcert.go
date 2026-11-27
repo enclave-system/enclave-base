@@ -209,11 +209,27 @@ type Store struct {
 	Roots, Intermediates *x509.CertPool
 	NRoots, NInter       int
 	Skipped              []string // files that hold no parseable certificate
+	vendor               map[[32]byte]string
 }
+
+// FirmwareVendors are the bundle directories of vendors whose TPMs are
+// firmware TPMs (no external bus): AMD fTPM and Pluton, Intel PTT, Qualcomm.
+// The other directories (Atmel, Infineon, NationZ, Nuvoton, STMicro) are
+// discrete TPMs.
+var FirmwareVendors = map[string]bool{"AMD": true, "Intel": true, "QC": true}
+
+// Info describes a validated EK certificate.
+type Info struct {
+	Issuer string
+	Vendor string // bundle directory of the trust anchor ("AMD", "Infineon", ...)
+}
+
+// Firmware reports whether the certificate was issued by a firmware-TPM vendor.
+func (i Info) Firmware() bool { return FirmwareVendors[i.Vendor] }
 
 // NewStore returns an empty store.
 func NewStore() *Store {
-	return &Store{Roots: x509.NewCertPool(), Intermediates: x509.NewCertPool()}
+	return &Store{Roots: x509.NewCertPool(), Intermediates: x509.NewCertPool(), vendor: map[[32]byte]string{}}
 }
 
 // ParseCertificates parses one or more certificates in DER (possibly
@@ -269,6 +285,12 @@ func (s *Store) AddDir(dir string) error {
 		if err != nil {
 			return err
 		}
+		vendor := filepath.Base(dir)
+		if rel, err := filepath.Rel(dir, path); err == nil {
+			if parts := strings.Split(filepath.ToSlash(rel), "/"); len(parts) > 2 {
+				vendor = parts[0]
+			}
+		}
 		certs := ParseCertificates(b)
 		if len(certs) == 0 {
 			s.Skipped = append(s.Skipped, path)
@@ -276,6 +298,7 @@ func (s *Store) AddDir(dir string) error {
 		}
 		for _, c := range certs {
 			s.Roots.AddCert(c)
+			s.vendor[sha256.Sum256(c.Raw)] = vendor
 			if kind == "RootCA" {
 				s.NRoots++
 			} else {
@@ -295,6 +318,9 @@ func (s *Store) AddIntermediates(b []byte) {
 }
 
 var (
+	oidEKU       = asn1.ObjectIdentifier{2, 23, 133, 8, 1} // tcg-kp-EKCertificate
+	oidAnyEKU    = asn1.ObjectIdentifier{2, 5, 29, 37, 0}
+	oidTPMAttrs  = []asn1.ObjectIdentifier{{2, 23, 133, 2, 1}, {2, 23, 133, 2, 2}, {2, 23, 133, 2, 3}} // manufacturer, model, version
 	oidSAN       = asn1.ObjectIdentifier{2, 5, 29, 17}
 	oidRSA       = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
 	oidRSAESOAEP = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 7}
@@ -333,19 +359,96 @@ func trimDER(b []byte) ([]byte, error) {
 	return raw.FullBytes, nil
 }
 
+// hasEKU reports whether a certificate is marked for EK certificates.
+func hasEKU(c *x509.Certificate) bool {
+	for _, o := range c.UnknownExtKeyUsage {
+		if o.Equal(oidEKU) {
+			return true
+		}
+	}
+	return false
+}
+
+// chainAllowsEKU applies the extended-key-usage rules of RFC 5280 to the
+// EK usage, which crypto/x509 does not know: the leaf must carry
+// tcg-kp-EKCertificate, and an issuing CA below the trust anchor that
+// restricts its usages must include it (or anyExtendedKeyUsage).
+func chainAllowsEKU(chain []*x509.Certificate) bool {
+	if !hasEKU(chain[0]) {
+		return false
+	}
+	for _, c := range chain[1 : len(chain)-1] {
+		if len(c.ExtKeyUsage)+len(c.UnknownExtKeyUsage) == 0 || hasEKU(c) {
+			continue
+		}
+		any := false
+		for _, u := range c.ExtKeyUsage {
+			any = any || u == x509.ExtKeyUsageAny
+		}
+		for _, o := range c.UnknownExtKeyUsage {
+			any = any || o.Equal(oidAnyEKU)
+		}
+		if !any {
+			return false
+		}
+	}
+	return true
+}
+
+// tpmAttributes checks the subjectAltName of an EK certificate: the TCG EK
+// Credential Profile requires a directoryName with the TPM manufacturer,
+// model and version attributes.
+func tpmAttributes(c *x509.Certificate) error {
+	for _, e := range c.Extensions {
+		if !e.Id.Equal(oidSAN) {
+			continue
+		}
+		var names []asn1.RawValue
+		if rest, err := asn1.Unmarshal(e.Value, &names); err != nil || len(rest) != 0 {
+			return errors.New("malformed subjectAltName")
+		}
+		for _, n := range names {
+			if n.Class != asn1.ClassContextSpecific || n.Tag != 4 {
+				continue
+			}
+			var rdns pkix.RDNSequence
+			if _, err := asn1.Unmarshal(n.Bytes, &rdns); err != nil {
+				return errors.New("malformed directoryName in subjectAltName")
+			}
+			found := 0
+			for _, want := range oidTPMAttrs {
+				for _, set := range rdns {
+					for _, atv := range set {
+						if atv.Type.Equal(want) {
+							found++
+						}
+					}
+				}
+			}
+			if found >= len(oidTPMAttrs) {
+				return nil
+			}
+		}
+	}
+	return errors.New("EK certificate lacks the TPM manufacturer, model and version in its subjectAltName (TCG EK Credential Profile)")
+}
+
 // Verify validates an EK certificate (as read from the TPM's NV) against
 // the store at the given time and returns the EK it certifies.
-func (s *Store) Verify(der []byte, now time.Time) (Key, *x509.Certificate, error) {
+func (s *Store) Verify(der []byte, now time.Time) (Key, Info, error) {
 	der, err := trimDER(der)
 	if err != nil {
-		return Key{}, nil, err
+		return Key{}, Info{}, err
 	}
 	c, err := x509.ParseCertificate(der)
 	if err != nil {
-		return Key{}, nil, fmt.Errorf("EK certificate: %w", err)
+		return Key{}, Info{}, fmt.Errorf("EK certificate: %w", err)
 	}
 	if c.IsCA {
-		return Key{}, nil, errors.New("EK certificate is a CA certificate")
+		return Key{}, Info{}, errors.New("EK certificate is a CA certificate")
+	}
+	if err := tpmAttributes(c); err != nil {
+		return Key{}, Info{}, err
 	}
 	// EK certificates carry the TPM model in a critical subjectAltName with
 	// a directoryName, which crypto/x509 reports as unhandled.
@@ -356,18 +459,33 @@ func (s *Store) Verify(der []byte, now time.Time) (Key, *x509.Certificate, error
 		}
 	}
 	c.UnhandledCriticalExtensions = unhandled
-	if _, err := c.Verify(x509.VerifyOptions{
+	// crypto/x509 can only enforce the key usages it knows; "any" here just
+	// turns its own check off. The EK usage is enforced on every chain by
+	// chainAllowsEKU below.
+	chains, err := c.Verify(x509.VerifyOptions{
 		Roots: s.Roots, Intermediates: s.Intermediates, CurrentTime: now,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
-	}); err != nil {
-		return Key{}, nil, fmt.Errorf("EK certificate (issuer %q) does not chain to a trusted TPM vendor CA: %w", c.Issuer.String(), err)
+	})
+	if err != nil {
+		return Key{}, Info{}, fmt.Errorf("EK certificate (issuer %q) does not chain to a trusted TPM vendor CA: %w", c.Issuer.String(), err)
+	}
+	info := Info{Issuer: c.Issuer.String()}
+	ok := false
+	for _, ch := range chains {
+		if chainAllowsEKU(ch) {
+			info.Vendor, ok = s.vendor[sha256.Sum256(ch[len(ch)-1].Raw)], true
+			break
+		}
+	}
+	if !ok {
+		return Key{}, Info{}, fmt.Errorf("certificate (issuer %q) is not issued for endorsement keys (extended key usage tcg-kp-EKCertificate missing in the certificate or excluded by its chain)", c.Issuer.String())
 	}
 	pub, err := publicKey(c)
 	if err != nil {
-		return Key{}, nil, err
+		return Key{}, Info{}, err
 	}
 	k, err := FromPublicKey(pub)
-	return k, c, err
+	return k, info, err
 }
 
 // ParseAllowlist parses the signed EK allowlist: one EK Name (hex,

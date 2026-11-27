@@ -30,7 +30,7 @@ func varConfig(root string) varauth.Config {
 	c.StateRoot = filepath.Join(root, "var/lib/enklave")
 	c.EKCADir = filepath.Join(root, "usr/share/enklave/tpm-ek-ca")
 	c.EKTestCADir = filepath.Join(root, "usr/share/enklave/tpm-ek-ca-test")
-	c.EKAllowlist = filepath.Join(root, "usr/lib/enklave/ek-allowlist")
+	c.WritersDir = filepath.Join(root, "usr/lib/enklave/state-writers.d")
 	c.UpdatesDir = filepath.Join(root, "usr/lib/enklave/efi-updates")
 	c.EventLog = filepath.Join(root, "sys/kernel/security/tpm0/binary_bios_measurements")
 	c.EFI = sbstate.EFIVarFS{Dir: filepath.Join(root, "sys/firmware/efi/efivars")}
@@ -117,7 +117,7 @@ func checkVarAuthenticated(root string, r Runner) (string, error) {
 	for _, ck := range []struct {
 		ix     varauth.Index
 		policy []byte
-	}{{varauth.Record, p.P}, {varauth.Secret, p.P}, {varauth.Counter, p.PC}, {varauth.Epoch, p.PE}, {varauth.PCRPolicy, p.VAuth}} {
+	}{{varauth.Record, p.P}, {varauth.Secret, p.P}, {varauth.Counter, p.PC}, {varauth.Epoch, p.PE}, {varauth.PCRPolicy, p.VAuth}, {varauth.Transition, p.VAuth}} {
 		pub, err := varauth.ReadPublic(r, ck.ix)
 		if err != nil {
 			return "", err
@@ -215,34 +215,33 @@ func checkVarIntegrity(root string, r Runner) (string, error) {
 	return "aes-xts-plain64 + hmac(sha256), argon2id", nil
 }
 
+// StateCall talks to the state service (replaced in tests).
+var StateCall = func(root string, req varauth.StateRequest) (varauth.StateReply, error) {
+	return varauth.StateCall(varConfig(root), req, nil)
+}
+
 // checkVarRollback: the authenticated state manifest version equals the TPM
-// counter and the version verified at boot.
-func checkVarRollback(root string, r Runner) (string, error) {
-	b, err := os.ReadFile(filepath.Join(root, "var/lib/enklave/.manifest"))
+// counter and the version verified at boot. The state service answers (it
+// alone holds the state keys); the key file must be gone from /run.
+func checkVarRollback(root string, _ Runner) (string, error) {
+	if err := mustNotExist(root, "run/enklave/state.key"); err != nil {
+		return "", fmt.Errorf("state keys left in /run: %w", err)
+	}
+	rep, err := StateCall(root, varauth.StateRequest{Op: "status"})
 	if err != nil {
 		return "", err
 	}
-	var m struct {
-		Version uint64 `json:"version"`
-	}
-	if err := json.Unmarshal(b, &m); err != nil {
-		return "", err
-	}
-	ctr, err := varauth.ReadCounter(varConfig(root), r)
-	if err != nil {
-		return "", err
-	}
-	if m.Version != ctr {
-		return "", fmt.Errorf("state manifest version %d != TPM counter %d", m.Version, ctr)
+	if rep.Version != rep.Counter {
+		return "", fmt.Errorf("state manifest version %d != TPM counter %d", rep.Version, rep.Counter)
 	}
 	rec, err := readTrim(root, "run/enklave/var-counter")
 	if err != nil {
 		return "", err
 	}
-	if rec != fmt.Sprint(ctr) {
-		return "", fmt.Errorf("verified version %q != TPM counter %d", rec, ctr)
+	if rec != fmt.Sprint(rep.Counter) {
+		return "", fmt.Errorf("verified version %q != TPM counter %d", rec, rep.Counter)
 	}
-	return fmt.Sprintf("state version %d", ctr), nil
+	return fmt.Sprintf("state version %d", rep.Counter), nil
 }
 
 // checkTPMLocked: owner/endorsement/lockout auth set, Clear disabled, the
@@ -277,7 +276,15 @@ func checkTPMLocked(root string, r Runner) (string, error) {
 		return "", fmt.Errorf("TPM dictionary-attack lockout not disabled (in lockout: %v, counter %d of %d, recovery time %d s)",
 			da.InLockout, da.Counter, da.MaxTries, da.Interval)
 	}
-	return "ownerAuthSet lockoutAuthSet endorsementAuthSet disableClear, DA lockout disabled, platform " + ps, nil
+	// B6: with the lockout off, nothing in the TPM may depend on it
+	foreign, err := varauth.ForeignObjects(r)
+	if err != nil {
+		return "", err
+	}
+	if len(foreign) > 0 {
+		return "", fmt.Errorf("TPM holds objects enklave does not account for (%s): with the DA lockout disabled their authValues are not protected against guessing", strings.Join(foreign, ", "))
+	}
+	return "ownerAuthSet lockoutAuthSet endorsementAuthSet disableClear, DA lockout disabled and no foreign TPM objects, platform " + ps, nil
 }
 
 // checkPCR11Sealed: PCR 11 has left every signed phase.

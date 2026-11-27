@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"enklave.local/base/internal/varauth"
 )
 
 // Runner runs external commands (nft, cryptsetup, systemctl).
@@ -384,9 +386,11 @@ func checkVersion(root string, _ Runner) (string, error) {
 	return "unknown", nil
 }
 
+// checkMarker reads the test marker through the state service: the read is
+// authenticated against the manifest and the TPM counter.
 func checkMarker(root string, _ Runner) (string, error) {
-	if _, err := os.Stat(filepath.Join(root, "var/lib/enklave/data/marker")); err != nil {
+	if _, err := StateCall(root, varauth.StateRequest{Op: "read", Path: "marker"}); err != nil {
 		return "", err
 	}
-	return "present", nil
+	return "present (authenticated read)", nil
 }

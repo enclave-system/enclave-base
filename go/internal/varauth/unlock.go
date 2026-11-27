@@ -144,15 +144,10 @@ func (k counterRT) Increment() error {
 	return err
 }
 
-// OpenStore opens the mounted state store for runtime writers: it
+// openStore opens the mounted state store with the given keys: it
 // authenticates the salt key (EK trust anchors and record A) and checks the
-// counter's policy, then uses the derived keys from /run. Root is the
-// directory the caller can write (its private read-write view of the volume).
-func OpenStore(c Config, r Runner, pause func(string)) (*statefs.Store, error) {
-	keys, err := LoadStateKeys(c)
-	if err != nil {
-		return nil, err
-	}
+// counter's policy. Only the state service calls it at runtime.
+func openStore(c Config, r Runner, keys StateKeys, pause func(string)) (*statefs.Store, error) {
 	t, err := newTPM(c, r)
 	if err != nil {
 		return nil, err
@@ -192,7 +187,7 @@ func (s tpmState) count() int {
 	return n
 }
 
-const allObjects = 6 // five NV indices and the salt key
+const allObjects = 7 // six NV indices and the salt key
 
 func readState(r Runner) (tpmState, error) {
 	var s tpmState
@@ -232,36 +227,48 @@ func Unlock(c Config, r Runner, varDev, espDev string) (string, error) {
 	if err := t.prepare(); err != nil {
 		return "", err
 	}
-	f, err := t.selectPolicy(espDev)
-	if err != nil {
+	if err := t.loadPolicies(espDev); err != nil {
 		return "", err
 	}
 	st, err := readState(r)
 	if err != nil {
 		return "", err
 	}
-
-	var key []byte
-	verb := "opened"
-	switch {
-	case first:
+	if first {
 		if st.count() != 0 || !st.h.Fresh() {
 			return "", fmt.Errorf("first boot of /var on a TPM that is not fresh (%d enklave objects, %+v)", st.count(), st.h)
 		}
 		if _, err := r.Run("cryptsetup", "isLuks", varDev); err == nil {
 			return "", fmt.Errorf("%s already carries a LUKS header on the first boot", varDev)
 		}
-		if key, err = t.provision(f, st, varDev); err != nil {
-			return "", err
-		}
-		verb = "provisioned"
-	default:
+	} else {
 		if !st.h.Locked() {
 			return "", fmt.Errorf("TPM hierarchies not locked on an enrolled machine: %+v (interrupted provisioning?)", st.h)
 		}
-		if !st.has(Epoch) || !st.has(PCRPolicy) {
-			return "", errors.New("epoch or PCR policy index missing on an enrolled machine")
+		if !st.has(Epoch) || !st.has(PCRPolicy) || !st.has(Transition) {
+			return "", errors.New("epoch, PCR policy or transition index missing on an enrolled machine")
 		}
+	}
+	// how the endorsement key is authenticated decides the device's policyRef
+	if err := t.chooseEK(st, first); err != nil {
+		return "", err
+	}
+	f, err := t.selectedPolicy()
+	if err != nil {
+		return "", err
+	}
+
+	var key []byte
+	verb := "opened"
+	if first {
+		if err := t.checkSignature(f); err != nil {
+			return "", err
+		}
+		if key, err = t.provision(f, varDev); err != nil {
+			return "", err
+		}
+		verb = "provisioned"
+	} else {
 		if err := t.authorize(f); err != nil {
 			return "", err
 		}
@@ -270,6 +277,13 @@ func Unlock(c Config, r Runner, varDev, espDev string) (string, error) {
 		}
 		if err := t.pcrMode(); err != nil {
 			return "", err
+		}
+		// B2: while a Secure Boot variable update is in transit, the complete
+		// Secure Boot state is checked here, before the volume key is read.
+		if t.mode == modeBridge {
+			if _, err := t.checkBridge(); err != nil {
+				return "", err
+			}
 		}
 		// before the first salted session of this boot
 		if err := t.disableDA(true); err != nil {
@@ -295,14 +309,10 @@ func Unlock(c Config, r Runner, varDev, espDev string) (string, error) {
 				return "", fmt.Errorf("healing: %w", err)
 			}
 			verb = "healed"
-		case !complete:
+		case !complete || rd == nil:
 			return "", fmt.Errorf("partial enklave TPM state (%d of %d objects): interrupted provisioning, refusing", st.count(), allObjects)
 		default:
-			trust, err := t.loadEKTrust(st.nv)
-			if err != nil {
-				return "", err
-			}
-			if err := t.useSalt(trust, rd.SaltName); err != nil {
+			if err := t.useSalt(rd.SaltName); err != nil {
 				return "", err
 			}
 			for _, ck := range []struct {
@@ -356,26 +366,30 @@ func (t *tpm) attach(varDev string) error {
 
 // provision runs the genuine first boot on a fresh TPM. Order (N1):
 //
-//  1. the endorsement key is authenticated (EK certificate or signed
-//     allowlist) and persisted as the salt key,
-//  2. the two indices that carry no secret and that policy P refers to are
-//     defined with the still-empty owner auth: E (revocation bits) and V
-//     (PCR-bound part of P, holding this boot's Secure Boot state),
-//  3. the hierarchies are locked (policy P, random discarded authValues sent
+//  1. the platform is checked: PolicyAuthorizeNV present, and the firmware's
+//     event log replays to PCR 7 with db, dbx and KEK measured exactly once
+//     (B7: a device that could not carry a signed Secure Boot update later is
+//     never enrolled),
+//  2. the endorsement key (authenticated by chooseEK) is persisted as the
+//     salt key,
+//  3. the indices that carry no secret and that policy P refers to are
+//     defined with the still-empty owner auth: E (revocation bits), V
+//     (PCR-bound part of P, holding this boot's Secure Boot state) and T
+//     (transition state, idle),
+//  4. the hierarchies are locked (policy P, random discarded authValues sent
 //     encrypted to the EK, Clear disabled),
-//  4. only then S, the volume, the counter C and the record A are created,
+//  5. only then S, the volume, the counter C and the record A are created,
 //     each authorized by policy P.
 //
 // Every later boot that finds a partial state fails closed.
-func (t *tpm) provision(f tpmpolicy.File, st tpmState, varDev string) ([]byte, error) {
+func (t *tpm) provision(f tpmpolicy.File, varDev string) ([]byte, error) {
 	if err := t.requireCommand("PolicyAuthorizeNV"); err != nil {
 		return nil, err
 	}
-	trust, err := t.loadEKTrust(st.nv)
-	if err != nil {
+	if err := t.requireEventLog(); err != nil {
 		return nil, err
 	}
-	if err := t.installSalt(trust, false); err != nil {
+	if err := t.installSalt(false); err != nil {
 		return nil, err
 	}
 	t.pause("salt-created")
@@ -385,11 +399,19 @@ func (t *tpm) provision(f tpmpolicy.File, st tpmState, varDev string) ([]byte, e
 	if err := t.initEpoch(); err != nil {
 		return nil, err
 	}
-	if err := t.defineFresh(PCRPolicy, "b1.bin"); err != nil {
+	if err := t.put("t-idle.bin", make([]byte, Transition.Size)); err != nil {
 		return nil, err
 	}
-	if _, err := t.run("tpm2_nvwrite", PCRPolicy.Handle, "-C", "o", "-i", t.w("v-steady.bin")); err != nil {
-		return nil, err
+	for _, w := range []struct {
+		ix   Index
+		file string
+	}{{PCRPolicy, "v-steady.bin"}, {Transition, "t-idle.bin"}} {
+		if err := t.defineFresh(w.ix, "b1.bin"); err != nil {
+			return nil, err
+		}
+		if _, err := t.run("tpm2_nvwrite", w.ix.Handle, "-C", "o", "-i", t.w(w.file)); err != nil {
+			return nil, err
+		}
 	}
 	t.pause("epoch-defined")
 	if err := t.authorize(f); err != nil {
@@ -399,6 +421,9 @@ func (t *tpm) provision(f tpmpolicy.File, st tpmState, varDev string) ([]byte, e
 		return nil, err
 	}
 	if err := t.pcrMode(); err != nil {
+		return nil, err
+	}
+	if err := t.checkIndex(Transition, Transition.Final, t.b1); err != nil {
 		return nil, err
 	}
 	// The dictionary-attack lockout is disabled while the lockout auth is
@@ -506,16 +531,15 @@ func (t *tpm) withState(fn func(root string) error) error {
 // could have learned (S, A, C) and re-provisions an empty state volume with
 // a new key.
 //
-// The re-created salt key is authenticated like on a first boot (EK
-// certificate chain or signed allowlist) and, when record A still exists,
-// must have the recorded Name (F4): an endorsement key that differs from the
-// one this device was provisioned with fails closed.
+// The re-created salt key must be the endorsement key authenticated for
+// this boot (EK certificate, or the device's signed admission) and, when
+// record A still exists, must have the recorded Name (F4). The platform
+// check of the first boot is repeated (B7).
 func (t *tpm) heal(st tpmState, rd *RecordData, varDev string) ([]byte, error) {
 	if t.mode != modeSteady {
 		return nil, errors.New("a Secure Boot variable update is pending (PCR 7 transition): boot the release that started it once more before healing")
 	}
-	trust, err := t.loadEKTrust(st.nv)
-	if err != nil {
+	if err := t.requireEventLog(); err != nil {
 		return nil, err
 	}
 	if st.pers[handleNum(SaltHandle)] {
@@ -523,7 +547,7 @@ func (t *tpm) heal(st tpmState, rd *RecordData, varDev string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	if err := t.installSalt(trust, true); err != nil {
+	if err := t.installSalt(true); err != nil {
 		return nil, err
 	}
 	if rd != nil && !bytes.Equal(t.salt.Name(), rd.SaltName) {

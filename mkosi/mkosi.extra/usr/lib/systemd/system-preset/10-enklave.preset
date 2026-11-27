@@ -5,6 +5,7 @@
 enable enklave-etc.service
 enable enklave-require-secureboot.service
 enable var-lib-enklave.mount
+enable enklave-state.service
 enable enklave-pcr11-sealed.service
 enable nftables.service
 enable apparmor.service

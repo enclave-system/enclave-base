@@ -1,0 +1,6 @@
+#!/bin/sh
+# Test profile only: the state writer "test-record" (state-writers.d). The
+# state service runs it on the staged copy of the state.
+set -eu
+[ -e "$ENKLAVE_STATE_DIR/marker" ] || : > "$ENKLAVE_STATE_DIR/marker"
+head -c 6000 /dev/urandom | od -An -tx1 >> "$ENKLAVE_STATE_DIR/bootlog"

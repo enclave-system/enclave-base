@@ -47,8 +47,8 @@ func TestSwtpmVector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if k.Alg != RSA || c.Issuer.CommonName != "swtpm-localca" {
-		t.Errorf("alg %s issuer %s", k.Alg, c.Issuer)
+	if k.Alg != RSA || c.Issuer != "CN=swtpm-localca" || c.Firmware() {
+		t.Errorf("alg %s info %+v", k.Alg, c)
 	}
 	if !bytes.Equal(k.TPM2B(), read(t, "swtpm-p2.pub")) {
 		t.Error("public area rebuilt from the certificate differs from the TPM's")
@@ -114,8 +114,7 @@ func newCA(t *testing.T, cn string, parent *ca) *ca {
 // the EK extended key usage that real TPM vendors use.
 func ekCert(t *testing.T, issuer *ca, pub any, mut func(*x509.Certificate)) []byte {
 	t.Helper()
-	san, _ := asn1.Marshal([]asn1.RawValue{{Class: asn1.ClassContextSpecific, Tag: 4, IsCompound: true,
-		Bytes: mustMarshal(pkix.Name{CommonName: "tpm"}.ToRDNSequence())}})
+	san := tpmSAN(2, 23, 133, 2, 1, 2, 23, 133, 2, 2, 2, 23, 133, 2, 3)
 	tpl := &x509.Certificate{SerialNumber: big.NewInt(7), NotBefore: vectorTime.Add(-time.Hour), NotAfter: vectorTime.Add(time.Hour),
 		KeyUsage:           x509.KeyUsageKeyEncipherment,
 		UnknownExtKeyUsage: []asn1.ObjectIdentifier{{2, 23, 133, 8, 1}},
@@ -128,6 +127,17 @@ func ekCert(t *testing.T, issuer *ca, pub any, mut func(*x509.Certificate)) []by
 		t.Fatal(err)
 	}
 	return der
+}
+
+// tpmSAN builds a subjectAltName with a directoryName holding one attribute
+// per given OID (five arcs each).
+func tpmSAN(arcs ...int) []byte {
+	var rdn pkix.RDNSequence
+	for i := 0; i+5 <= len(arcs); i += 5 {
+		rdn = append(rdn, pkix.RelativeDistinguishedNameSET{{Type: asn1.ObjectIdentifier(arcs[i : i+5]), Value: "id:00001014"}})
+	}
+	san, _ := asn1.Marshal([]asn1.RawValue{{Class: asn1.ClassContextSpecific, Tag: 4, IsCompound: true, Bytes: mustMarshal(rdn)}})
+	return san
 }
 
 func mustMarshal(v any) []byte {
@@ -175,6 +185,32 @@ func TestVerify(t *testing.T) {
 			c.ExtraExtensions = append(c.ExtraExtensions, pkix.Extension{Id: asn1.ObjectIdentifier{1, 2, 3, 4}, Critical: true, Value: []byte{5, 0}})
 		}), vectorTime, "does not chain"},
 	}
+	// B4: EK certificate profile
+	cases["no EK extended key usage"] = struct {
+		der  []byte
+		at   time.Time
+		want string
+	}{ekCert(t, inter, &ek.PublicKey, func(c *x509.Certificate) { c.UnknownExtKeyUsage = nil }), vectorTime, "not issued for endorsement keys"}
+	cases["other extended key usage only"] = struct {
+		der  []byte
+		at   time.Time
+		want string
+	}{ekCert(t, inter, &ek.PublicKey, func(c *x509.Certificate) {
+		c.UnknownExtKeyUsage = nil
+		c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	}), vectorTime, "not issued for endorsement keys"}
+	cases["no TPM attributes in the subjectAltName"] = struct {
+		der  []byte
+		at   time.Time
+		want string
+	}{ekCert(t, inter, &ek.PublicKey, func(c *x509.Certificate) {
+		c.ExtraExtensions = []pkix.Extension{{Id: oidSAN, Critical: true, Value: tpmSAN(2, 23, 133, 2, 1)}}
+	}), vectorTime, "manufacturer, model and version"}
+	cases["no subjectAltName"] = struct {
+		der  []byte
+		at   time.Time
+		want string
+	}{ekCert(t, inter, &ek.PublicKey, func(c *x509.Certificate) { c.ExtraExtensions = nil }), vectorTime, "manufacturer, model and version"}
 	p384, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	cases["P-384 EK"] = struct {
 		der  []byte
@@ -259,5 +295,37 @@ func TestAddDir(t *testing.T) {
 	}
 	if err := NewStore().AddDir(filepath.Join(d, "missing")); err == nil {
 		t.Error("missing CA directory accepted")
+	}
+}
+
+// An issuing CA that restricts its extended key usages to something else
+// cannot issue EK certificates; vendors are classified by bundle directory.
+func TestChainEKUAndVendor(t *testing.T) {
+	root := newCA(t, "root", nil)
+	tlsOnly := newCA(t, "tls issuing CA", root)
+	tlsOnly.cert.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth} // as parsed from such a CA
+	ek, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leaf, _ := x509.ParseCertificate(ekCert(t, tlsOnly, &ek.PublicKey, nil))
+	if chainAllowsEKU([]*x509.Certificate{leaf, tlsOnly.cert, root.cert}) {
+		t.Error("EK certificate accepted below a CA restricted to TLS server certificates")
+	}
+	tlsOnly.cert.ExtKeyUsage = nil
+	if !chainAllowsEKU([]*x509.Certificate{leaf, tlsOnly.cert, root.cert}) {
+		t.Error("unrestricted issuing CA refused")
+	}
+
+	d := t.TempDir()
+	for _, v := range []string{"Intel", "Infineon"} {
+		ca := newCA(t, v+" EK CA", nil)
+		os.MkdirAll(filepath.Join(d, v, "RootCA"), 0o755)
+		os.WriteFile(filepath.Join(d, v, "RootCA", "ca.cer"), ca.cert.Raw, 0o644)
+		s := NewStore()
+		if err := s.AddDir(d); err != nil {
+			t.Fatal(err)
+		}
+		_, info, err := s.Verify(ekCert(t, ca, &ek.PublicKey, nil), vectorTime)
+		if err != nil || info.Vendor != v || info.Firmware() != (v == "Intel") {
+			t.Errorf("%s: %+v %v", v, info, err)
+		}
 	}
 }

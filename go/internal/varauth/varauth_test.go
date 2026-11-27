@@ -2,6 +2,7 @@ package varauth
 
 import (
 	"bytes"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -167,8 +168,11 @@ func TestAttacksAfterProvisioning(t *testing.T) {
 		{"salt key replaced by another EK", func(t *testing.T, e *env) {
 			k, _ := ekcert.FromPublicKey(&newEKKey().PublicKey)
 			e.f.pers[handleNum(SaltHandle)] = k.TPM2B()
-		}, "not the key of this TPM's EK certificate"},
-		{"EK certificate removed", func(t *testing.T, e *env) { e.f.setEKCert(nil) }, "no valid EK certificate"},
+		}, "is not the authenticated key of this TPM"},
+		{"EK certificate removed", func(t *testing.T, e *env) { e.f.setEKCert(nil) }, "no signed per-device admission"},
+		{"transition index rewritten", func(t *testing.T, e *env) {
+			e.f.nv[handleNum(Transition.Handle)].policy = nil
+		}, "authPolicy"},
 		{"hierarchy unlocked", func(t *testing.T, e *env) { e.f.h["o"].auth = "" }, "not locked"},
 		{"secret undefined", func(t *testing.T, e *env) { delete(e.f.nv, handleNum(Secret.Handle)) }, "partial"},
 		{"record altered", func(t *testing.T, e *env) {
@@ -405,7 +409,7 @@ func TestParseHelpers(t *testing.T) {
 	if err := CheckPublic(Record, p, Record.Final, nil); err == nil {
 		t.Error("empty expected policy accepted")
 	}
-	want := map[string]uint32{"record": 0x22042808, "secret": 0xB2082808, "counter": 0x22080018, "epoch": 0x22040028, "pcrpolicy": 0x22040002}
+	want := map[string]uint32{"record": 0x22042808, "secret": 0xB2082808, "counter": 0x22080018, "epoch": 0x22040028, "pcrpolicy": 0x22040002, "transition": 0x22040002}
 	for _, ix := range allIndices {
 		if ix.Final != want[ix.Name] {
 			t.Errorf("%s final 0x%08x", ix.Name, ix.Final)
@@ -455,7 +459,7 @@ func TestSaltSubstitutionMITM(t *testing.T) {
 	t.Run("first boot", func(t *testing.T) {
 		e := newEnv(t, "prod")
 		e.f.mitm = func(int, []byte) []byte { return attacker.TPM2B() }
-		wantErr(t, e.boot(t), "not the key of this TPM's EK certificate")
+		wantErr(t, e.boot(t), "is not the authenticated key of this TPM")
 		if len(e.f.violations) > 0 || len(e.f.luks[e.dev]) == 64 || e.f.h["o"].auth != "" {
 			t.Fatalf("provisioned through a substituted key: %v", e.f.violations)
 		}
@@ -482,6 +486,7 @@ func TestSaltSubstitutionMITM(t *testing.T) {
 // ---------------------------------------------------------------- F2: EK certificate
 
 func TestEKCertificate(t *testing.T) {
+	var t0 *testing.T
 	foreign := newTestCA("foreign CA")
 	cases := []struct {
 		name, profile string
@@ -491,7 +496,7 @@ func TestEKCertificate(t *testing.T) {
 		{"valid certificate", "prod", func(e *env) {}, ""},
 		{"missing certificate", "prod", func(e *env) { e.f.setEKCert(nil) }, "holds no EK certificate"},
 		{"foreign CA", "prod", func(e *env) { e.f.setEKCert(foreign.ekCertificate(&e.f.ek.PublicKey)) }, "does not chain to a trusted TPM vendor CA"},
-		{"mismatched EK", "prod", func(e *env) { e.f.setEKCert(vendorCA().ekCertificate(&newEKKey().PublicKey)) }, "not the key of this TPM's EK certificate"},
+		{"mismatched EK", "prod", func(e *env) { e.f.setEKCert(vendorCA().ekCertificate(&newEKKey().PublicKey)) }, "is not the authenticated key of this TPM"},
 		{"expired certificate", "prod", func(e *env) { e.c.Now = func() time.Time { return testNow.Add(48 * time.Hour) } }, "does not chain"},
 		{"corrupt certificate", "prod", func(e *env) { e.f.nv[handleNum(ekcert.ECC.CertHandle())].data[40] ^= 0xff }, "EK certificate"},
 		{"clock before the build time", "prod", func(e *env) {
@@ -510,23 +515,28 @@ func TestEKCertificate(t *testing.T) {
 			os.WriteFile(filepath.Join(e.c.EKTestCADir, "RootCA/test.cer"), foreign.cert.Raw, 0o644)
 			e.f.setEKCert(foreign.ekCertificate(&e.f.ek.PublicKey))
 		}, ""},
-		{"no certificate but EK in the signed allowlist", "prod", func(e *env) {
-			e.f.setEKCert(nil)
-			k, _ := ekcert.FromPublicKey(&e.f.ek.PublicKey)
-			os.WriteFile(e.c.EKAllowlist, []byte("# dev VM\n"+hex.EncodeToString(k.Name())+"\n"), 0o644)
+		{"certificate without the EK extended key usage", "prod", func(e *env) {
+			e.f.setEKCert(vendorCA().certificate(&e.f.ek.PublicKey, func(c *x509.Certificate) { c.UnknownExtKeyUsage = nil }))
+		}, "not issued for endorsement keys"},
+		{"certificate without TPM attributes", "prod", func(e *env) {
+			e.f.setEKCert(vendorCA().certificate(&e.f.ek.PublicKey, func(c *x509.Certificate) { c.ExtraExtensions = nil }))
+		}, "manufacturer, model and version"},
+		{"require_ftpm and a discrete-TPM vendor", "prod", func(e *env) {
+			e.requireFTPM = true
+			e.setImage(t0, "ref", "prod", 0, 0)
+		}, "requires a firmware TPM"},
+		{"require_ftpm and a firmware-TPM vendor", "prod", func(e *env) {
+			e.requireFTPM = true
+			e.setImage(t0, "ref", "prod", 0, 0)
+			os.Rename(filepath.Join(e.c.EKCADir, "Vendor"), filepath.Join(e.c.EKCADir, "Intel"))
 		}, ""},
-		{"no certificate and another EK in the allowlist", "prod", func(e *env) {
-			e.f.setEKCert(nil)
-			k, _ := ekcert.FromPublicKey(&newEKKey().PublicKey)
-			os.WriteFile(e.c.EKAllowlist, []byte(hex.EncodeToString(k.Name())+"\n"), 0o644)
-		}, "not in the signed EK allowlist"},
-		{"malformed allowlist", "prod", func(e *env) { os.WriteFile(e.c.EKAllowlist, []byte("junk\n"), 0o644) }, "allowlist"},
 		{"empty vendor bundle", "prod", func(e *env) { os.RemoveAll(filepath.Join(e.c.EKCADir, "Vendor")) }, "bundle is empty"},
 		{"TPM without PolicyAuthorizeNV", "prod", func(e *env) { e.f.noAuthorizeNV = true }, "revision 1.38"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t, tc.profile)
+			t0 = t
 			tc.prep(e)
 			err := e.boot(t)
 			if tc.want == "" {
@@ -592,7 +602,7 @@ func TestHealChecksSaltKey(t *testing.T) {
 	t.Run("endorsement key without a valid certificate", func(t *testing.T) {
 		e := provisioned(t)
 		e.f.ek = newEKKey()
-		wantErr(t, e.boot(t), "not the key of this TPM's EK certificate")
+		wantErr(t, e.boot(t), "is not the authenticated key of this TPM")
 	})
 	t.Run("EK certificate from a foreign CA", func(t *testing.T) {
 		e := provisioned(t)
@@ -637,8 +647,10 @@ func TestDbxUpdate(t *testing.T) {
 	revoked := bytes.Repeat([]byte{0xd0}, 32)
 	// device provisioned by release 0, then release 1 (epoch 1, heal as given)
 	// arrives carrying a dbx append that revokes the old UKI
+	older := bytes.Repeat([]byte{0x0d}, 32) // a revocation the device already has
 	start := func(t *testing.T, heal int) *env {
 		e := newEnv(t, "prod")
+		e.fw.Vars[dbxVar] = sbtest.ESL(older)
 		e.mustBoot(t, "current (0 update")
 		e.later()
 		e.commit(t, "config", "kept across the dbx update")
@@ -664,8 +676,8 @@ func TestDbxUpdate(t *testing.T) {
 		if readFile(filepath.Join(e.c.stateMount(), "data/config")) != "kept across the dbx update" {
 			t.Error("state lost")
 		}
-		if _, err := os.Stat(filepath.Join(e.c.stateMount(), ".pcr7")); !errors.Is(err, os.ErrNotExist) {
-			t.Error("transition record left behind")
+		if ts := e.f.nv[handleNum(Transition.Handle)].data; ts[64] != 0 {
+			t.Errorf("transition index not idle after completion: state %d", ts[64])
 		}
 		final := append([]byte{}, e.vDigest()...)
 		e.mustBoot(t, "current (1 update")
@@ -674,7 +686,7 @@ func TestDbxUpdate(t *testing.T) {
 		}
 		e.commit(t, "config", "v2")
 		// the old Secure Boot state (dbx rolled back) is no longer accepted
-		e.fw.Vars[dbxVar] = nil
+		e.fw.Vars[dbxVar] = sbtest.ESL(older)
 		wantErr(t, e.boot(t), "Secure Boot configuration")
 	})
 	t.Run("with healing", func(t *testing.T) {
@@ -733,11 +745,11 @@ func TestDbxUpdate(t *testing.T) {
 		e.mustBoot(t, "pending")
 		e.mustBoot(t, "current (1 update")
 	})
-	t.Run("event log does not explain PCR 7 so blocked and no brick", func(t *testing.T) {
+	t.Run("event log unusable after enrolment so blocked and no brick", func(t *testing.T) {
 		e := newEnv(t, "prod")
-		e.pcr7 = bytes.Repeat([]byte{0x42}, 32)
 		e.mustBoot(t, "current")
 		e.later()
+		e.badLog = true // cannot happen without a firmware change: provisioning checks the log (B7)
 		e.shipDbx(t, "dbx-epoch0.auth", revoked)
 		e.mustBoot(t, "blocked")
 		if e.fw.Vars[dbxVar] != nil {
@@ -752,18 +764,19 @@ func TestDbxUpdate(t *testing.T) {
 		mut  func(e *env)
 		want string
 	}{
-		"secure boot disabled":      {func(e *env) { e.fw.SecureBoot = 0 }, "changed beyond the signed updates"},
-		"db key enrolled":           {func(e *env) { e.fw.Vars["db-"+sbstate.GUIDSecurity] = []byte("attacker") }, "changed beyond the signed updates"},
-		"other signing authority":   {func(e *env) { e.fw.Authority = []byte("attacker cert") }, "changed beyond the signed updates"},
-		"additional authority":      {func(e *env) { e.fw.Extra = []sbtest.Ev{{PCR: 7, Type: 0x800000E0, Data: []byte("x")}} }, "changed beyond the signed updates"},
-		"other boot loader (PCR 4)": {func(e *env) { e.f.pcr[4] = bytes.Repeat([]byte{0x44}, 32) }, "Secure Boot configuration, firmware or boot chain changed"},
-		"other firmware (PCR 0)":    {func(e *env) { e.f.pcr[0] = bytes.Repeat([]byte{0x40}, 32) }, "Secure Boot configuration, firmware or boot chain changed"},
-		"option ROM/driver (PCR 2)": {func(e *env) { e.f.pcr[2] = bytes.Repeat([]byte{0x41}, 32) }, "Secure Boot configuration, firmware or boot chain changed"},
-		"ESP credential (PCR 12)":   {func(e *env) { e.f.pcr[12] = bytes.Repeat([]byte{1}, 32) }, "PCR 12"},
-		"transition record removed": {func(e *env) { os.Remove(filepath.Join(e.c.stateMount(), ".pcr7")) }, "record is missing"},
-		"transition record forged": {func(e *env) {
-			os.WriteFile(filepath.Join(e.c.stateMount(), ".pcr7"), []byte(`{"events":[],"vars":[],"mac":"00"}`), 0o600)
-		}, "not authentic"},
+		"secure boot disabled":       {func(e *env) { e.fw.SecureBoot = 0 }, "neither the state before the update"},
+		"db key enrolled":            {func(e *env) { e.fw.Vars["db-"+sbstate.GUIDSecurity] = []byte("attacker") }, "neither the state before the update"},
+		"other signing authority":    {func(e *env) { e.fw.Authority = []byte("attacker cert") }, "neither the state before the update"},
+		"additional authority":       {func(e *env) { e.fw.Extra = []sbtest.Ev{{PCR: 7, Type: 0x800000E0, Data: []byte("x")}} }, "neither the state before the update"},
+		"other boot loader (PCR 4)":  {func(e *env) { e.f.pcr[4] = bytes.Repeat([]byte{0x44}, 32) }, "Secure Boot configuration, firmware or boot chain changed"},
+		"other firmware (PCR 0)":     {func(e *env) { e.f.pcr[0] = bytes.Repeat([]byte{0x40}, 32) }, "Secure Boot configuration, firmware or boot chain changed"},
+		"option ROM/driver (PCR 2)":  {func(e *env) { e.f.pcr[2] = bytes.Repeat([]byte{0x41}, 32) }, "Secure Boot configuration, firmware or boot chain changed"},
+		"ESP credential (PCR 12)":    {func(e *env) { e.f.pcr[12] = bytes.Repeat([]byte{1}, 32) }, "PCR 12"},
+		"transition index cleared":   {func(e *env) { e.f.nv[handleNum(Transition.Handle)].data = make([]byte, Transition.Size) }, "no Secure Boot update is in transit"},
+		"transition index replaced":  {func(e *env) { e.f.nv[handleNum(Transition.Handle)].attrs |= attrPolicyWrite }, "attributes"},
+		"older dbx entry dropped":    {func(e *env) { e.fw.Vars[dbxVar] = sbtest.ESL(revoked) }, "neither the state before the update"},
+		"foreign dbx entry added":    {func(e *env) { e.fw.Vars[dbxVar] = sbtest.ESL(older, revoked, bytes.Repeat([]byte{9}, 32)) }, "neither the state before the update"},
+		"KEK replaced":               {func(e *env) { e.fw.Vars["KEK-"+sbstate.GUIDGlobal] = []byte("attacker") }, "neither the state before the update"},
 		"event log tampered":         {func(e *env) { e.pcr7 = bytes.Repeat([]byte{0x43}, 32) }, "replays PCR 7"},
 		"another UKI (other PCR 11)": {func(e *env) { e.f.pcr[11] = bytes.Repeat([]byte{0x5a}, 32) }, "no signed approved policy"},
 	} {
@@ -771,7 +784,14 @@ func TestDbxUpdate(t *testing.T) {
 			e := start(t, 0)
 			e.mustBoot(t, "pending")
 			tc.mut(e)
+			n := len(e.f.calls)
 			wantErr(t, e.boot(t), tc.want)
+			// B2: refused before the volume key leaves the TPM
+			for _, c := range e.f.calls[n:] {
+				if strings.HasPrefix(c, "tpm2_nvread "+Secret.Handle) {
+					t.Fatal("volume key read from the TPM although the Secure Boot state is not an expected one")
+				}
+			}
 		})
 	}
 }
@@ -905,5 +925,243 @@ func TestHealRecordsSaltCheck(t *testing.T) {
 	}
 	if !strings.Contains(readFile(e.c.SaltSourceFile()), "re-created salt key has the Name recorded at provisioning") {
 		t.Errorf("source %q", readFile(e.c.SaltSourceFile()))
+	}
+}
+
+// ---------------------------------------------------------------- round 5
+
+// B1: admission of a TPM without EK certificate is a signature for exactly
+// one endorsement key, under its own policyRef.
+func TestEKAdmission(t *testing.T) {
+	noCert := func(t *testing.T, profile string) *env {
+		e := newEnv(t, profile)
+		e.f.setEKCert(nil)
+		return e
+	}
+	t.Run("admitted device", func(t *testing.T) {
+		e := noCert(t, "dev")
+		e.admit(t, e.ekName())
+		if err := e.boot(t); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(readFile(e.c.SaltSourceFile()), "signed per-device admission") {
+			t.Errorf("source %q", readFile(e.c.SaltSourceFile()))
+		}
+		e.later()
+		e.commit(t, "config", "v1")
+		if err := e.boot(t); err != nil {
+			t.Fatal(err)
+		}
+		// its objects are bound to the per-device ref, not to the base ref
+		base := newEnv(t, "dev")
+		if err := base.boot(t); err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Equal(e.f.nv[handleNum(Secret.Handle)].policy, base.f.nv[handleNum(Secret.Handle)].policy) {
+			t.Error("admitted and certified devices share policy P")
+		}
+		// healing keeps working, also after the salt key was already evicted
+		e.setImage(t, "ref", "dev", 1, 1)
+		delete(e.f.pers, handleNum(SaltHandle))
+		delete(e.f.nv, handleNum(Record.Handle))
+		if err := e.boot(t); err != nil {
+			t.Fatalf("heal of an admitted device: %v", err)
+		}
+	})
+	t.Run("admission of another device", func(t *testing.T) {
+		e := noCert(t, "dev")
+		e.admit(t, append([]byte{0, 0x0b}, bytes.Repeat([]byte{7}, 32)...))
+		wantErr(t, e.boot(t), "no signed per-device admission")
+		if e.f.h["o"].auth != "" || e.f.pers[handleNum(SaltHandle)] != nil || len(e.f.luks[e.dev]) == 64 {
+			t.Error("provisioned without an admission")
+		}
+	})
+	t.Run("admission signed for another profile", func(t *testing.T) {
+		e := noCert(t, "prod")
+		e.install(t, signedRef(t, e.f.pcr[11], 0, "ref", "dev", tpmpolicy.RefEK(refOf("ref", "dev"), e.ekName())))
+		wantErr(t, e.boot(t), "no signed per-device admission")
+	})
+	t.Run("forged admission", func(t *testing.T) {
+		e := noCert(t, "dev")
+		p := signedRef(t, e.f.pcr[11], 0, "ref", "dev", tpmpolicy.RefEK(refOf("ref", "dev"), e.ekName()))
+		p.Signature = b64("SIG:00")
+		e.install(t, p)
+		wantErr(t, e.boot(t), "signature rejected")
+		if e.f.h["o"].auth != "" || e.f.pers[handleNum(SaltHandle)] != nil || len(e.f.nv) != 0 {
+			t.Error("TPM changed although the admission is forged")
+		}
+	})
+	t.Run("a certified TPM is never matched against admissions", func(t *testing.T) {
+		e := newEnv(t, "dev")
+		e.admit(t, e.ekName()) // even an admission of its own key is ignored
+		if err := e.boot(t); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(readFile(e.c.SaltSourceFile()), "EK certificate") {
+			t.Errorf("source %q", readFile(e.c.SaltSourceFile()))
+		}
+	})
+	// The round-4 bypass: an EK admitted "elsewhere" (here even for this very
+	// release) is presented by an interposer on a certificate-provisioned
+	// device; it hides the certificate and rewrites the unauthenticated
+	// record. The device must refuse and no session may reach that key.
+	t.Run("admitted foreign EK presented on a certified device", func(t *testing.T) {
+		e := newEnv(t, "dev")
+		if err := e.boot(t); err != nil {
+			t.Fatal(err)
+		}
+		e.later()
+		other, _ := ekcert.FromPublicKey(&newEKKey().PublicKey)
+		e.admit(t, other.Name())
+		e.f.setEKCert(nil)
+		e.f.mitm = func(int, []byte) []byte { return other.TPM2B() }
+		copy(e.f.nv[handleNum(Record.Handle)].data[40:], other.Name())
+		err := e.boot(t)
+		if len(e.f.violations) > 0 {
+			t.Fatalf("session salted to the foreign admitted key: %v", e.f.violations)
+		}
+		wantErr(t, err, "authPolicy") // the admitted ref opens none of this device's objects
+	})
+	t.Run("admitted foreign EK presented on a fresh device", func(t *testing.T) {
+		e := noCert(t, "dev")
+		other, _ := ekcert.FromPublicKey(&newEKKey().PublicKey)
+		e.admit(t, other.Name())
+		e.f.mitm = func(int, []byte) []byte { return other.TPM2B() }
+		// An admission is a statement about ONE key. If that key is not in
+		// this TPM, the TPM cannot decrypt a salt encrypted to it: the first
+		// salted session fails, before any authValue or key is set.
+		if err := e.boot(t); err == nil {
+			t.Fatal("provisioned with an endorsement key the TPM does not hold")
+		}
+		if e.f.h["o"].auth != "" || e.f.h["l"].auth != "" || e.f.nv[handleNum(Secret.Handle)] != nil || len(e.f.luks[e.dev]) == 64 {
+			t.Error("hierarchy authValues or the volume key were set through a session salted to a foreign key")
+		}
+	})
+}
+
+// B2: one-shot bridge. A variable store rolled back after the update was
+// applied must not re-open the transition, however often it is repeated.
+func TestDbxRollbackDoesNotReopenBridge(t *testing.T) {
+	older, revoked := bytes.Repeat([]byte{0x0d}, 32), bytes.Repeat([]byte{0xd0}, 32)
+	e := newEnv(t, "prod")
+	e.fw.Vars[dbxVar] = sbtest.ESL(older)
+	e.mustBoot(t, "current")
+	e.later()
+	steady := append([]byte{}, e.vDigest()...)
+	e.setImage(t, "ref", "prod", 1, 0)
+	e.shipDbx(t, "dbx-epoch0.auth", revoked)
+	e.mustBoot(t, "pending")
+	for i := 0; i < 3; i++ {
+		e.fw.Vars[dbxVar] = sbtest.ESL(older) // SPI flash rolled back
+		e.mustBoot(t, "failed: NOT APPLIED: the firmware lost")
+		if !bytes.Equal(e.vDigest(), steady) {
+			t.Fatalf("round %d: the boot-chain binding is open after a rollback", i)
+		}
+		if bytes.Contains(e.fw.Vars[dbxVar], revoked) {
+			t.Fatalf("round %d: update handed to the firmware again", i)
+		}
+	}
+	// with Secure Boot off the steady binding refuses as always
+	e.fw.SecureBoot = 0
+	wantErr(t, e.boot(t), "Secure Boot configuration")
+}
+
+// B7: firmware whose event log cannot carry a Secure Boot update is not enrolled.
+func TestNonConformingEventLog(t *testing.T) {
+	for name, tc := range map[string]struct {
+		mut  func(e *env)
+		want string
+	}{
+		"log does not replay to PCR 7": {func(e *env) { e.pcr7 = bytes.Repeat([]byte{0x42}, 32) }, "replays PCR 7"},
+		"log truncated":                {func(e *env) { e.badLog = true }, "event log"},
+		"dbx not measured":             {func(e *env) { e.fw.Skip = "dbx" }, "dbx-"},
+		"KEK measured twice": {func(e *env) {
+			e.fw.Extra = []sbtest.Ev{{PCR: 7, Type: 0x80000001, Data: sbtest.VarEvent(sbstate.GUIDGlobal, "KEK", []byte("kek"))}}
+		}, "KEK-"},
+		"db is not a signature list": {func(e *env) { e.fw.Vars["db-"+sbstate.GUIDSecurity] = []byte("not a list at all, just bytes") }, "db-"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, "prod")
+			tc.mut(e)
+			err := e.boot(t)
+			wantErr(t, err, "cannot carry signed Secure Boot variable updates")
+			wantErr(t, err, tc.want)
+			if e.f.h["o"].auth != "" || len(e.f.nv) != 1 || len(e.f.luks[e.dev]) == 64 { // only the EK certificate index
+				t.Error("device enrolled on non-conforming firmware")
+			}
+		})
+	}
+	t.Run("checked again when healing", func(t *testing.T) {
+		e := newEnv(t, "prod")
+		if err := e.boot(t); err != nil {
+			t.Fatal(err)
+		}
+		e.later()
+		e.setImage(t, "ref", "prod", 1, 1)
+		e.badLog = true
+		wantErr(t, e.boot(t), "cannot carry signed Secure Boot variable updates")
+		if e.f.nv[handleNum(Secret.Handle)] == nil {
+			t.Error("state destroyed although the heal was refused")
+		}
+	})
+}
+
+// B8: the state service authorizes callers, runs only writers defined by
+// the image, keeps the keys to itself and authenticates every read.
+func TestStateService(t *testing.T) {
+	e := newEnv(t, "prod")
+	if err := e.boot(t); err != nil {
+		t.Fatal(err)
+	}
+	e.later()
+	s := e.state(t)
+	if _, err := os.Stat(e.c.StateKeyFile()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("state keys left in /run after the service started")
+	}
+	if _, err := NewStateServer(e.c, e.f); err == nil {
+		t.Fatal("a second process obtained the state keys")
+	}
+	v0 := e.counter()
+	for name, tc := range map[string]struct {
+		req  StateRequest
+		unit string
+		want string
+	}{
+		"caller in another unit":      {StateRequest{Op: "exec", Writer: "config"}, "evil.service", "not authorized"},
+		"caller outside any unit":     {StateRequest{Op: "exec", Writer: "config"}, "", "not authorized"},
+		"transient unit of root":      {StateRequest{Op: "exec", Writer: "config"}, "run-u42.service", "not authorized"},
+		"writer not in the image":     {StateRequest{Op: "exec", Writer: "sh"}, "enklave-config.service", "unknown state writer"},
+		"unknown operation":           {StateRequest{Op: "key"}, "enklave-config.service", "unknown operation"},
+		"read of a file not in state": {StateRequest{Op: "read", Path: "../.manifest"}, "x.service", "not exist"},
+	} {
+		if rep := s.Handle(tc.req, tc.unit, nil); rep.OK || !strings.Contains(rep.Error, tc.want) {
+			t.Errorf("%s: %+v, want %q", name, rep, tc.want)
+		}
+	}
+	if e.counter() != v0 {
+		t.Fatal("a refused request changed the state")
+	}
+	e.commit(t, "config", "hello")
+	rep := s.Handle(StateRequest{Op: "read", Path: "config"}, "any-reader.service", nil)
+	if !rep.OK || string(rep.Data) != "hello" || rep.Version != v0+1 || rep.Counter != v0+1 {
+		t.Fatalf("verified read: %+v", rep)
+	}
+	// a write that bypassed the service (root remounted the volume) is
+	// detected by the next read, not only at the next boot
+	os.WriteFile(filepath.Join(e.c.stateMount(), "data/config"), []byte("forged"), 0o644)
+	if rep := s.Handle(StateRequest{Op: "read", Path: "config"}, "any-reader.service", nil); rep.OK || !strings.Contains(rep.Error, "manifest") {
+		t.Errorf("forged content served: %+v", rep)
+	}
+	if rep := s.Handle(StateRequest{Op: "exec", Writer: "config"}, "enklave-config.service", nil); rep.OK {
+		t.Error("commit on top of forged content")
+	}
+	// writer definitions: only .service units and absolute commands
+	bad := t.TempDir()
+	os.WriteFile(filepath.Join(bad, "x.json"), []byte(`{"unit":"../x","exec":["sh"]}`), 0o644)
+	if _, err := LoadWriters(bad); err == nil {
+		t.Error("malformed writer accepted")
+	}
+	if w, err := LoadWriters(filepath.Join(bad, "none")); err != nil || len(w) != 0 {
+		t.Errorf("image without writers: %v %v", w, err)
 	}
 }

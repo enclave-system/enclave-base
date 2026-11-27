@@ -4,5 +4,6 @@ enable enklave-test-marker.service
 enable enklave-test-pcrs.service
 enable enklave-test-unseal-probe.service
 enable enklave-test-state-ro.service
+enable enklave-test-state-auth.service
 enable systemd-networkd.service
 enable systemd-networkd.socket

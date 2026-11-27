@@ -1,0 +1,33 @@
+# The state service: the only writer of the state volume and the only holder
+# of the state keys at runtime (enklave-varauth state-serve).
+#  - It takes the derived state keys out of /run/enklave/state.key and deletes
+#    the file before it reports READY. local-fs.target requires it, so no
+#    ordinary service starts while the file exists.
+#  - PrivateMounts: the volume becomes writable only inside this unit's mount
+#    namespace, for the duration of one commit.
+#  - A commit runs a writer defined in /usr/lib/enklave/state-writers.d
+#    (verity), and only for a caller in the unit that writer is reserved for
+#    (SO_PEERCRED, SO_PEERPIDFD, cgroup of the peer).
+#  - Reads are authenticated against the manifest and the TPM counter.
+# Production: a failure powers the machine off.
+[Unit]
+Description=enklave state service (authorized commits, verified reads)
+DefaultDependencies=no
+Requires=var-lib-enklave.mount
+After=var-lib-enklave.mount enklave-var-auth.service
+Before=local-fs.target shutdown.target
+Conflicts=shutdown.target
+FailureAction=poweroff-force
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/lib/enklave/enklave-varauth state-serve
+PrivateMounts=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+StandardError=journal+console
+
+[Install]
+RequiredBy=local-fs.target

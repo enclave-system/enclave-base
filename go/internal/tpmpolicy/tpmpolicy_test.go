@@ -68,7 +68,7 @@ func TestRefAndFileDecode(t *testing.T) {
 	if err != nil || ref != "enklave-var-v1:ref:prod" {
 		t.Fatalf("%q %v", ref, err)
 	}
-	for _, bad := range [][2]string{{"evil", "prod"}, {"ref", "dev"}, {"ref:x", "prod"}, {"", ""}} {
+	for _, bad := range [][2]string{{"evil", "prod"}, {"ref", "debug"}, {"ref:x", "prod"}, {"", ""}} {
 		if _, err := Ref(bad[0], bad[1]); err == nil {
 			t.Errorf("accepted %v", bad)
 		}
@@ -137,5 +137,32 @@ func TestLocalPolicyArithmeticMatchesTPM(t *testing.T) {
 	}
 	if bytes.Equal(NVName(0x01800E05, 0x22040002, []byte{1}, 34), name) {
 		t.Error("authPolicy does not change the NV name")
+	}
+}
+
+// B1: a per-device admission is signed for a ref that names the device's EK.
+func TestRefEK(t *testing.T) {
+	base, _ := Ref("ref", "dev")
+	name := append([]byte{0, 0x0b}, bytes.Repeat([]byte{0xab}, 32)...)
+	ref := RefEK(base, name)
+	if ref != "enklave-var-v1:ref:dev:ek:000b"+hex.EncodeToString(bytes.Repeat([]byte{0xab}, 32)) {
+		t.Fatalf("%q", ref)
+	}
+	f := File{Version: 2, Role: "ref", Profile: "dev", PCR11Policy: vecPCR11Policy, Approved: vecApproved, Ref: ref}
+	if _, _, err := f.DecodeRef("ref", "dev", ref); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.Decode("ref", "dev"); err == nil {
+		t.Error("per-device policy accepted for the base ref")
+	}
+	other := RefEK(base, append([]byte{0, 0x0b}, bytes.Repeat([]byte{0xcd}, 32)...))
+	if _, _, err := f.DecodeRef("ref", "dev", other); err == nil {
+		t.Error("admission of one EK accepted for another")
+	}
+	if _, _, err := f.DecodeRef("ref", "prod", ref); err == nil {
+		t.Error("dev admission accepted by a prod image")
+	}
+	if _, _, err := f.DecodeRef("ref", "dev", "enklave-var-v1:ref:devil"); err == nil {
+		t.Error("foreign ref accepted")
 	}
 }

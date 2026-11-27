@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 const (
@@ -39,8 +40,10 @@ const (
 )
 
 var (
-	roleRe   = regexp.MustCompile(`^(ref|client|gateway|terminal|console|sluice|backup|fileserver)$`)
-	profiles = map[string]bool{"prod": true, "test": true}
+	roleRe = regexp.MustCompile(`^(ref|client|gateway|terminal|console|sluice|backup|fileserver)$`)
+	// prod: production keys, production configuration. dev: production
+	// configuration signed with a development PKI. test: test profile.
+	profiles = map[string]bool{"prod": true, "dev": true, "test": true}
 )
 
 // Ref returns the policyRef for a role and profile.
@@ -49,9 +52,18 @@ func Ref(role, profile string) (string, error) {
 		return "", fmt.Errorf("invalid role %q", role)
 	}
 	if !profiles[profile] {
-		return "", fmt.Errorf("invalid profile %q (prod|test)", profile)
+		return "", fmt.Errorf("invalid profile %q (prod|dev|test)", profile)
 	}
 	return RefPrefix + ":" + role + ":" + profile, nil
+}
+
+// RefEK is the policyRef of ONE device whose TPM has no EK certificate and
+// was admitted by a signature: the base ref plus the Name of that device's
+// endorsement key. Policies signed for it authorize nothing on any other
+// device, and nothing on a device provisioned through an EK certificate
+// (whose objects are bound to the base ref).
+func RefEK(base string, ekName []byte) string {
+	return base + ":ek:" + hex.EncodeToString(ekName)
 }
 
 // EpochOperand is operandB for PolicyNV: an 8-byte big-endian mask with only
@@ -134,6 +146,19 @@ func (f File) Decode(role, profile string) (pcr11, approved []byte, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	return f.DecodeRef(role, profile, ref)
+}
+
+// DecodeRef is Decode for an explicit policyRef (the base ref of role and
+// profile, or the per-device ref of an admitted endorsement key).
+func (f File) DecodeRef(role, profile, ref string) (pcr11, approved []byte, err error) {
+	base, err := Ref(role, profile)
+	if err != nil {
+		return nil, nil, err
+	}
+	if ref != base && !strings.HasPrefix(ref, base+":ek:") {
+		return nil, nil, fmt.Errorf("policyRef %q does not belong to %s", ref, base)
+	}
 	if f.Version != 2 || f.Ref != ref || f.Role != role || f.Profile != profile {
 		return nil, nil, fmt.Errorf("policy file is for %s/%s (ref %q, version %d), want %s", f.Role, f.Profile, f.Ref, f.Version, ref)
 	}
@@ -161,6 +186,9 @@ type Release struct {
 	// bound of the clock used to validate EK certificates.
 	DevKeys bool  `json:"dev_keys"`
 	Built   int64 `json:"built"`
+	// RequireFTPM makes provisioning refuse TPMs whose EK certificate was
+	// issued by a discrete-TPM vendor (README "Accepted limits").
+	RequireFTPM bool `json:"require_ftpm"`
 }
 
 // Validate checks the release values.

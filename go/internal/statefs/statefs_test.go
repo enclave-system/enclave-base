@@ -2,6 +2,7 @@ package statefs
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -248,5 +249,44 @@ func TestWrongKeyRejected(t *testing.T) {
 	other := &Store{Root: s.Root, Key: []byte("other-key"), Counter: c}
 	if _, err := other.Verify(); err == nil {
 		t.Fatal("manifest accepted with another key")
+	}
+}
+
+// B8: a consumer's read authenticates the manifest, its version and the file.
+func TestVerifiedRead(t *testing.T) {
+	s, c := newStore(t)
+	mustExec(t, s, write("cfg/a", "one"))
+	if b, err := s.Read("cfg/a"); err != nil || string(b) != "one" {
+		t.Fatalf("%q %v", b, err)
+	}
+	if v, ctr, err := s.Status(); err != nil || v != ctr || v != c.v {
+		t.Fatalf("status %d %d %v", v, ctr, err)
+	}
+	for _, rel := range []string{"cfg", "missing", "../.manifest", "cfg/../../.manifest"} {
+		if _, err := s.Read(rel); err == nil {
+			t.Errorf("read of %q accepted", rel)
+		}
+	}
+	// content written past the commit protocol
+	os.WriteFile(filepath.Join(s.Root, "data/cfg/a"), []byte("forged"), 0o644)
+	if _, err := s.Read("cfg/a"); !errors.Is(err, ErrTampered) {
+		t.Errorf("forged content: %v", err)
+	}
+	// a file that is not in the manifest
+	os.WriteFile(filepath.Join(s.Root, "data/cfg/b"), []byte("new"), 0o644)
+	if _, err := s.Read("cfg/b"); err == nil {
+		t.Error("file outside the manifest served")
+	}
+	// an older manifest (state rolled back below the counter)
+	os.WriteFile(filepath.Join(s.Root, "data/cfg/a"), []byte("one"), 0o644)
+	c.v++
+	if _, err := s.Read("cfg/a"); !errors.Is(err, ErrRollback) {
+		t.Errorf("rolled-back manifest: %v", err)
+	}
+	// a manifest with a forged MAC
+	c.v--
+	os.WriteFile(filepath.Join(s.Root, ".manifest"), []byte(`{"version":`+fmt.Sprint(c.v)+`,"entries":[{"path":"cfg/a","type":"f","sha256":"00"}],"mac":"00"}`), 0o600)
+	if _, err := s.Read("cfg/a"); !errors.Is(err, ErrTampered) {
+		t.Errorf("forged manifest: %v", err)
 	}
 }

@@ -105,6 +105,8 @@ type Firmware struct {
 	Reject error
 	// Extra events appended to PCR 7 (e.g. an attacker-enrolled authority).
 	Extra []Ev
+	// Skip names a variable this firmware does not measure (non-conforming).
+	Skip string
 }
 
 const (
@@ -115,7 +117,7 @@ const (
 // NewFirmware returns a Secure Boot configuration with enklave-like keys.
 func NewFirmware() *Firmware {
 	return &Firmware{SecureBoot: 1, Authority: []byte("enklave db certificate"), Vars: map[string][]byte{
-		"PK-" + guidGlobal: []byte("pk"), "KEK-" + guidGlobal: []byte("kek"),
+		"PK-" + guidGlobal: ESL(sha256Of("pk")), "KEK-" + guidGlobal: ESL(sha256Of("kek")),
 		"db-" + guidSecurity: ESL(sha256Of("db")), "dbx-" + guidSecurity: nil,
 	}}
 }
@@ -148,5 +150,24 @@ func (f *Firmware) Boot() ([]byte, []byte) {
 		{4, 0x80000003, []byte("systemd-boot")},
 		{7, 0x800000E0, VarEvent(guidSecurity, "db", f.Authority)},
 	}
+	if f.Skip != "" {
+		var kept []Ev
+		for _, e := range evs {
+			if e.PCR == 7 && e.Type == 0x80000001 && nameOf(e.Data) == f.Skip {
+				continue
+			}
+			kept = append(kept, e)
+		}
+		evs = kept
+	}
 	return Log(7, append(evs, f.Extra...))
+}
+
+func nameOf(data []byte) string {
+	n := binary.LittleEndian.Uint64(data[16:24])
+	u := make([]uint16, n)
+	for i := range u {
+		u[i] = binary.LittleEndian.Uint16(data[32+2*i:])
+	}
+	return string(utf16.Decode(u))
 }

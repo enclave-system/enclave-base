@@ -16,7 +16,6 @@
 //	.manifest.next   prepared manifest of an in-flight commit
 //	.staging/        prepared data tree of an in-flight commit
 //	lost+found/      created by mkfs, ignored
-//	.pcr7            PCR 7 transition record (written and authenticated by varauth)
 //
 // Commit protocol (Exec): copy data -> .staging, run the writer on .staging,
 // write .manifest.next (version+1), exchange data and .staging atomically
@@ -238,7 +237,6 @@ func (s *Store) checkRoot() error {
 	for _, e := range ents {
 		switch e.Name() {
 		case "data", ".manifest", ".manifest.next", ".manifest.tmp", ".manifest.next.tmp", ".staging", ".lock", "lost+found":
-		case ".pcr7", ".pcr7.tmp": // PCR 7 transition record (package varauth, own MAC)
 		default:
 			return fmt.Errorf("unexpected entry %q in the state volume: %w", e.Name(), ErrTampered)
 		}
@@ -512,4 +510,60 @@ func syncTree(dir string) error {
 func (s *Store) HasPending() bool {
 	_, err := os.Lstat(s.p(".manifest.next"))
 	return err == nil
+}
+
+// Read returns a regular file of the state after authenticating it: the
+// manifest's MAC, the manifest version against the TPM counter, and the
+// file's hash against its manifest entry. Consumers read state through this
+// (or check the same way) so that a write that bypassed the commit protocol
+// is detected at the read, not only at the next boot.
+//
+// The volume is mounted read-only for readers, so no lock file is taken;
+// the state service serializes reads and commits.
+func (s *Store) Read(rel string) ([]byte, error) {
+	m, err := s.load(".manifest")
+	if err != nil {
+		return nil, err
+	}
+	c, err := s.Counter.Read()
+	if err != nil {
+		return nil, err
+	}
+	if m.Version != c {
+		return nil, fmt.Errorf("manifest version %d != TPM counter %d: %w", m.Version, c, ErrRollback)
+	}
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	for _, e := range m.Entries {
+		if e.Path != rel {
+			continue
+		}
+		if e.Type != "f" {
+			return nil, fmt.Errorf("%s is not a regular file", rel)
+		}
+		p := filepath.Join(s.p("data"), filepath.FromSlash(rel))
+		fi, err := os.Lstat(p)
+		if err != nil || !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("%s: %w", rel, ErrTampered)
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return nil, err
+		}
+		h := sha256.Sum256(b)
+		if hex.EncodeToString(h[:]) != e.SHA256 {
+			return nil, fmt.Errorf("%s differs from its manifest entry: %w", rel, ErrTampered)
+		}
+		return b, nil
+	}
+	return nil, fmt.Errorf("%s: %w", rel, fs.ErrNotExist)
+}
+
+// Status returns the authenticated manifest version and the TPM counter.
+func (s *Store) Status() (version, counter uint64, err error) {
+	m, err := s.load(".manifest")
+	if err != nil {
+		return 0, 0, err
+	}
+	c, err := s.Counter.Read()
+	return m.Version, c, err
 }

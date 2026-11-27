@@ -130,7 +130,7 @@ func TestChecksNotOk(t *testing.T) {
 			r.out[luksDumpCmd] = strings.Replace(goodLuksDump, "integrity: hmac(sha256)", "integrity: (no)", 1)
 		}},
 		{"var_rollback", func(t *testing.T, root string, r *fakeRunner) {
-			put(t, root, "var/lib/enklave/.manifest", `{"version":41,"entries":[],"mac":"00"}`)
+			stateReply.Version = 41
 		}},
 		{"tpm_locked", func(t *testing.T, root string, r *fakeRunner) {
 			r.out[hierCmd] = strings.Replace(lockedHier, "disableClear:              1", "disableClear:              0", 1)
@@ -253,7 +253,7 @@ func TestMarker(t *testing.T) {
 	if rs[len(rs)-1].Check != "marker" {
 		t.Error("marker should be last")
 	}
-	put(t, root, "var/lib/enklave/data/marker", "x")
+	stateFiles["marker"] = true
 	if !find(t, RunChecks(root, r), "marker").OK {
 		t.Error("marker not ok with file")
 	}

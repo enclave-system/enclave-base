@@ -1,30 +1,33 @@
 // Command enklave-varauth creates, unlocks, authenticates and heals the
-// encrypted state volume and commits state changes (see packages varauth,
+// encrypted state volume and runs the state service (see packages varauth,
 // statefs).
 //
 //	enklave-varauth repart [systemd-repart args...]   lock platform, create the partition
 //	enklave-varauth unlock <var-partition> <esp>      open the volume (provision/heal)
 //	enklave-varauth verify                            authenticate, check state, TPM lock
 //	enklave-varauth sealed                            PCR 11 must have left the signed phase
-//	enklave-varauth state-exec -- CMD [ARGS...]       run CMD on a staged copy of the
-//	                                                  state ($ENKLAVE_STATE_DIR, "{}"
-//	                                                  in ARGS) and commit atomically
+//	enklave-varauth state-serve                       the state service (enklave-state.service)
+//	enklave-varauth state-exec <writer>               ask the state service to run a writer
+//	                                                  defined by the image; stdin is its input
+//	enklave-varauth state-read <path>                 print a state file after authenticating it
+//	enklave-varauth state-status                      authenticated state version and TPM counter
 //	enklave-varauth ek-name                           print the Names of this TPM's
-//	                                                  endorsement keys (for the signed
-//	                                                  EK allowlist of a release)
+//	                                                  endorsement keys (for a signed
+//	                                                  per-device admission)
 //	enklave-varauth probe                             (tests) try to read the key after boot
 //
-// The state volume is mounted read-only. state-exec re-executes itself in a
-// private mount namespace and makes the volume writable only there, so no
-// other process (root included) can write the state through the mount.
+// The state volume is mounted read-only. Only the state service writes it:
+// it holds the state keys (taken out of /run before any other service
+// starts), makes the volume writable in its own mount namespace for one
+// commit, runs only writers defined in the verity-protected image, and
+// accepts a writer only from the systemd unit the image reserves it for.
 package main
 
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
-	"os/exec"
-	"strings"
 	"syscall"
 	"time"
 
@@ -38,7 +41,7 @@ func fail(what string, err error) {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: enklave-varauth repart|unlock|verify|sealed|state-exec|ek-name|probe ...")
+		fmt.Fprintln(os.Stderr, "usage: enklave-varauth repart|unlock|verify|sealed|state-serve|state-exec|state-read|state-status|ek-name|probe ...")
 		os.Exit(2)
 	}
 	c := varauth.DefaultConfig()
@@ -84,19 +87,36 @@ func main() {
 			fail("PCR 11 SEAL CHECK", err)
 		}
 		fmt.Fprintf(os.Stderr, "enklave-varauth: %s\n", msg)
-	case "state-exec":
-		args := os.Args[2:]
-		if len(args) > 0 && args[0] == "--" {
-			args = args[1:]
+	case "state-serve":
+		if err := serve(c, r); err != nil {
+			fail("state service", err)
 		}
-		if len(args) == 0 {
-			fmt.Fprintln(os.Stderr, "usage: enklave-varauth state-exec -- CMD [ARGS...]")
+	case "state-exec":
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: enklave-varauth state-exec <writer>   (stdin is handed to the writer)")
 			os.Exit(2)
 		}
-		if os.Getenv(nsEnv) != "1" {
-			os.Exit(reexecPrivate())
+		rep, err := varauth.StateCall(c, varauth.StateRequest{Op: "exec", Writer: os.Args[2], Pause: os.Getenv("ENKLAVE_STATE_PAUSE")}, os.Stdin)
+		if err != nil {
+			fail("state-exec", err)
 		}
-		os.Exit(stateExec(c, r, args))
+		fmt.Fprintf(os.Stderr, "enklave-state: committed state version %d\n", rep.Version)
+	case "state-read":
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: enklave-varauth state-read <path below data/>")
+			os.Exit(2)
+		}
+		rep, err := varauth.StateCall(c, varauth.StateRequest{Op: "read", Path: os.Args[2]}, nil)
+		if err != nil {
+			fail("state-read", err)
+		}
+		os.Stdout.Write(rep.Data)
+	case "state-status":
+		rep, err := varauth.StateCall(c, varauth.StateRequest{Op: "status"}, nil)
+		if err != nil {
+			fail("state-status", err)
+		}
+		fmt.Printf("version %d counter %d\n", rep.Version, rep.Counter)
 	case "ek-name":
 		names, err := varauth.EKNames(c, r)
 		if err != nil {
@@ -118,105 +138,67 @@ func main() {
 	}
 }
 
-const (
-	nsEnv   = "ENKLAVE_STATE_NS"
-	mntBase = syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC
-)
+const mntBase = syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC
 
-// reexecPrivate runs this command again in a new mount namespace (with
-// private propagation, set by the Go runtime for CLONE_NEWNS).
-func reexecPrivate() int {
-	cmd := exec.Command("/proc/self/exe", os.Args[1:]...)
-	cmd.Env = append(os.Environ(), nsEnv+"=1")
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Unshareflags: syscall.CLONE_NEWNS}
-	if err := cmd.Run(); err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return ee.ExitCode()
+// remount makes the state volume writable or read-only in this process's
+// mount namespace. It refuses to run in the mount namespace of PID 1
+// (enklave-state.service has PrivateMounts=yes): the read-only mount
+// everyone else sees must never change.
+func remount(root string) func(rw bool) error {
+	return func(rw bool) error {
+		self, err := os.Readlink("/proc/self/ns/mnt")
+		if err != nil {
+			return err
 		}
-		fail("state-exec (private mount namespace)", err)
+		init1, err := os.Readlink("/proc/1/ns/mnt")
+		if err != nil {
+			return err
+		}
+		if self == init1 {
+			return errors.New("the state service is not in a private mount namespace")
+		}
+		flags := uintptr(syscall.MS_REMOUNT | mntBase)
+		if !rw {
+			syscall.Sync()
+			flags |= syscall.MS_RDONLY
+		}
+		if err := syscall.Mount("", root, "", flags, ""); err != nil {
+			return fmt.Errorf("remounting %s (rw=%v) in the private namespace: %w", root, rw, err)
+		}
+		return nil
 	}
-	return 0
 }
 
-// writableState makes the state volume writable in this (private) mount
-// namespace only. It refuses to run in the mount namespace of PID 1: the
-// read-only mount everyone else sees must never change.
-func writableState(root string) (func(), error) {
-	self, err := os.Readlink("/proc/self/ns/mnt")
+// serve runs the state service: take the keys out of /run, listen, tell
+// systemd that the keys are gone (Type=notify), serve.
+func serve(c varauth.Config, r execRunner) error {
+	s, err := varauth.NewStateServer(c, r)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	init, err := os.Readlink("/proc/1/ns/mnt")
-	if err != nil {
-		return nil, err
-	}
-	if self == init {
-		return nil, errors.New("not in a private mount namespace")
-	}
-	if err := syscall.Mount("", root, "", syscall.MS_REMOUNT|mntBase, ""); err != nil {
-		return nil, fmt.Errorf("making %s writable in the private namespace: %w", root, err)
-	}
-	return func() {
-		syscall.Sync()
-		if err := syscall.Mount("", root, "", syscall.MS_REMOUNT|syscall.MS_RDONLY|mntBase, ""); err != nil {
-			fmt.Fprintf(os.Stderr, "enklave-state: warning: could not return %s to read-only: %v\n", root, err)
+	s.Remount = remount(c.StateRoot)
+	s.Pause = func(p string) { // test profile only (checked by the server)
+		msg := "enklave-state: TEST PAUSE at " + p + "\n"
+		os.Stderr.WriteString(msg)
+		if f, err := os.OpenFile("/dev/ttyS0", os.O_WRONLY, 0); err == nil {
+			f.WriteString(msg)
+			f.Close()
 		}
-	}, nil
-}
-
-// stateExec runs args against a staged copy of the state and commits it.
-func stateExec(c varauth.Config, r execRunner, args []string) int {
-	restore, err := writableState(c.StateRoot)
-	if err != nil {
-		fail("state-exec", err)
+		time.Sleep(time.Hour)
 	}
-	defer restore()
-	work, err := os.MkdirTemp(c.RunDir, "state-exec-")
+	os.Remove(c.StateSocket())
+	old := syscall.Umask(0o177)
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: c.StateSocket(), Net: "unix"})
+	syscall.Umask(old)
 	if err != nil {
-		restore()
-		fail("state-exec", err)
+		return err
 	}
-	defer os.RemoveAll(work)
-	c.Work = work
-	var pause func(string)
-	if _, err := os.Stat(c.TestMarker); err == nil {
-		if at := os.Getenv("ENKLAVE_STATE_PAUSE"); at != "" { // test profile only
-			pause = func(p string) {
-				if p == at {
-					msg := "enklave-state: TEST PAUSE at " + p + "\n"
-					os.Stderr.WriteString(msg)
-					if f, err := os.OpenFile("/dev/ttyS0", os.O_WRONLY, 0); err == nil {
-						f.WriteString(msg)
-						f.Close()
-					}
-					time.Sleep(time.Hour)
-				}
-			}
+	if sock := os.Getenv("NOTIFY_SOCKET"); sock != "" {
+		if conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: sock, Net: "unixgram"}); err == nil {
+			conn.Write([]byte("READY=1")) //nolint:errcheck
+			conn.Close()
 		}
 	}
-	s, err := varauth.OpenStore(c, r, pause)
-	if err != nil {
-		restore()
-		os.RemoveAll(work)
-		fail("state-exec", err)
-	}
-	v, err := s.Exec(func(staging string) error {
-		a := make([]string, len(args))
-		for i, x := range args {
-			a[i] = strings.ReplaceAll(x, "{}", staging)
-		}
-		cmd := exec.Command(a[0], a[1:]...)
-		cmd.Env = append(os.Environ(), "ENKLAVE_STATE_DIR="+staging)
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-		return cmd.Run()
-	})
-	if err != nil {
-		restore()
-		os.RemoveAll(work)
-		fail("state-exec", err)
-	}
-	fmt.Fprintf(os.Stderr, "enklave-state: committed state version %d\n", v)
-	return 0
+	fmt.Fprintf(os.Stderr, "enklave-state: serving %s (%d writer(s) defined by the image)\n", c.StateSocket(), len(s.Writers))
+	return s.Serve(l)
 }

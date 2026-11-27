@@ -140,7 +140,7 @@ shared_dropin_dirs() {
         echo "$dst/$pfx.$type.d"
     done
 }
-for u in enklave-var-repart.service enklave-var-unlock.service enklave-var-auth.service var-lib-enklave.mount \
+for u in enklave-var-repart.service enklave-var-unlock.service enklave-var-auth.service var-lib-enklave.mount enklave-state.service \
          enklave-require-secureboot.service systemd-pcrphase-sysinit.service enklave-pcr11-sealed.service; do
     [ -f "$dst/$u" ] || die "$u missing"
     for d in $(shared_dropin_dirs "$u"); do
@@ -163,6 +163,18 @@ done
 grep -qx 'TimeoutSec=600' "$dst/enklave-var-unlock.service" || die "enklave-var-unlock needs a finite timeout"
 [ -s "$root/usr/lib/enklave/release.json" ] || die "release.json missing"
 grep -Eq '"dev_keys":(true|false)' "$root/usr/lib/enklave/release.json" || die "release.json lacks the dev_keys marker"
+grep -Eq '"require_ftpm":(true|false)' "$root/usr/lib/enklave/release.json" || die "release.json lacks require_ftpm"
+# B1: no image carries an EK allowlist. A TPM without EK certificate is
+# admitted per device by a signed policy on the ESP, never by the image.
+[ ! -e "$root/usr/lib/enklave/ek-allowlist" ] || die "EK allowlist in the image (admissions are per device, on the ESP)"
+# B8: the state service is the only writer; its writers are JSON definitions.
+[ -L "$dst/local-fs.target.requires/enklave-state.service" ] || die "enklave-state.service is not required by local-fs.target"
+for f in "$root"/usr/lib/enklave/state-writers.d/*; do
+    case "${f##*/}" in *.json) ;; *) die "unexpected file in state-writers.d: ${f##*/}" ;; esac
+    grep -q '"unit"' "$f" || die "${f##*/}: a state writer names its unit"
+    grep -q '"exec"' "$f" || die "${f##*/}: a state writer names its command"
+done
+grep -qx 'kernel.yama.ptrace_scope = 3' "$root/usr/lib/sysctl.d/50-enklave-ptrace.conf" || die "ptrace is not disabled (state keys live in the state service)"
 # The state volume is mounted read-only (state-exec writes in a private namespace).
 case ",$(unit_value "$dst/var-lib-enklave.mount" Mount Options)," in
     *,ro,*) ;;

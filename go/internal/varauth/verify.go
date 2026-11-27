@@ -2,7 +2,6 @@ package varauth
 
 import (
 	"bytes"
-	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -50,6 +49,9 @@ func Verify(c Config, r Runner) (string, error) {
 			t.pauseAt = strings.TrimSpace(string(b))
 		}
 	}
+	if err := t.runtimeEK(); err != nil {
+		return "", err
+	}
 	f, err := t.cachedPolicy()
 	if err != nil {
 		return "", err
@@ -67,17 +69,13 @@ func Verify(c Config, r Runner) (string, error) {
 	if err := t.pcrMode(); err != nil {
 		return "", err
 	}
-	trust, err := t.loadEKTrust(st.nv)
-	if err != nil {
-		return "", err
-	}
 	provisioned, err := exists(c.ProvisionedFlag())
 	if err != nil {
 		return "", err
 	}
 	if provisioned {
 		// (re-)provisioned in this boot by Unlock: pin the salt key now
-		if err := t.useSalt(trust, nil); err != nil {
+		if err := t.useSalt(nil); err != nil {
 			return "", err
 		}
 		if err := t.defineWithPolicy(Record, "p.bin"); err != nil {
@@ -102,7 +100,7 @@ func Verify(c Config, r Runner) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := t.useSalt(trust, rd.SaltName); err != nil {
+	if err := t.useSalt(rd.SaltName); err != nil {
 		return "", err
 	}
 	for _, ck := range []struct {
@@ -122,16 +120,15 @@ func Verify(c Config, r Runner) (string, error) {
 		return "", err
 	}
 	var version uint64
-	var updates string
 	if err := t.withState(func(root string) error {
 		var verr error
 		version, verr = (&statefs.Store{Root: root, Key: keys.MAC, Counter: counterRT{r, t.c.work(), keys.CounterAuth}}).Verify()
-		if verr != nil {
-			return verr
-		}
-		updates, verr = t.secureBootUpdates(root, keys.MAC)
 		return verr
 	}); err != nil {
+		return "", err
+	}
+	updates, err := t.secureBootUpdates()
+	if err != nil {
 		return "", err
 	}
 	for name, content := range map[string]string{
@@ -153,60 +150,44 @@ func Verify(c Config, r Runner) (string, error) {
 
 // ---------------------------------------------------------------- Secure Boot variable updates
 
-// transition is kept in the state volume while index V binds the boot chain
-// instead of PCR 7: the PCR 7 events before the update and the variables the
-// release's signed updates may change.
-type transition struct {
-	Events []sbstate.Event `json:"events"`
-	Vars   []string        `json:"vars"`
-	MAC    string          `json:"mac,omitempty"`
+// Transition states (last byte block of index T).
+const (
+	trIdle       = 0
+	trArmed      = 1 // T and V are set for the update; the firmware may or may not have it
+	trApplied    = 2 // the firmware took the update in a boot that saw it in the variable
+	trRolledBack = 3 // the firmware lost an applied update again; not re-armed
+)
+
+// transState is the content of index T.
+type transState struct {
+	old, new []byte // sbstate.StateDigest before the update / the only state it may lead to
+	state    byte
 }
 
-func (tr transition) mac(key []byte) string {
-	body, _ := json.Marshal(transition{Events: tr.Events, Vars: tr.Vars})
-	h := hmac.New(sha256.New, key)
-	h.Write([]byte("enklave-pcr7-transition-v1\x00"))
-	h.Write(body)
-	return hex.EncodeToString(h.Sum(nil))
+func (ts transState) bytes() []byte {
+	b := make([]byte, Transition.Size)
+	copy(b, ts.old)
+	copy(b[32:], ts.new)
+	b[64] = ts.state
+	return b
 }
 
-func writeSynced(path string, data []byte) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+func (t *tpm) readTransition() (transState, error) {
+	if err := t.checkIndex(Transition, Transition.Final, t.b1); err != nil {
+		return transState{}, err
+	}
+	b, err := ReadNV(t.r, Transition)
 	if err != nil {
-		return err
+		return transState{}, err
 	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	return syncDir(filepath.Dir(path))
+	return transState{old: b[:32], new: b[32:64], state: b[64]}, nil
 }
 
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
+func (t *tpm) writeTransition(ts transState) error {
+	if err := t.put("t.bin", ts.bytes()); err != nil {
 		return err
 	}
-	defer d.Close()
-	return d.Sync()
-}
-
-func removeSynced(path string) error {
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return syncDir(filepath.Dir(path))
+	return t.writeIndex(Transition, "t.bin")
 }
 
 // pcr7Events returns the PCR 7 events of this boot if the TCG event log
@@ -230,6 +211,28 @@ func (t *tpm) pcr7Events() ([]sbstate.Event, error) {
 	return evs, nil
 }
 
+// updatable are the variables a release may update, as named in the event log.
+var updatable = []string{"db-" + sbstate.GUIDSecurity, "dbx-" + sbstate.GUIDSecurity, "KEK-" + sbstate.GUIDGlobal}
+
+// requireEventLog is the platform check of first provisioning and healing
+// (B7): the firmware's event log must replay to PCR 7 and measure db, dbx
+// and KEK exactly once each, as parseable signature lists. Otherwise a later
+// signed Secure Boot update (the durable revocation of a release) could not
+// be carried, so such a device is not enrolled.
+func (t *tpm) requireEventLog() error {
+	evs, err := t.pcr7Events()
+	if err == nil {
+		err = sbstate.HasVariables(evs, updatable)
+	}
+	if err == nil {
+		_, err = sbstate.StateDigest(evs, updatable, nil)
+	}
+	if err != nil {
+		return fmt.Errorf("this firmware cannot carry signed Secure Boot variable updates (dbx revocation), refusing to enrol the device: %w", err)
+	}
+	return nil
+}
+
 func (t *tpm) efi() sbstate.Vars {
 	if t.c.EFI != nil {
 		return t.c.EFI
@@ -237,28 +240,31 @@ func (t *tpm) efi() sbstate.Vars {
 	return sbstate.EFIVarFS{Dir: "/sys/firmware/efi/efivars"}
 }
 
-// unapplied returns the release's updates whose signatures are not all in
-// the firmware's variable yet.
-func (t *tpm) unapplied() ([]sbstate.Update, int, error) {
-	all, err := sbstate.LoadUpdates(t.c.UpdatesDir)
-	if err != nil {
-		return nil, 0, fmt.Errorf("Secure Boot updates of this release: %w", err)
+// releaseUpdates loads the release's signed updates: all of them, those not
+// yet in the firmware, the variables they touch and their signatures.
+func (t *tpm) releaseUpdates() (all, todo []sbstate.Update, ids []string, add map[string][]sbstate.Signature, err error) {
+	if all, err = sbstate.LoadUpdates(t.c.UpdatesDir); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("Secure Boot updates of this release: %w", err)
 	}
-	var todo []sbstate.Update
+	add = map[string][]sbstate.Signature{}
 	for _, u := range all {
+		if _, seen := add[u.ID()]; !seen {
+			ids = append(ids, u.ID())
+		}
+		add[u.ID()] = append(add[u.ID()], u.Sigs...)
 		cur, err := t.efi().Read(u.Var, u.GUID)
 		if err != nil {
-			return nil, 0, err
+			return nil, nil, nil, nil, err
 		}
 		done, err := u.Applied(cur)
 		if err != nil {
-			return nil, 0, err
+			return nil, nil, nil, nil, err
 		}
 		if !done {
 			todo = append(todo, u)
 		}
 	}
-	return todo, len(all), nil
+	return all, todo, ids, add, nil
 }
 
 // apply submits the updates to the firmware (which verifies their KEK/PK
@@ -283,101 +289,159 @@ func (t *tpm) apply(todo []sbstate.Update) (failed []string, changed bool) {
 	return failed, changed
 }
 
-const transitionFile = ".pcr7"
+// checkBridge is the Secure Boot check of a boot in which index V binds the
+// boot chain (PCR 0+2+4+12) instead of PCR 7. It runs BEFORE the volume key
+// is read (B2) and needs nothing from the state volume: index T, written
+// under policy P when the transition was armed, holds the digests of the
+// only two Secure Boot states that may follow. The state of this boot, from
+// the event log that replays to PCR 7, must be one of them:
+//
+//   - exactly the state before the update (the firmware has not taken it),
+//   - exactly that state with the signatures of the release's signed updates
+//     added to the updated variables (B3): nothing dropped, nothing else
+//     added, Secure Boot on, PK/KEK/db and the signing authority unchanged.
+//
+// It returns whether the update is in the firmware.
+func (t *tpm) checkBridge() (applied bool, err error) {
+	ts, err := t.readTransition()
+	if err != nil {
+		return false, err
+	}
+	if ts.state != trArmed && ts.state != trApplied {
+		return false, fmt.Errorf("PCR policy index binds the boot chain but no Secure Boot update is in transit (transition state %d)", ts.state)
+	}
+	evs, err := t.pcr7Events()
+	if err != nil {
+		return false, fmt.Errorf("Secure Boot update in transit: %w", err)
+	}
+	_, _, ids, _, err := t.releaseUpdates()
+	if err != nil {
+		return false, err
+	}
+	cur, err := sbstate.StateDigest(evs, ids, nil)
+	if err != nil {
+		return false, fmt.Errorf("Secure Boot update in transit: %w", err)
+	}
+	switch {
+	case bytes.Equal(cur, ts.new):
+		return true, nil
+	case bytes.Equal(cur, ts.old):
+		return false, nil
+	}
+	return false, fmt.Errorf("Secure Boot update in transit and the Secure Boot state of this boot (%x) is neither the state before the update (%x) nor exactly that state plus the signed update (%x): refusing before the volume key is read",
+		cur, ts.old, ts.new)
+}
 
 // secureBootUpdates applies the signed Secure Boot variable updates shipped
 // in /usr (dbx appends that revoke old UKIs, db/KEK appends) and moves the
-// state volume's Secure Boot binding along (F3).
+// state volume's Secure Boot binding along (F3, B2, B3).
 //
-// A dbx/db/KEK change alters PCR 7 from the next boot on, by a value only
-// the firmware determines. Policy P therefore does not hold PCR 7 itself:
-// its PCR-bound part lives in index V, which an authorized boot rewrites:
+// A dbx/db/KEK change alters PCR 7 from the next boot on. Policy P does not
+// hold PCR 7 itself: its PCR-bound part lives in index V.
 //
 //  1. Steady (V = PCR 7+12 of this boot), updates not yet in the firmware:
-//     the PCR 7 events of this boot are stored in the state volume (MAC from
-//     the volume key), V is switched to the *bridge* PCR 0+2+4+12 (firmware
-//     code, option ROMs/drivers, every EFI binary on the boot path, no ESP
-//     credentials), and only then the updates are handed to the firmware.
-//     From this moment the old PCR 7 is no longer accepted by anything.
-//  2. Next boot (bridge): the same firmware, boot loader and UKI started, so
-//     only genuine code is running whatever the Secure Boot variables say.
-//     It replays the event log against PCR 7 and requires the new PCR 7
-//     events to equal the stored ones except for the content of the updated
-//     variables: Secure Boot still on, PK/KEK/db and the signing authority
-//     unchanged. Then V is set to the new PCR 7+12 and the bridge ends.
+//     index T is armed with the digest of the current Secure Boot state and
+//     the digest of that state plus the update; V is switched to PCR
+//     0+2+4+12 (firmware code, option ROMs/drivers, every EFI binary on the
+//     boot path, no ESP credentials); only then the updates are handed to
+//     the firmware, and T is marked "applied". From the V write on, the old
+//     PCR 7 alone opens nothing.
+//  2. Next boot: checkBridge (before the volume key is read) accepts only
+//     the two states pinned in T. If the update is in the firmware, V is set
+//     to the new PCR 7+12 here and T is cleared.
 //
-// A crash at any point leaves V satisfiable by the same boot chain, so the
-// device is never bricked; a foreign Secure Boot configuration, firmware or
-// loader satisfies neither binding. Devices whose firmware does not log the
-// variable as expected keep their binding and report "blocked" (no brick).
-func (t *tpm) secureBootUpdates(root string, macKey []byte) (string, error) {
-	todo, total, err := t.unapplied()
+// One shot: if an update that was marked applied is missing again (the
+// variable store was rolled back), V returns to the old PCR 7 binding, T
+// remembers "rolled back", and the transition is not armed again for this
+// update. A power loss before the firmware took the update is retried; the
+// boot chain binding never admits any other Secure Boot state.
+func (t *tpm) secureBootUpdates() (string, error) {
+	all, todo, ids, add, err := t.releaseUpdates()
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(root, transitionFile)
-	var ids []string
-	seen := map[string]bool{}
-	for _, u := range todo {
-		if !seen[u.ID()] {
-			seen[u.ID()] = true
-			ids = append(ids, u.ID())
-		}
+	total := len(all)
+	ts, err := t.readTransition()
+	if err != nil {
+		return "", err
+	}
+	pending := func(failed []string) string {
+		return fmt.Sprintf("pending: %d of %d update(s) handed to the firmware, reboot to complete%s", len(todo)-len(failed), total, failures(failed))
 	}
 
 	if t.mode == modeBridge {
-		b, err := os.ReadFile(path)
+		applied, err := t.checkBridge() // already passed in Unlock; needed for the decision here
 		if err != nil {
-			return "", fmt.Errorf("PCR 7 transition pending but its record is missing from the state volume: %w", err)
+			return "", err
 		}
-		var tr transition
-		if err := json.Unmarshal(b, &tr); err != nil || !hmac.Equal([]byte(tr.MAC), []byte(tr.mac(macKey))) {
-			return "", errors.New("PCR 7 transition record is not authentic")
-		}
-		evs, err := t.pcr7Events()
-		if err != nil {
-			return "", fmt.Errorf("PCR 7 transition: %w", err)
-		}
-		if err := sbstate.Compare(tr.Events, evs, tr.Vars); err != nil {
-			return "", fmt.Errorf("PCR 7 transition refused, the Secure Boot state changed beyond the signed updates: %w", err)
-		}
-		var failed []string
-		if len(todo) > 0 {
-			// interrupted before the firmware took the update: hand it over again
-			var changed bool
-			if failed, changed = t.apply(todo); changed {
-				return fmt.Sprintf("pending: %d of %d update(s) handed to the firmware, reboot to complete%s", len(todo)-len(failed), total, failures(failed)), nil
+		if applied {
+			if err := t.writePCRPolicy("v-steady.bin", modeSteady); err != nil {
+				return "", err
 			}
+			if err := t.writeTransition(transState{}); err != nil {
+				return "", err
+			}
+			if len(todo) > 0 {
+				return "failed: NOT APPLIED: the firmware holds only part of the release's updates", nil
+			}
+			return fmt.Sprintf("current (%d update(s) in the firmware, Secure Boot state re-recorded after the update)", total), nil
+		}
+		if ts.state == trApplied {
+			// the update was in the firmware and is gone: variable store rolled back
+			if err := t.writePCRPolicy("v-steady.bin", modeSteady); err != nil {
+				return "", err
+			}
+			ts.state = trRolledBack
+			if err := t.writeTransition(ts); err != nil {
+				return "", err
+			}
+			return "failed: NOT APPLIED: the firmware lost the update again (variable store rolled back); the transition is not opened again", nil
+		}
+		// armed, but the firmware never took it (power loss): hand it over again
+		failed, changed := t.apply(todo)
+		if changed {
+			ts.state = trApplied
+			if err := t.writeTransition(ts); err != nil {
+				return "", err
+			}
+			return pending(failed), nil
 		}
 		if err := t.writePCRPolicy("v-steady.bin", modeSteady); err != nil {
 			return "", err
 		}
-		if err := removeSynced(path); err != nil {
+		if err := t.writeTransition(transState{}); err != nil {
 			return "", err
 		}
-		if len(failed) > 0 {
-			return "failed" + failures(failed), nil
-		}
-		return fmt.Sprintf("current (%d update(s) in the firmware, Secure Boot state re-recorded after the update)", total), nil
+		return "failed" + failures(failed), nil
 	}
 
-	if err := removeSynced(path); err != nil { // stale record of a reverted transition
-		return "", err
-	}
 	if len(todo) == 0 {
+		if ts.state != trIdle {
+			if err := t.writeTransition(transState{}); err != nil {
+				return "", err
+			}
+		}
 		return fmt.Sprintf("current (%d update(s) in the firmware)", total), nil
 	}
 	evs, err := t.pcr7Events()
 	if err == nil {
 		err = sbstate.HasVariables(evs, ids)
 	}
+	var old, next []byte
+	if err == nil {
+		old, err = sbstate.StateDigest(evs, ids, nil)
+	}
+	if err == nil {
+		next, err = sbstate.StateDigest(evs, ids, add)
+	}
 	if err != nil {
+		// cannot happen on an enrolled device unless the firmware changed (requireEventLog)
 		return fmt.Sprintf("blocked: %d update(s) not applied, this firmware's PCR 7 log cannot carry the transition: %v", len(todo), err), nil
 	}
-	tr := transition{Events: evs, Vars: ids}
-	tr.MAC = tr.mac(macKey)
-	b, _ := json.Marshal(tr)
-	if err := writeSynced(path, b); err != nil {
+	if ts.state == trRolledBack && bytes.Equal(ts.new, next) {
+		return "failed: NOT APPLIED: the firmware lost this update before (variable store rolled back); the transition is not opened again", nil
+	}
+	if err := t.writeTransition(transState{old: old, new: next, state: trArmed}); err != nil {
 		return "", err
 	}
 	if err := t.writePCRPolicy("v-bridge.bin", modeBridge); err != nil {
@@ -391,12 +455,15 @@ func (t *tpm) secureBootUpdates(root string, macKey []byte) (string, error) {
 		if err := t.writePCRPolicy("v-steady.bin", modeSteady); err != nil {
 			return "", err
 		}
-		if err := removeSynced(path); err != nil {
+		if err := t.writeTransition(transState{}); err != nil {
 			return "", err
 		}
 		return "failed" + failures(failed), nil
 	}
-	return fmt.Sprintf("pending: %d of %d update(s) handed to the firmware, reboot to complete%s", len(todo)-len(failed), total, failures(failed)), nil
+	if err := t.writeTransition(transState{old: old, new: next, state: trApplied}); err != nil {
+		return "", err
+	}
+	return pending(failed), nil
 }
 
 func failures(f []string) string {
@@ -481,7 +548,10 @@ func Probe(c Config, r Runner) error {
 	if err != nil {
 		return err
 	}
-	if pcr11, _, err := f.Decode(t.id.Role, t.id.Profile); err == nil {
+	if err := t.runtimeEK(); err != nil {
+		return err
+	}
+	if pcr11, _, err := f.DecodeRef(t.id.Role, t.id.Profile, t.ref); err == nil {
 		t.pcr11 = pcr11 // try the signed state even though PCR 11 moved on
 	}
 	if err := t.authorize(f); err != nil {
@@ -497,28 +567,6 @@ func Probe(c Config, r Runner) error {
 // pauseHook is called at a test pause point (overridden in unit tests).
 var pauseHook = func(string) { time.Sleep(time.Hour) }
 
-// ReadCounter returns the TPM state counter (selftest). The session is
-// salted to the salt key authenticated against the EK trust anchors and
-// record A.
-func ReadCounter(c Config, r Runner) (uint64, error) {
-	keys, err := LoadStateKeys(c)
-	if err != nil {
-		return 0, err
-	}
-	t, err := newTPM(c, r)
-	if err != nil {
-		return 0, err
-	}
-	defer os.RemoveAll(c.work())
-	if err := t.prepare(); err != nil {
-		return 0, err
-	}
-	if err := t.recordedSalt(); err != nil {
-		return 0, err
-	}
-	return counterRT{r, c.work(), keys.CounterAuth}.Read()
-}
-
 // SaltName authenticates the persistent salt key (EK trust anchors and
 // record A) and returns its Name and how it was authenticated (selftest).
 func SaltName(c Config, r Runner) ([]byte, string, error) {
@@ -526,10 +574,10 @@ func SaltName(c Config, r Runner) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	if err := os.MkdirAll(c.work(), 0o700); err != nil {
+	defer os.RemoveAll(c.work())
+	if err := t.prepare(); err != nil {
 		return nil, "", err
 	}
-	defer os.RemoveAll(c.work())
 	if err := t.recordedSalt(); err != nil {
 		return nil, "", err
 	}
