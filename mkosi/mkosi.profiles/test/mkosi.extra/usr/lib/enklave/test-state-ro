@@ -1,0 +1,13 @@
+#!/bin/sh
+# Test profile only: root in the running system tries to write the state
+# volume directly, bypassing "enklave-varauth state-exec". Every attempt must
+# be refused because the volume is mounted read-only (M3).
+r="ok: refused"
+for p in /var/lib/enklave/data/evil /var/lib/enklave/evil /var/lib/enklave/.manifest; do
+    if out=$(sh -c ": >> $p" 2>&1); then
+        r="BAD: wrote $p"
+        break
+    fi
+    r="ok: refused: ${out##*: }"
+done
+echo "enklave-test-state-ro: $r" > /dev/ttyS0

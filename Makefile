@@ -28,6 +28,19 @@ REF_OUT      ?= ref
 REF_TEST_OUT ?= ref-test
 # Development only: allow signing prod images with a DEV-KEYS PKI.
 ENKLAVE_DEV_PROD ?= 0
+# Signed EK allowlist (optional): file with one TPM endorsement-key Name per
+# line, for devices whose TPM carries no EK certificate (AMD fTPM, virtual
+# TPMs of development VMs). See README "TPM authenticity".
+EK_ALLOWLIST ?=
+# Signed Secure Boot variable updates (optional): directory with
+# <dbx|db|KEK>-<id>.auth files (scripts/revoke-release.sh) that this release
+# applies on its first boot. See README "Revoking a vulnerable release".
+EFI_UPDATES ?=
+# Public certificates of the CA that certifies the emulated TPMs of the VM
+# tests (pki/enklave-pki ek-test-ca); they go into test-profile images only.
+EK_TEST_CA ?= $(ENKLAVE_PKI_DIR)/ek-test-ca
+STAGE_TEST := $(OUT)/stage-test
+DEV_KEYS := $(shell [ -e "$(ENKLAVE_PKI_DIR)/DEV-KEYS" ] && echo true || echo false)
 
 export ENKLAVE_PKI_DIR
 # PCR signing public key, plus a self-signed X.509 wrapper of the same key:
@@ -42,7 +55,7 @@ kernel_pkg = linux-image-$(KVER)-enklave-$(1)
 PKI_FILES := sb/db.key sb/db.crt verity/verity.key verity/verity.crt \
              pcr/pcr-signing.key pcr/pcr-signing.pub config/config-signing.pub
 
-.PHONY: kernel-client kernel-server go stage pcr-cert check-pki ref ref-test test-unit test-vm clean
+.PHONY: kernel-client kernel-server go stage stage-test pcr-cert check-pki ref ref-test test-unit test-vm clean
 
 kernel-client: $(call kernel_deb,client)
 kernel-server: $(call kernel_deb,server)
@@ -67,7 +80,25 @@ stage: go check-pki
 	install -D -m 0755 $(OUT)/bin/enklave-selftest $(STAGE)/usr/lib/enklave/enklave-selftest
 	install -D -m 0755 $(OUT)/bin/enklave-varauth $(STAGE)/usr/lib/enklave/enklave-varauth
 	install -D -m 0644 $(ENKLAVE_PKI_DIR)/config/config-signing.pub $(STAGE)/usr/share/enklave/keys/config-signing.pub
-	printf '{"epoch":%d,"heal_below":%d}\n' $(SECURITY_EPOCH) $(HEAL_BELOW) > $(STAGE)/usr/lib/enklave/release.json
+	printf '{"epoch":%d,"heal_below":%d,"dev_keys":%s,"built":%d}\n' $(SECURITY_EPOCH) $(HEAL_BELOW) $(DEV_KEYS) "$$(date +%s)" \
+	    > $(STAGE)/usr/lib/enklave/release.json
+	if [ -n "$(EK_ALLOWLIST)" ]; then install -D -m 0644 "$(EK_ALLOWLIST)" $(STAGE)/usr/lib/enklave/ek-allowlist; fi
+	if [ -n "$(EFI_UPDATES)" ]; then \
+	    for f in "$(EFI_UPDATES)"/*.auth; do \
+	        install -D -m 0644 "$$f" $(STAGE)/usr/lib/enklave/efi-updates/"$$(basename "$$f")"; \
+	    done; \
+	fi
+
+# Test profile only: the CA of the emulated test TPMs. Refused for a PKI
+# without the DEV-KEYS marker: a test CA must never be trusted by a shippable
+# image (mkosi.finalize asserts its absence in production images).
+stage-test: check-pki
+	[ "$(DEV_KEYS)" = true ] || { echo "test images need a DEV-KEYS PKI" >&2; exit 1; }
+	rm -rf $(STAGE_TEST)
+	for f in issuercert.pem swtpm-localca-rootca-cert.pem; do \
+	    [ -f "$(EK_TEST_CA)/$$f" ] || { echo "missing $(EK_TEST_CA)/$$f (run: pki/enklave-pki ek-test-ca $(ENKLAVE_PKI_DIR))" >&2; exit 1; }; \
+	    install -D -m 0644 "$(EK_TEST_CA)/$$f" $(STAGE_TEST)/usr/share/enklave/tpm-ek-ca-test/RootCA/"$${f%.pem}.crt"; \
+	done
 
 pcr-cert: check-pki
 	mkdir -p $(dir $(ENKLAVE_PCR_CERT))
@@ -103,6 +134,7 @@ define mkosi_build
 	    --uki $(OUT)/$(2)/enklave-$(1)_$(3).efi \
 	    --key $(ENKLAVE_PKI_DIR)/pcr/pcr-signing.key --pub $(ENKLAVE_PKI_DIR)/pcr/pcr-signing.pub \
 	    --epoch $(SECURITY_EPOCH) --role $(1) --profile $(6) --pki $(ENKLAVE_PKI_DIR) \
+	    --release $(STAGE)/usr/lib/enklave/release.json \
 	    $(if $(filter 1,$(ENKLAVE_DEV_PROD)),--allow-dev-key-for-prod) \
 	    --out $(OUT)/$(2)/enklave-$(1)_$(3).policy.json \
 	    --image $(OUT)/$(2)/enklave-$(1)_$(3).raw
@@ -112,8 +144,8 @@ endef
 ref: kernel-$(REF_KERNEL_FLAVOR) stage pcr-cert
 	$(call mkosi_build,ref,$(REF_OUT),$(REF_VERSION),$(REF_KERNEL_FLAVOR),,prod)
 
-ref-test: kernel-$(REF_KERNEL_FLAVOR) stage pcr-cert
-	$(call mkosi_build,ref,$(REF_TEST_OUT),$(REF_VERSION),$(REF_KERNEL_FLAVOR),--profile=test,test)
+ref-test: kernel-$(REF_KERNEL_FLAVOR) stage stage-test pcr-cert
+	$(call mkosi_build,ref,$(REF_TEST_OUT),$(REF_VERSION),$(REF_KERNEL_FLAVOR),--profile=test --extra-tree=$(STAGE_TEST),test)
 
 test-unit:
 	cd go && go vet ./... && go test ./... -race -count=1
@@ -124,4 +156,4 @@ test-vm:
 	python3 -m pytest -v -m vm pki/tests $(wildcard tests/vm)
 
 clean:
-	rm -rf $(OUT)/ref $(OUT)/ref-test $(STAGE) $(OUT)/bin
+	rm -rf $(OUT)/ref $(OUT)/ref-test $(STAGE) $(STAGE_TEST) $(OUT)/bin

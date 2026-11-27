@@ -172,3 +172,32 @@ def test_init_dev_marker(tmp_path):
     assert (tmp_path / "dev" / "DEV-KEYS").is_file()
     run(TOOL, "init", tmp_path / "prod")
     assert not (tmp_path / "prod" / "DEV-KEYS").exists()
+
+
+def test_ek_test_ca_needs_dev_pki(pki, tmp_path):
+    # a test TPM CA must never be created next to production keys
+    r = run(TOOL, "ek-test-ca", pki, check=False)
+    assert r.returncode != 0 and "DEV-KEYS" in r.stderr
+    assert not (pki / "ek-test-ca").exists()
+    r = run(TOOL, "ek-test-ca", tmp_path / "nothing", check=False)
+    assert r.returncode != 0
+
+
+def test_ek_test_ca(tmp_path):
+    d = tmp_path / "devpki"
+    run(TOOL, "init", "--dev", d)
+    run(TOOL, "ek-test-ca", d)
+    ca = d / "ek-test-ca"
+    for f in ["issuercert.pem", "swtpm-localca-rootca-cert.pem", "swtpm_setup.conf", "swtpm-localca.conf"]:
+        assert (ca / f).stat().st_size > 0, f
+    for f in ["signkey.pem", "swtpm-localca-rootca-privkey.pem"]:
+        assert mode(ca / f) == 0o600, f
+    assert mode(ca) == 0o700
+    # the issuer chains to the root, and a fresh emulated TPM gets an EK certificate from it
+    run("openssl", "verify", "-CAfile", ca / "swtpm-localca-rootca-cert.pem", ca / "issuercert.pem")
+    state = tmp_path / "tpm"
+    state.mkdir()
+    out = run("swtpm_setup", "--tpm2", "--tpmstate", state, "--config", ca / "swtpm_setup.conf", "--create-ek-cert")
+    assert "Successfully created NVRAM area 0x1c00002 for RSA 2048 EK certificate" in out.stdout
+    r = run(TOOL, "ek-test-ca", d, check=False)
+    assert r.returncode != 0 and "already exists" in r.stderr

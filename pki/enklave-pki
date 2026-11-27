@@ -6,6 +6,11 @@
 #                                          may be signed with it)
 #   enklave-pki ovmf-vars <dir> <out.fd>   build an OVMF VARS file (PK/KEK/db enrolled,
 #                                          Secure Boot user mode, no Microsoft keys)
+#   enklave-pki ek-test-ca <dir>           (DEV-KEYS PKI only) create <dir>/ek-test-ca, the
+#                                          CA that certifies the endorsement keys of
+#                                          emulated test TPMs: swtpm_setup --tpm2 --config
+#                                          <dir>/ek-test-ca/swtpm_setup.conf --create-ek-cert
+#                                          Only test-profile images trust this CA.
 #
 # Keeping <dir> offline and protected is the operator's responsibility.
 set -euo pipefail
@@ -22,7 +27,7 @@ cleanup() {
     fi
 }
 die() { echo "enklave-pki: $*" >&2; exit 1; }
-usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 # selfsigned <keyfile> <crtfile> <CN> <genpkey args...> -- <extra -addext args...>
 selfsigned() {
@@ -136,8 +141,40 @@ cmd_ovmf_vars() {
         --sb --no-microsoft -o "$out"
 }
 
+# CA for the EK certificates of emulated TPMs (VM tests). swtpm_localca
+# creates it on first use; its private keys stay in <dir>/ek-test-ca.
+cmd_ek_test_ca() {
+    [ "$#" -eq 1 ] || usage
+    local dir="$1" ca
+    [ -r "$dir/sb/GUID" ] || die "$dir is not an enklave PKI directory"
+    [ -e "$dir/DEV-KEYS" ] || die "$dir has no DEV-KEYS marker: a test TPM CA must never exist next to production keys"
+    dir="$(cd "$dir" && pwd)"
+    ca="$dir/ek-test-ca"
+    [ ! -e "$ca" ] || die "$ca already exists"
+    command -v swtpm_setup >/dev/null || die "swtpm_setup not found (package swtpm-tools)"
+    command -v swtpm_localca >/dev/null || die "swtpm_localca not found (package swtpm-tools)"
+    mkdir -m 700 "$ca"
+    printf '%s\n' "statedir = $ca" "signingkey = $ca/signkey.pem" "issuercert = $ca/issuercert.pem" \
+        "certserial = $ca/certserial" > "$ca/swtpm-localca.conf"
+    printf '%s\n' "--platform-manufacturer enklave-test" "--platform-version 1" "--platform-model swtpm" \
+        > "$ca/swtpm-localca.options"
+    printf '%s\n' "create_certs_tool=$(command -v swtpm_localca)" "create_certs_tool_config=$ca/swtpm-localca.conf" \
+        "create_certs_tool_options=$ca/swtpm-localca.options" > "$ca/swtpm_setup.conf"
+    tmp="$(mktemp -d)"
+    trap cleanup EXIT
+    mkdir "$tmp/tpm"
+    swtpm_setup --tpm2 --tpmstate "$tmp/tpm" --config "$ca/swtpm_setup.conf" \
+        --create-ek-cert --lock-nvram > /dev/null
+    [ -s "$ca/issuercert.pem" ] && [ -s "$ca/swtpm-localca-rootca-cert.pem" ] \
+        || die "swtpm_localca did not create the CA"
+    chmod 600 "$ca/signkey.pem" "$ca/swtpm-localca-rootca-privkey.pem"
+    chmod 644 "$ca/issuercert.pem" "$ca/swtpm-localca-rootca-cert.pem"
+    echo "Test TPM CA created in $ca (development only)."
+}
+
 case "${1:-}" in
     init) shift; cmd_init "$@" ;;
+    ek-test-ca) shift; cmd_ek_test_ca "$@" ;;
     ovmf-vars) shift; cmd_ovmf_vars "$@" ;;
     *) usage ;;
 esac

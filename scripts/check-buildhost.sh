@@ -33,7 +33,8 @@ fi
 
 for c in qemu-system-x86_64 swtpm sbsign sbverify cert-to-efi-sig-list \
          sign-efi-sig-list openssl pytest systemd-repart ukify veritysetup \
-         cryptsetup virt-fw-vars gpg mcopy mkfs.vfat git tpm2_pcrread bootctl; do
+         cryptsetup virt-fw-vars gpg mcopy mkfs.vfat git tpm2_pcrread bootctl \
+         swtpm_setup swtpm_localca hash-to-efi-sig-list; do
     have "$c" || missing "$c"
 done
 

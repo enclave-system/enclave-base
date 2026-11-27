@@ -162,6 +162,35 @@ for u in enklave-var-repart.service enklave-var-unlock.service enklave-var-auth.
 done
 grep -qx 'TimeoutSec=600' "$dst/enklave-var-unlock.service" || die "enklave-var-unlock needs a finite timeout"
 [ -s "$root/usr/lib/enklave/release.json" ] || die "release.json missing"
+grep -Eq '"dev_keys":(true|false)' "$root/usr/lib/enklave/release.json" || die "release.json lacks the dev_keys marker"
+# The state volume is mounted read-only (state-exec writes in a private namespace).
+case ",$(unit_value "$dst/var-lib-enklave.mount" Mount Options)," in
+    *,ro,*) ;;
+    *) die "var-lib-enklave.mount must be mounted read-only" ;;
+esac
+# TPM vendor EK CA bundle: present, with provenance, without the Microsoft
+# (virtual TPM) CAs. The CA of the emulated test TPMs exists in test-profile
+# images only and test-profile images are always dev-signed.
+ekca="$root/usr/share/enklave/tpm-ek-ca"
+[ -s "$ekca/SOURCE" ] && [ -s "$ekca/SHA256SUMS" ] || die "TPM vendor CA bundle or its provenance missing"
+[ "$(find "$ekca" -path '*/RootCA/*' -type f | wc -l)" -ge 40 ] || die "TPM vendor CA bundle incomplete"
+[ ! -e "$ekca/Microsoft" ] || die "the Microsoft (virtual TPM) CAs must not be shipped"
+( cd "$ekca" && sha256sum --quiet -c SHA256SUMS ) || die "TPM vendor CA bundle does not match SHA256SUMS"
+[ "$(find "$ekca" -type f ! -name SOURCE ! -name SHA256SUMS | wc -l)" = "$(wc -l < "$ekca/SHA256SUMS")" ] \
+    || die "TPM vendor CA bundle holds files that are not in SHA256SUMS"
+if [ -e "$root/usr/lib/enklave/test-profile" ]; then
+    [ -n "$(ls -A "$root/usr/share/enklave/tpm-ek-ca-test/RootCA" 2>/dev/null)" ] || die "test profile without the test TPM CA"
+    grep -q '"dev_keys":true' "$root/usr/lib/enklave/release.json" || die "test-profile image without the dev-key marker"
+else
+    [ ! -e "$root/usr/share/enklave/tpm-ek-ca-test" ] || die "test TPM CA in a production image"
+fi
+# Signed Secure Boot variable updates: only dbx/db/KEK appends.
+for f in "$root"/usr/lib/enklave/efi-updates/*; do
+    case "${f##*/}" in
+        dbx-*.auth|db-*.auth|KEK-*.auth) ;;
+        *) die "unexpected file in efi-updates: ${f##*/}" ;;
+    esac
+done
 grep -q -- '--factory-reset=no' "$dst/enklave-var-repart.service" || die "repart may honour factory reset"
 r="$root/usr/lib/enklave/repart.d/30-var.conf"
 [ "$(unit_value "$r" Partition FactoryReset)" = no ] || die "30-var.conf: FactoryReset must be no"
