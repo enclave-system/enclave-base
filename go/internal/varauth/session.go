@@ -687,13 +687,9 @@ func (t *tpm) chooseEK(st tpmState, first bool) error {
 		if err != nil {
 			return err
 		}
-		prefix := t.id.Ref + ":ek:"
-		for ref := range t.files {
-			if !strings.HasPrefix(ref, prefix) {
-				continue
-			}
-			name, err := hex.DecodeString(strings.TrimPrefix(ref, prefix))
-			if err != nil {
+		for ref, f := range t.files {
+			name, err := hex.DecodeString(f.EK)
+			if err != nil || len(name) == 0 || tpmpolicy.RefEK(t.id.Ref, name) != ref {
 				continue
 			}
 			if err := t.setRef(ref); err != nil {

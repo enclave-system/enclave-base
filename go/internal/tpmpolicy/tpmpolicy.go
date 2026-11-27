@@ -21,6 +21,7 @@ package tpmpolicy
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -57,13 +58,18 @@ func Ref(role, profile string) (string, error) {
 	return RefPrefix + ":" + role + ":" + profile, nil
 }
 
+// RefEKPrefix marks a per-device policyRef.
+const RefEKPrefix = "ek1:"
+
 // RefEK is the policyRef of ONE device whose TPM has no EK certificate and
-// was admitted by a signature: the base ref plus the Name of that device's
-// endorsement key. Policies signed for it authorize nothing on any other
-// device, and nothing on a device provisioned through an EK certificate
-// (whose objects are bound to the base ref).
+// was admitted by a signature: a digest over the base ref and the Name of
+// that device's endorsement key (a policyRef is at most 64 bytes, so the
+// Name itself does not fit). Policies signed for it authorize nothing on any
+// other device, and nothing on a device provisioned through an EK
+// certificate (whose objects are bound to the base ref).
 func RefEK(base string, ekName []byte) string {
-	return base + ":ek:" + hex.EncodeToString(ekName)
+	h := sha256.Sum256([]byte(base + ":ek:" + hex.EncodeToString(ekName)))
+	return RefEKPrefix + base64.RawURLEncoding.EncodeToString(h[:])
 }
 
 // EpochOperand is operandB for PolicyNV: an 8-byte big-endian mask with only
@@ -134,6 +140,9 @@ type File struct {
 	Approved    string `json:"approved"`     // hex
 	Ref         string `json:"ref"`
 	Signature   string `json:"signature"` // base64 RSASSA-PKCS1-v1_5/SHA-256 over approved||ref
+	// EK is the Name (hex) of the endorsement key a per-device admission is
+	// for. Informational: what counts is that Ref equals RefEK(base, Name).
+	EK string `json:"ek,omitempty"`
 	// DevKeys is informational release metadata: signed with a development
 	// PKI. The authoritative marker is release.json in the verity /usr.
 	DevKeys bool `json:"dev_keys,omitempty"`
@@ -156,7 +165,7 @@ func (f File) DecodeRef(role, profile, ref string) (pcr11, approved []byte, err 
 	if err != nil {
 		return nil, nil, err
 	}
-	if ref != base && !strings.HasPrefix(ref, base+":ek:") {
+	if ref != base && (!strings.HasPrefix(ref, RefEKPrefix) || len(ref) > 64) {
 		return nil, nil, fmt.Errorf("policyRef %q does not belong to %s", ref, base)
 	}
 	if f.Version != 2 || f.Ref != ref || f.Role != role || f.Profile != profile {

@@ -3,6 +3,7 @@ package tpmpolicy
 import (
 	"bytes"
 	"encoding/hex"
+	"strings"
 	"testing"
 )
 
@@ -145,8 +146,11 @@ func TestRefEK(t *testing.T) {
 	base, _ := Ref("ref", "dev")
 	name := append([]byte{0, 0x0b}, bytes.Repeat([]byte{0xab}, 32)...)
 	ref := RefEK(base, name)
-	if ref != "enklave-var-v1:ref:dev:ek:000b"+hex.EncodeToString(bytes.Repeat([]byte{0xab}, 32)) {
-		t.Fatalf("%q", ref)
+	if !strings.HasPrefix(ref, "ek1:") || len(ref) != 47 || len(ref) > 64 {
+		t.Fatalf("%q: a policyRef must fit a TPM2B_NONCE (64 bytes)", ref)
+	}
+	if prod, _ := Ref("ref", "prod"); RefEK(prod, name) == ref {
+		t.Fatal("per-device ref does not depend on the profile")
 	}
 	f := File{Version: 2, Role: "ref", Profile: "dev", PCR11Policy: vecPCR11Policy, Approved: vecApproved, Ref: ref}
 	if _, _, err := f.DecodeRef("ref", "dev", ref); err != nil {
@@ -161,6 +165,9 @@ func TestRefEK(t *testing.T) {
 	}
 	if _, _, err := f.DecodeRef("ref", "prod", ref); err == nil {
 		t.Error("dev admission accepted by a prod image")
+	}
+	if _, _, err := f.DecodeRef("ref", "prod", RefEK(base, name)); err == nil {
+		t.Error("policy with profile dev accepted by a prod image")
 	}
 	if _, _, err := f.DecodeRef("ref", "dev", "enklave-var-v1:ref:devil"); err == nil {
 		t.Error("foreign ref accepted")

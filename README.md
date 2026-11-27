@@ -256,7 +256,8 @@ the image:
 
 - `make EK_ADMIT=<file>` (one EK Name per line) lets `enklave-sign-policy`
   sign, for each Name, one additional policy for the policyRef
-  `enklave-var-v1:<role>:<profile>:ek:<Name>`. It is stored next to the
+  derived from `enklave-var-v1:<role>:<profile>` and that Name (a digest:
+  `ek1:<base64>`). It is stored next to the
   release's policy on the ESP. No image contains an allowlist (asserted by
   the build).
 - The device computes the Name of its own EK, looks for the policy signed

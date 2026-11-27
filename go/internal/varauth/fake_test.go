@@ -336,6 +336,9 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 		return nil, nil
 	case "tpm2_policyauthorize":
 		ref := string(f.read(arg(args, "-q")))
+		if len(ref) > 64 { // policyRef is a TPM2B_NONCE (seen with tpm2-tools: "size is larger than buffer")
+			return nil, errors.New("policyRef larger than 64 bytes")
+		}
 		if a := arg(args, "-i"); a != "" { // real session
 			approved := f.read(a)
 			tk := f.tickets[arg(args, "-t")]
@@ -796,6 +799,14 @@ func signed(t *testing.T, pcr11 []byte, epoch int, role, profile string) tpmpoli
 	return signedRef(t, pcr11, epoch, role, profile, refOf(role, profile))
 }
 
+// signedEK signs the per-device admission of the endorsement key with the given Name.
+func signedEK(t *testing.T, pcr11 []byte, epoch int, role, profile string, name []byte) tpmpolicy.File {
+	t.Helper()
+	f := signedRef(t, pcr11, epoch, role, profile, tpmpolicy.RefEK(refOf(role, profile), name))
+	f.EK = hex.EncodeToString(name)
+	return f
+}
+
 // signedRef signs the approved policy for an explicit policyRef (the base
 // ref, or the per-device ref of an admitted endorsement key).
 func signedRef(t *testing.T, pcr11 []byte, epoch int, role, profile, ref string) tpmpolicy.File {
@@ -849,7 +860,7 @@ func (e *env) setImage(t *testing.T, role, profile string, epoch, heal int) {
 	e.f.pcr[11] = h([]byte("uki"), []byte(fmt.Sprintf("%s/%s/%d", role, profile, epoch)))
 	e.install(t, signed(t, e.f.pcr[11], epoch, role, profile))
 	for _, name := range e.admitted {
-		e.install(t, signedRef(t, e.f.pcr[11], epoch, role, profile, tpmpolicy.RefEK(refOf(role, profile), name)))
+		e.install(t, signedEK(t, e.f.pcr[11], epoch, role, profile, name))
 	}
 }
 
@@ -858,7 +869,7 @@ func (e *env) setImage(t *testing.T, role, profile string, epoch, heal int) {
 func (e *env) admit(t *testing.T, name []byte) {
 	t.Helper()
 	e.admitted = append(e.admitted, name)
-	e.install(t, signedRef(t, e.f.pcr[11], e.epoch, e.role, e.profile, tpmpolicy.RefEK(refOf(e.role, e.profile), name)))
+	e.install(t, signedEK(t, e.f.pcr[11], e.epoch, e.role, e.profile, name))
 }
 
 func (e *env) ekName() []byte {

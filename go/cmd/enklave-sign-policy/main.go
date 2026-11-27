@@ -17,7 +17,7 @@
 // keys) and "test" need a DEV-KEYS PKI.
 //
 // With --admit-ek it also signs one policy per listed endorsement-key Name,
-// for the per-device ref "<ref>:ek:<Name>" (B1): the admission of a TPM
+// for the per-device ref RefEK(<ref>, <Name>) (B1): the admission of a TPM
 // without EK certificate. FAT names: <uki>.ek-<first 8 Name bytes>.json.
 //
 // Usage:
@@ -436,7 +436,7 @@ func main() {
 	}
 	base := strings.TrimSuffix(filepath.Base(*uki), ".efi")
 	// sign signs the approved policy for one policyRef and embeds it.
-	sign := func(ref, outPath, espName string, n int) {
+	sign := func(ref, ekHex, outPath, espName string, n int) {
 		etmp := filepath.Join(tmp, fmt.Sprintf("epoch-%d", n))
 		if err := os.MkdirAll(etmp, 0o700); err != nil {
 			die("%v", err)
@@ -455,7 +455,7 @@ func main() {
 			die("%v", err)
 		}
 		doc := tpmpolicy.File{Version: 2, Role: *role, Profile: *profile, Epoch: *epoch, PCR11Policy: hex.EncodeToString(pol),
-			Approved: hex.EncodeToString(approved), Ref: ref, Signature: base64.StdEncoding.EncodeToString(signature), DevKeys: dev}
+			Approved: hex.EncodeToString(approved), Ref: ref, Signature: base64.StdEncoding.EncodeToString(signature), DevKeys: dev, EK: ekHex}
 		b, _ := json.MarshalIndent(doc, "", "  ")
 		if err := os.WriteFile(outPath, append(b, '\n'), 0o644); err != nil {
 			die("%v", err)
@@ -468,9 +468,9 @@ func main() {
 			fmt.Printf("enklave-sign-policy: embedded as ESP:/EFI/enklave/policy/%s\n", espName)
 		}
 	}
-	sign(ref, *out, base+".json", 0)
+	sign(ref, "", *out, base+".json", 0)
 	for i, name := range admitted {
 		short := hex.EncodeToString(name[2:10])
-		sign(tpmpolicy.RefEK(ref, name), strings.TrimSuffix(*out, ".json")+".ek-"+short+".json", base+".ek-"+short+".json", i+1)
+		sign(tpmpolicy.RefEK(ref, name), hex.EncodeToString(name), strings.TrimSuffix(*out, ".json")+".ek-"+short+".json", base+".ek-"+short+".json", i+1)
 	}
 }
