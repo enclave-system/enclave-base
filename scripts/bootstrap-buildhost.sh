@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs everything the enklave build needs on Debian 13. Idempotent.
+# Installs everything the enclave build needs on Debian 13. Idempotent.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091

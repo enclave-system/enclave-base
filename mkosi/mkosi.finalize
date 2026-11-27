@@ -4,7 +4,7 @@
 #  2. move unit enablement/masks from /etc/systemd/system into /usr (the root
 #     file system is a tmpfs, so /etc starts empty and is populated only after
 #     PID 1 has loaded its units)
-#  3. snapshot /etc into /usr/share/factory/etc (enklave-etc.service)
+#  3. snapshot /etc into /usr/share/factory/etc (enclave-etc.service)
 #  4. sanity checks; any failure aborts the build
 set -euo pipefail
 shopt -s nullglob
@@ -130,7 +130,7 @@ key_count() {
         END { print c + 0 }' "$1"
 }
 # Drop-in directories systemd applies to a unit: type-level (service.d),
-# dash-prefix levels (enklave-.service.d, enklave-var-.service.d, ...) and
+# dash-prefix levels (enclave-.service.d, enclave-var-.service.d, ...) and
 # the unit's own. A FailureAction in a shared directory would be ambiguous.
 shared_dropin_dirs() {
     local u="$1" type="${1##*.}" base="${1%.*}" pfx=""
@@ -140,8 +140,8 @@ shared_dropin_dirs() {
         echo "$dst/$pfx.$type.d"
     done
 }
-for u in enklave-var-repart.service enklave-var-unlock.service enklave-var-auth.service var-lib-enklave.mount enklave-state.service \
-         enklave-require-secureboot.service systemd-pcrphase-sysinit.service enklave-pcr11-sealed.service; do
+for u in enclave-var-repart.service enclave-var-unlock.service enclave-var-auth.service var-lib-enclave.mount enclave-state.service \
+         enclave-require-secureboot.service systemd-pcrphase-sysinit.service enclave-pcr11-sealed.service; do
     [ -f "$dst/$u" ] || die "$u missing"
     for d in $(shared_dropin_dirs "$u"); do
         for f in "$d"/*.conf; do
@@ -157,19 +157,19 @@ for u in enklave-var-repart.service enklave-var-unlock.service enklave-var-auth.
         [ "$(key_count "$f" FailureAction Unit)" = 0 ] || v="$(unit_value "$f" Unit FailureAction)"
     done
     want=poweroff-force
-    [ ! -e "$root/usr/lib/enklave/test-profile" ] || want=none   # test profile: log only
+    [ ! -e "$root/usr/lib/enclave/test-profile" ] || want=none   # test profile: log only
     [ "$v" = "$want" ] || die "$u: effective [Unit] FailureAction is '$v', want $want"
 done
-grep -qx 'TimeoutSec=600' "$dst/enklave-var-unlock.service" || die "enklave-var-unlock needs a finite timeout"
-[ -s "$root/usr/lib/enklave/release.json" ] || die "release.json missing"
-grep -Eq '"dev_keys":(true|false)' "$root/usr/lib/enklave/release.json" || die "release.json lacks the dev_keys marker"
-grep -Eq '"require_ftpm":(true|false)' "$root/usr/lib/enklave/release.json" || die "release.json lacks require_ftpm"
+grep -qx 'TimeoutSec=600' "$dst/enclave-var-unlock.service" || die "enclave-var-unlock needs a finite timeout"
+[ -s "$root/usr/lib/enclave/release.json" ] || die "release.json missing"
+grep -Eq '"dev_keys":(true|false)' "$root/usr/lib/enclave/release.json" || die "release.json lacks the dev_keys marker"
+grep -Eq '"require_ftpm":(true|false)' "$root/usr/lib/enclave/release.json" || die "release.json lacks require_ftpm"
 # B1: no image carries an EK allowlist. A TPM without EK certificate is
 # admitted per device by a signed policy on the ESP, never by the image.
-[ ! -e "$root/usr/lib/enklave/ek-allowlist" ] || die "EK allowlist in the image (admissions are per device, on the ESP)"
+[ ! -e "$root/usr/lib/enclave/ek-allowlist" ] || die "EK allowlist in the image (admissions are per device, on the ESP)"
 # B8: the state service is the only writer; its writers are JSON definitions.
-[ -L "$dst/local-fs.target.requires/enklave-state.service" ] || die "enklave-state.service is not required by local-fs.target"
-for f in "$root"/usr/lib/enklave/state-writers.d/*; do
+[ -L "$dst/local-fs.target.requires/enclave-state.service" ] || die "enclave-state.service is not required by local-fs.target"
+for f in "$root"/usr/lib/enclave/state-writers.d/*; do
     case "${f##*/}" in *.json) ;; *) die "unexpected file in state-writers.d: ${f##*/}" ;; esac
     grep -q '"unit"' "$f" || die "${f##*/}: a state writer names its unit"
     grep -q '"exec"' "$f" || die "${f##*/}: a state writer names its command"
@@ -177,70 +177,70 @@ for f in "$root"/usr/lib/enklave/state-writers.d/*; do
     # service: no caller input at all, or a signed, versioned bundle. Input
     # the service cannot verify exists in the test profile only.
     if grep -Eq '"input"[[:space:]]*:[[:space:]]*"(none|signed-bundle)"' "$f"; then :
-    elif [ -e "$root/usr/lib/enklave/test-profile" ] && grep -Eq '"input"[[:space:]]*:[[:space:]]*"unverified"' "$f"; then :
+    elif [ -e "$root/usr/lib/enclave/test-profile" ] && grep -Eq '"input"[[:space:]]*:[[:space:]]*"unverified"' "$f"; then :
     else die "${f##*/}: a state writer must declare \"input\": \"none\" or \"signed-bundle\""
     fi
 done
 # A bundle is bound to role and version, not to a writer: one signed-bundle
 # writer per image (the test profile adds its probe writer).
-nsigned="$( (grep -El '"input"[[:space:]]*:[[:space:]]*"signed-bundle"' "$root"/usr/lib/enklave/state-writers.d/*.json 2>/dev/null || true) | wc -l)"
-[ "$nsigned" -le 1 ] || [ -e "$root/usr/lib/enklave/test-profile" ] || die "$nsigned state writers take signed bundles; an image may define one"
+nsigned="$( (grep -El '"input"[[:space:]]*:[[:space:]]*"signed-bundle"' "$root"/usr/lib/enclave/state-writers.d/*.json 2>/dev/null || true) | wc -l)"
+[ "$nsigned" -le 1 ] || [ -e "$root/usr/lib/enclave/test-profile" ] || die "$nsigned state writers take signed bundles; an image may define one"
 # G10: the process holding the state keys leaves no core dump.
-[ "$(unit_value "$dst/enklave-state.service" Service LimitCORE)" = 0 ] || die "enklave-state.service must set LimitCORE=0"
+[ "$(unit_value "$dst/enclave-state.service" Service LimitCORE)" = 0 ] || die "enclave-state.service must set LimitCORE=0"
 # G8: a client is built with require_ftpm (test-profile VM builds excepted).
-if [ "$(cat "$root/usr/lib/enklave/role" 2>/dev/null)" = client ] && [ ! -e "$root/usr/lib/enklave/test-profile" ]; then
-    grep -q '"require_ftpm":true' "$root/usr/lib/enklave/release.json" || die "role client without require_ftpm (build with REQUIRE_FTPM=1)"
+if [ "$(cat "$root/usr/lib/enclave/role" 2>/dev/null)" = client ] && [ ! -e "$root/usr/lib/enclave/test-profile" ]; then
+    grep -q '"require_ftpm":true' "$root/usr/lib/enclave/release.json" || die "role client without require_ftpm (build with REQUIRE_FTPM=1)"
 fi
-grep -qx 'kernel.yama.ptrace_scope = 3' "$root/usr/lib/sysctl.d/50-enklave-ptrace.conf" || die "ptrace is not disabled (state keys live in the state service)"
+grep -qx 'kernel.yama.ptrace_scope = 3' "$root/usr/lib/sysctl.d/50-enclave-ptrace.conf" || die "ptrace is not disabled (state keys live in the state service)"
 # The state volume is mounted read-only (state-exec writes in a private namespace).
-case ",$(unit_value "$dst/var-lib-enklave.mount" Mount Options)," in
+case ",$(unit_value "$dst/var-lib-enclave.mount" Mount Options)," in
     *,ro,*) ;;
-    *) die "var-lib-enklave.mount must be mounted read-only" ;;
+    *) die "var-lib-enclave.mount must be mounted read-only" ;;
 esac
 # TPM vendor EK CA bundle: present, with provenance, without the Microsoft
 # (virtual TPM) CAs. The CA of the emulated test TPMs exists in test-profile
 # images only and test-profile images are always dev-signed.
-ekca="$root/usr/share/enklave/tpm-ek-ca"
+ekca="$root/usr/share/enclave/tpm-ek-ca"
 [ -s "$ekca/SOURCE" ] && [ -s "$ekca/SHA256SUMS" ] || die "TPM vendor CA bundle or its provenance missing"
 [ "$(find "$ekca" -path '*/RootCA/*' -type f | wc -l)" -ge 40 ] || die "TPM vendor CA bundle incomplete"
 [ ! -e "$ekca/Microsoft" ] || die "the Microsoft (virtual TPM) CAs must not be shipped"
 ( cd "$ekca" && sha256sum --quiet -c SHA256SUMS ) || die "TPM vendor CA bundle does not match SHA256SUMS"
 [ "$(find "$ekca" -type f ! -name SOURCE ! -name SHA256SUMS | wc -l)" = "$(wc -l < "$ekca/SHA256SUMS")" ] \
     || die "TPM vendor CA bundle holds files that are not in SHA256SUMS"
-if [ -e "$root/usr/lib/enklave/test-profile" ]; then
-    [ -n "$(ls -A "$root/usr/share/enklave/tpm-ek-ca-test/RootCA" 2>/dev/null)" ] || die "test profile without the test TPM CA"
-    grep -q '"dev_keys":true' "$root/usr/lib/enklave/release.json" || die "test-profile image without the dev-key marker"
+if [ -e "$root/usr/lib/enclave/test-profile" ]; then
+    [ -n "$(ls -A "$root/usr/share/enclave/tpm-ek-ca-test/RootCA" 2>/dev/null)" ] || die "test profile without the test TPM CA"
+    grep -q '"dev_keys":true' "$root/usr/lib/enclave/release.json" || die "test-profile image without the dev-key marker"
 else
-    [ ! -e "$root/usr/share/enklave/tpm-ek-ca-test" ] || die "test TPM CA in a production image"
+    [ ! -e "$root/usr/share/enclave/tpm-ek-ca-test" ] || die "test TPM CA in a production image"
 fi
 # Signed Secure Boot variable updates: only dbx/db/KEK appends.
-for f in "$root"/usr/lib/enklave/efi-updates/*; do
+for f in "$root"/usr/lib/enclave/efi-updates/*; do
     case "${f##*/}" in
         dbx-*.auth|db-*.auth|KEK-*.auth) ;;
         *) die "unexpected file in efi-updates: ${f##*/}" ;;
     esac
 done
-grep -q -- '--factory-reset=no' "$dst/enklave-var-repart.service" || die "repart may honour factory reset"
-r="$root/usr/lib/enklave/repart.d/30-var.conf"
+grep -q -- '--factory-reset=no' "$dst/enclave-var-repart.service" || die "repart may honour factory reset"
+r="$root/usr/lib/enclave/repart.d/30-var.conf"
 [ "$(unit_value "$r" Partition FactoryReset)" = no ] || die "30-var.conf: FactoryReset must be no"
 [ -z "$(unit_value "$r" Partition Encrypt)" ] || die "30-var.conf: Encrypt= must not be used (varauth formats /var)"
-[ ! -e "$root/usr/lib/enklave/enklave-sign-policy" ] || die "build-time signer must not be shipped"
+[ ! -e "$root/usr/lib/enclave/enclave-sign-policy" ] || die "build-time signer must not be shipped"
 [ -z "$(ls -A "$root/boot" | grep -E '^(vmlinuz|System\.map|config|initrd)')" ] || die "kernel files left in /boot (ESP)"
 for d in boot efi; do
     cmp -s "$root/$d/loader/loader.conf" <(printf '%s\n' "${loader_conf[@]}") \
         || die "/$d/loader/loader.conf not enforced"
 done
 [ -z "$(ls -A "$root/efi" | grep -E '^(vmlinuz|System\.map|config|initrd)')" ] || die "kernel files left in /efi (ESP)"
-role="$(cat "$root/usr/lib/enklave/role" 2>/dev/null || true)"
+role="$(cat "$root/usr/lib/enclave/role" 2>/dev/null || true)"
 case "$role" in
     ref|client|gateway|terminal|console|sluice|backup|fileserver) ;;
-    *) die "/usr/lib/enklave/role missing or invalid: '$role'" ;;
+    *) die "/usr/lib/enclave/role missing or invalid: '$role'" ;;
 esac
-[ "$(stat -c %s "$root/usr/share/enklave/keys/config-signing.pub")" = 32 ] \
+[ "$(stat -c %s "$root/usr/share/enclave/keys/config-signing.pub")" = 32 ] \
     || die "config-signing.pub missing or not 32 bytes"
-for b in enklave-cfg enklave-selftest enklave-varauth var-unlock; do
-    [ -x "$root/usr/lib/enklave/$b" ] || die "/usr/lib/enklave/$b missing"
+for b in enclave-cfg enclave-selftest enclave-varauth var-unlock; do
+    [ -x "$root/usr/lib/enclave/$b" ] || die "/usr/lib/enclave/$b missing"
 done
-[ "$(readlink "$root/usr/lib/enklave/require-secureboot")" = enklave-selftest ] \
+[ "$(readlink "$root/usr/lib/enclave/require-secureboot")" = enclave-selftest ] \
     || die "require-secureboot symlink missing"
-[ -d "$root/usr/lib/enklave/nft.d" ] || die "/usr/lib/enklave/nft.d missing"
+[ -d "$root/usr/lib/enclave/nft.d" ] || die "/usr/lib/enclave/nft.d missing"

@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"enklave.local/base/internal/sbstate"
-	"enklave.local/base/internal/statefs"
-	"enklave.local/base/internal/tpmpolicy"
+	"enclave.local/base/internal/sbstate"
+	"enclave.local/base/internal/statefs"
+	"enclave.local/base/internal/tpmpolicy"
 )
 
 // ---------------------------------------------------------------- verify
@@ -784,7 +784,7 @@ func CurrentPCR11Policy(c Config, r Runner) ([]byte, error) {
 }
 
 // SignedPCR11Policies returns every signed PCR 11 policy known to this boot
-// (systemd's .pcrsig and the enklave approved policy).
+// (systemd's .pcrsig and the enclave approved policy).
 func SignedPCR11Policies(pcrsig, cache string) ([]string, error) {
 	var out []string
 	b, err := os.ReadFile(pcrsig)

@@ -18,9 +18,9 @@ import (
 	"testing"
 	"time"
 
-	"enklave.local/base/internal/ekcert"
-	"enklave.local/base/internal/tpmpolicy"
-	"enklave.local/base/internal/varauth"
+	"enclave.local/base/internal/ekcert"
+	"enclave.local/base/internal/tpmpolicy"
+	"enclave.local/base/internal/varauth"
 )
 
 const (
@@ -35,7 +35,7 @@ const (
 	goodLuksDump = "LUKS header information\nVersion:       \t2\nData segments:\n  0: crypt\n\toffset: 16777216 [bytes]\n" +
 		"\tcipher: aes-xts-plain64\n\tsector: 512 [bytes]\n\tintegrity: hmac(sha256)\n" +
 		"Keyslots:\n  0: luks2\n\tKey:        768 bits\n\tCipher:     aes-xts-plain64\n\tCipher key: 512 bits\n\tPBKDF:      argon2id\n" +
-		"Tokens:\n  0: enklave-tpm2-nv\n\tKeyslot:    0\nDigests:\n"
+		"Tokens:\n  0: enclave-tpm2-nv\n\tKeyslot:    0\nDigests:\n"
 	lockedHier = "TPM2_PT_PERMANENT:\n  ownerAuthSet:              1\n  endorsementAuthSet:        1\n  lockoutAuthSet:            1\n" +
 		"  reserved1:                 0\n  disableClear:              1\n  inLockout:                 0\nTPM2_PT_STARTUP_CLEAR:\n  phEnable:                  1\n" +
 		"TPM2_PT_LOCKOUT_COUNTER: 0x0\nTPM2_PT_MAX_AUTH_FAIL: 0x3\nTPM2_PT_LOCKOUT_INTERVAL: 0x0\nTPM2_PT_LOCKOUT_RECOVERY: 0x3E8\n"
@@ -149,9 +149,9 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 	put(t, root, "sys/module/module/parameters/sig_enforce", "Y\n")
 	put(t, root, "proc/self/mountinfo",
 		"20 1 253:0 / /usr ro,relatime shared:1 - erofs /dev/mapper/usr ro\n"+
-			"21 1 253:1 / /var/lib/enklave ro,nosuid,nodev,noexec,relatime shared:2 - ext4 /dev/mapper/var rw\n")
-	put(t, root, "usr/share/enklave/tpm-ek-ca/Vendor/RootCA/ca.cer", string(ekCA))
-	put(t, root, "run/enklave/efi-updates", "current (0 update(s) in the firmware)\n")
+			"21 1 253:1 / /var/lib/enclave ro,nosuid,nodev,noexec,relatime shared:2 - ext4 /dev/mapper/var rw\n")
+	put(t, root, "usr/share/enclave/tpm-ek-ca/Vendor/RootCA/ca.cer", string(ekCA))
+	put(t, root, "run/enclave/efi-updates", "current (0 update(s) in the firmware)\n")
 	put(t, root, "sys/dev/block/253:0/dm/uuid", "CRYPT-VERITY-abc-usr\n")
 	put(t, root, "sys/dev/block/253:1/dm/uuid", "CRYPT-LUKS2-"+strings.ReplaceAll(luksUUID, "-", "")+"-var\n")
 	// state volume (dm-crypt 253:1) -> dm-integrity dm-2 -> vda8, as with LUKS2 integrity
@@ -161,16 +161,16 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 		}
 	}
 	put(t, root, "sys/module/apparmor/parameters/enabled", "Y\n")
-	put(t, root, "usr/lib/enklave/role", " ref\n")
-	put(t, root, "usr/lib/enklave/release.json", `{"epoch":0,"heal_below":0}`)
-	put(t, root, "usr/lib/os-release", "NAME=Enklave\nIMAGE_VERSION=1.2.3\n")
+	put(t, root, "usr/lib/enclave/role", " ref\n")
+	put(t, root, "usr/lib/enclave/release.json", `{"epoch":0,"heal_below":0}`)
+	put(t, root, "usr/lib/os-release", "NAME=Enclave\nIMAGE_VERSION=1.2.3\n")
 	put(t, root, "proc/cmdline", "usrhash=ab lockdown=confidentiality systemd.import_credentials=no root=tmpfs\n")
-	put(t, root, "run/enklave/var-authenticated", strings.Repeat("15", 32)+"\n")
-	put(t, root, "run/enklave/var-counter", "42\n")
-	put(t, root, "run/enklave/platform", "firmware-auth\n")
-	put(t, root, "var/lib/enklave/.manifest", `{"version":42,"entries":[],"mac":"00"}`)
+	put(t, root, "run/enclave/var-authenticated", strings.Repeat("15", 32)+"\n")
+	put(t, root, "run/enclave/var-counter", "42\n")
+	put(t, root, "run/enclave/platform", "firmware-auth\n")
+	put(t, root, "var/lib/enclave/.manifest", `{"version":42,"entries":[],"mac":"00"}`)
 	put(t, root, "run/systemd/tpm2-pcr-signature.json", `{"sha256":[{"pcrs":[11],"pol":"`+strings.Repeat("dd", 32)+`"}]}`)
-	put(t, root, "run/enklave/policy.json", `{"version":2,"pcr11_policy":"`+strings.Repeat("ee", 32)+`"}`)
+	put(t, root, "run/enclave/policy.json", `{"version":2,"pcr11_policy":"`+strings.Repeat("ee", 32)+`"}`)
 	log, pcr15 := measureLog("cryptsetup:var:"+luksUUID, "machine-id:0123")
 	put(t, root, "run/log/systemd/tpm2-measure.log", log)
 	r := &fakeRunner{out: map[string]string{
@@ -255,8 +255,8 @@ func TestVarChecksNotOk(t *testing.T) {
 		name   string
 		mutate func(t *testing.T, root string, r *fakeRunner)
 	}{
-		{"var_tpm_bound", "no enklave token", func(t *testing.T, root string, r *fakeRunner) {
-			r.out[luksDumpCmd] = strings.Replace(goodLuksDump, "enklave-tpm2-nv", "other", 1)
+		{"var_tpm_bound", "no enclave token", func(t *testing.T, root string, r *fakeRunner) {
+			r.out[luksDumpCmd] = strings.Replace(goodLuksDump, "enclave-tpm2-nv", "other", 1)
 		}},
 		{"var_tpm_bound", "extra systemd-tpm2 token", func(t *testing.T, root string, r *fakeRunner) {
 			r.out[luksDumpCmd] = goodLuksDump + "  1: systemd-tpm2\n"
@@ -280,7 +280,7 @@ func TestVarChecksNotOk(t *testing.T) {
 			r.err = map[string]error{"tpm2_nvreadpublic 0x01800E03": errors.New("TPM_RC_HANDLE")}
 		}},
 		{"var_authenticated", "record mismatch", func(t *testing.T, root string, r *fakeRunner) {
-			put(t, root, "run/enklave/var-authenticated", strings.Repeat("aa", 32)+"\n")
+			put(t, root, "run/enclave/var-authenticated", strings.Repeat("aa", 32)+"\n")
 		}},
 		{"var_authenticated", "log does not replay", func(t *testing.T, root string, r *fakeRunner) {
 			r.out["tpm2_pcrread sha256:15"] = "  sha256:\n    15: 0x" + strings.Repeat("AB", 32) + "\n"
@@ -308,7 +308,7 @@ func TestVarChecksNotOk(t *testing.T) {
 			stateReply.Counter = 43
 		}},
 		{"var_rollback", "state keys left in /run", func(t *testing.T, root string, r *fakeRunner) {
-			put(t, root, "run/enklave/state.key", strings.Repeat("k", 64))
+			put(t, root, "run/enclave/state.key", strings.Repeat("k", 64))
 		}},
 		{"var_rollback", "state service not reachable", func(t *testing.T, root string, r *fakeRunner) {
 			stateErr = errors.New("state service: connection refused")
@@ -329,7 +329,7 @@ func TestVarChecksNotOk(t *testing.T) {
 			r.out["salt"] = "\x00\x04junk"
 		}},
 		{"var_authenticated", "vendor CA bundle missing", func(t *testing.T, root string, r *fakeRunner) {
-			os.RemoveAll(filepath.Join(root, "usr/share/enklave/tpm-ek-ca"))
+			os.RemoveAll(filepath.Join(root, "usr/share/enclave/tpm-ek-ca"))
 		}},
 		{"var_authenticated", "PCR policy index holds another Secure Boot state", func(t *testing.T, root string, r *fakeRunner) {
 			r.out[pcrPolicyReadCmd] = "\x00\x0b" + strings.Repeat("\x77", 32)
@@ -341,27 +341,27 @@ func TestVarChecksNotOk(t *testing.T) {
 			r.out["tpm2_nvreadpublic 0x01800E05"] = nvPublic("0x01800E05", 0x22040006, 34, fakeB1)
 		}},
 		{"efi_updates", "transition pending", func(t *testing.T, root string, r *fakeRunner) {
-			put(t, root, "run/enklave/efi-updates", "pending: 1 of 1 update(s) handed to the firmware, reboot to complete\n")
+			put(t, root, "run/enclave/efi-updates", "pending: 1 of 1 update(s) handed to the firmware, reboot to complete\n")
 		}},
 		{"efi_updates", "update rejected by the firmware", func(t *testing.T, root string, r *fakeRunner) {
-			put(t, root, "run/enklave/efi-updates", "failed: NOT APPLIED: dbx-x.auth: EACCES\n")
+			put(t, root, "run/enclave/efi-updates", "failed: NOT APPLIED: dbx-x.auth: EACCES\n")
 		}},
 		{"efi_updates", "no status", func(t *testing.T, root string, r *fakeRunner) {
-			os.Remove(filepath.Join(root, "run/enklave/efi-updates"))
+			os.Remove(filepath.Join(root, "run/enclave/efi-updates"))
 		}},
 		{"state_readonly", "state volume writable", func(t *testing.T, root string, r *fakeRunner) {
 			put(t, root, "proc/self/mountinfo",
 				"20 1 253:0 / /usr ro,relatime shared:1 - erofs /dev/mapper/usr ro\n"+
-					"21 1 253:1 / /var/lib/enklave rw,nosuid,nodev,noexec,relatime shared:2 - ext4 /dev/mapper/var rw\n")
+					"21 1 253:1 / /var/lib/enclave rw,nosuid,nodev,noexec,relatime shared:2 - ext4 /dev/mapper/var rw\n")
 		}},
 		{"dev_keys", "test profile without the dev marker", func(t *testing.T, root string, r *fakeRunner) {
-			put(t, root, "usr/lib/enklave/test-profile", "")
+			put(t, root, "usr/lib/enclave/test-profile", "")
 		}},
 		{"dev_keys", "no release metadata", func(t *testing.T, root string, r *fakeRunner) {
-			os.Remove(filepath.Join(root, "usr/lib/enklave/release.json"))
+			os.Remove(filepath.Join(root, "usr/lib/enclave/release.json"))
 		}},
 		{"tpm_locked", "platform enabled without firmware auth", func(t *testing.T, root string, r *fakeRunner) {
-			put(t, root, "run/enklave/platform", "disabled\n")
+			put(t, root, "run/enclave/platform", "disabled\n")
 		}},
 		{"tpm_locked", "owner auth empty", func(t *testing.T, root string, r *fakeRunner) {
 			r.out[hierCmd] = strings.Replace(lockedHier, "ownerAuthSet:              1", "ownerAuthSet:              0", 1)
@@ -379,7 +379,7 @@ func TestVarChecksNotOk(t *testing.T) {
 			put(t, root, "run/systemd/tpm2-pcr-signature.json", `{"sha256":[{"pcrs":[11],"pol":"`+fakePol11+`"}]}`)
 		}},
 		{"pcr11_sealed", "no policy cache", func(t *testing.T, root string, r *fakeRunner) {
-			os.Remove(filepath.Join(root, "run/enklave/policy.json"))
+			os.Remove(filepath.Join(root, "run/enclave/policy.json"))
 		}},
 	}
 	for _, c := range cases {
@@ -409,7 +409,7 @@ func TestVarChecksDetails(t *testing.T) {
 			t.Errorf("%s: %+v", check, x)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(root, "run/enklave/selftest/work")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(root, "run/enclave/selftest/work")); !errors.Is(err, os.ErrNotExist) {
 		t.Error("selftest work dir left behind")
 	}
 }
@@ -446,7 +446,7 @@ func TestVarAuthenticatedDetails(t *testing.T) {
 // M2: dev-signed builds are reported; production acceptance rejects them.
 func TestDevKeys(t *testing.T) {
 	root, r := goodRoot(t)
-	put(t, root, "usr/lib/enklave/release.json", `{"epoch":0,"heal_below":0,"dev_keys":true}`)
+	put(t, root, "usr/lib/enclave/release.json", `{"epoch":0,"heal_below":0,"dev_keys":true}`)
 	x := find(t, RunChecks(root, r), "dev_keys")
 	if !x.OK || !strings.Contains(x.Detail, "DEV KEYS") {
 		t.Errorf("informational: %+v", x)
@@ -455,12 +455,12 @@ func TestDevKeys(t *testing.T) {
 	if x.OK || !strings.Contains(x.Detail, "DEV KEYS") {
 		t.Errorf("--forbid-dev-keys: %+v", x)
 	}
-	put(t, root, "usr/lib/enklave/test-profile", "")
+	put(t, root, "usr/lib/enclave/test-profile", "")
 	if x := find(t, RunChecks(root, r), "dev_keys"); !x.OK {
 		t.Errorf("dev-signed test image: %+v", x)
 	}
-	put(t, root, "usr/lib/enklave/release.json", `{"epoch":0,"heal_below":0}`)
-	os.Remove(filepath.Join(root, "usr/lib/enklave/test-profile"))
+	put(t, root, "usr/lib/enclave/release.json", `{"epoch":0,"heal_below":0}`)
+	os.Remove(filepath.Join(root, "usr/lib/enclave/test-profile"))
 	if x := find(t, RunChecksWith(root, r, Options{ForbidDevKeys: true}), "dev_keys"); !x.OK || x.Detail != "production keys" {
 		t.Errorf("production: %+v", x)
 	}
@@ -475,7 +475,7 @@ func TestAdmittedDeviceReported(t *testing.T) {
 	if x := find(t, RunChecks(root, r), "var_authenticated"); x.OK || !strings.Contains(x.Detail, "production release accepts only endorsement keys certified by a TPM vendor") {
 		t.Errorf("prod: %+v", x)
 	}
-	put(t, root, "usr/lib/enklave/release.json", `{"epoch":0,"heal_below":0,"dev_keys":true}`)
+	put(t, root, "usr/lib/enclave/release.json", `{"epoch":0,"heal_below":0,"dev_keys":true}`)
 	x := find(t, RunChecks(root, r), "var_authenticated")
 	if !x.OK || !strings.Contains(x.Detail, "signed per-device admission of EK") {
 		t.Errorf("%+v", x)

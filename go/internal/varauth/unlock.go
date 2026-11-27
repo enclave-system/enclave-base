@@ -15,8 +15,8 @@ import (
 	"strconv"
 	"strings"
 
-	"enklave.local/base/internal/statefs"
-	"enklave.local/base/internal/tpmpolicy"
+	"enclave.local/base/internal/statefs"
+	"enclave.local/base/internal/tpmpolicy"
 )
 
 // ---------------------------------------------------------------- repart
@@ -84,7 +84,7 @@ func derive(key []byte, label string) []byte {
 type StateKeys struct{ MAC, CounterAuth []byte }
 
 func deriveKeys(s []byte) StateKeys {
-	return StateKeys{derive(s, "enklave-state-mac-v1"), derive(s, "enklave-counter-auth-v1")}
+	return StateKeys{derive(s, "enclave-state-mac-v1"), derive(s, "enclave-counter-auth-v1")}
 }
 
 // LoadStateKeys reads the runtime copy written by Unlock.
@@ -167,7 +167,7 @@ func openStore(c Config, r Runner, keys StateKeys, pause func(string)) (*statefs
 
 // ---------------------------------------------------------------- unlock
 
-// state of the enklave objects in the TPM
+// state of the enclave objects in the TPM
 type tpmState struct {
 	h        Hierarchy
 	nv, pers map[uint64]bool
@@ -241,7 +241,7 @@ func Unlock(c Config, r Runner, varDev, espDev string) (string, error) {
 	}
 	if first {
 		if st.count() != 0 || !st.h.Fresh() {
-			return "", fmt.Errorf("first boot of /var on a TPM that is not fresh (%d enklave objects, %+v)", st.count(), st.h)
+			return "", fmt.Errorf("first boot of /var on a TPM that is not fresh (%d enclave objects, %+v)", st.count(), st.h)
 		}
 		if _, err := r.Run("cryptsetup", "isLuks", varDev); err == nil {
 			return "", fmt.Errorf("%s already carries a LUKS header on the first boot", varDev)
@@ -291,7 +291,7 @@ func Unlock(c Config, r Runner, varDev, espDev string) (string, error) {
 			}
 		}
 		// G7: the lockout is switched off only on a TPM that holds nothing
-		// but enklave's objects
+		// but enclave's objects
 		if err := requireNoForeignObjects(r); err != nil {
 			return "", err
 		}
@@ -320,7 +320,7 @@ func Unlock(c Config, r Runner, varDev, espDev string) (string, error) {
 			}
 			verb = "healed"
 		case !complete || rd == nil:
-			return "", fmt.Errorf("partial enklave TPM state (%d of %d objects): interrupted provisioning, refusing", st.count(), allObjects)
+			return "", fmt.Errorf("partial enclave TPM state (%d of %d objects): interrupted provisioning, refusing", st.count(), allObjects)
 		default:
 			if err := t.useSalt(rd.SaltName); err != nil {
 				return "", err
@@ -438,7 +438,7 @@ func (t *tpm) provision(f tpmpolicy.File, varDev string) ([]byte, error) {
 	}
 	// The dictionary-attack lockout is disabled while the lockout auth is
 	// still empty, before the first salted session, and only on a TPM that
-	// holds nothing but enklave's objects (G7).
+	// holds nothing but enclave's objects (G7).
 	if err := requireNoForeignObjects(t.r); err != nil {
 		return nil, err
 	}
@@ -479,11 +479,11 @@ func (t *tpm) provisionVolume(varDev string) ([]byte, error) {
 	}
 	if _, err := t.run("cryptsetup", "luksFormat", "--batch-mode", "--type", "luks2",
 		"--cipher", "aes-xts-plain64", "--key-size", "512", "--hash", "sha256",
-		"--pbkdf", "argon2id", "--integrity", "hmac-sha256", "--label", "enklave-var",
+		"--pbkdf", "argon2id", "--integrity", "hmac-sha256", "--label", "enclave-var",
 		"--key-file", t.c.keyFile(), varDev); err != nil {
 		return nil, err
 	}
-	tok := fmt.Sprintf(`{"type":"enklave-tpm2-nv","keyslots":["0"],"nv-secret":"%s","nv-record":"%s","nv-counter":"%s","nv-epoch":"%s","nv-pcrpolicy":"%s","salt":"%s","ref":"%s"}`,
+	tok := fmt.Sprintf(`{"type":"enclave-tpm2-nv","keyslots":["0"],"nv-secret":"%s","nv-record":"%s","nv-counter":"%s","nv-epoch":"%s","nv-pcrpolicy":"%s","salt":"%s","ref":"%s"}`,
 		Secret.Handle, Record.Handle, Counter.Handle, Epoch.Handle, PCRPolicy.Handle, SaltHandle, t.id.Ref)
 	if err := t.put("token.json", []byte(tok)); err != nil {
 		return nil, err
@@ -495,7 +495,7 @@ func (t *tpm) provisionVolume(varDev string) ([]byte, error) {
 	if err := t.attach(varDev); err != nil {
 		return nil, err
 	}
-	if _, err := t.run("mkfs.ext4", "-q", "-L", "enklave-state", "/dev/mapper/var"); err != nil {
+	if _, err := t.run("mkfs.ext4", "-q", "-L", "enclave-state", "/dev/mapper/var"); err != nil {
 		return nil, err
 	}
 	keys := deriveKeys(key)
@@ -591,7 +591,7 @@ func (t *tpm) heal(st tpmState, rd *RecordData, varDev string) ([]byte, error) {
 	return t.provisionVolume(varDev)
 }
 
-// requireNoForeignObjects fails closed if the TPM holds an object enklave
+// requireNoForeignObjects fails closed if the TPM holds an object enclave
 // does not account for (G7). The dictionary-attack lockout is switched off
 // on every boot; that is sound only while nothing in the TPM is protected
 // by a guessable authValue (ForeignObjects).
@@ -601,7 +601,7 @@ func requireNoForeignObjects(r Runner) error {
 		return err
 	}
 	if len(foreign) > 0 {
-		return fmt.Errorf("the TPM holds objects that are not enklave's (%s): the dictionary-attack lockout is not switched off for them, refusing",
+		return fmt.Errorf("the TPM holds objects that are not enclave's (%s): the dictionary-attack lockout is not switched off for them, refusing",
 			strings.Join(foreign, ", "))
 	}
 	return nil
@@ -614,7 +614,7 @@ func requireNoForeignObjects(r Runner) error {
 // amd_iommu=force_isolation, strict); this check is what refuses the volume
 // key when the platform does not deliver it, for example with VT-d/AMD-Vi
 // switched off in the firmware setup, a setting that is not measured into a
-// PCR enklave binds.
+// PCR enclave binds.
 func RequireIOMMU(c Config) error {
 	sys := c.Sys
 	if sys == "" {

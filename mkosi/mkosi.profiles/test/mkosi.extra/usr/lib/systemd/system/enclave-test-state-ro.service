@@ -1,0 +1,15 @@
+# Test profile only: direct writes to the state volume by root must be
+# refused (read-only mount, M3). Runs before the marker unit, which writes
+# through "enclave-varauth state-exec" and must still succeed.
+[Unit]
+Description=Probe: direct writes to the state volume must be refused (test profile)
+After=enclave-selftest.service
+Before=enclave-test-marker.service
+RequiresMountsFor=/var/lib/enclave
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/enclave/test-state-ro
+
+[Install]
+WantedBy=graphical.target

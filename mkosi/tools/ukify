@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-# enklave wrapper around the real ukify (found first via ExtraSearchPaths= in
+# enclave wrapper around the real ukify (found first via ExtraSearchPaths= in
 # mkosi.conf). mkosi 27.1 cannot pass --phases= to ukify, so this adds it:
 # the signed PCR 11 policy is restricted to the phase in which /var is
 # unlocked and authenticated (enter-initrd:leave-initrd, i.e. after the initrd

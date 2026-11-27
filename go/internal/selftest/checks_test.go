@@ -52,12 +52,12 @@ const (
 	smPath = "sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 )
 
-// The enklave kernels are built without IPv6, so the base ruleset is an
+// The enclave kernels are built without IPv6, so the base ruleset is an
 // "ip" table (an "inet" table needs CONFIG_NF_TABLES_INET, which needs IPV6).
-const goodNft = `{"nftables":[{"metainfo":{}},{"table":{"family":"ip","name":"enklave"}},
-{"chain":{"family":"ip","table":"enklave","name":"input","policy":"drop"}},
-{"chain":{"family":"ip","table":"enklave","name":"forward","policy":"drop"}},
-{"chain":{"family":"ip","table":"enklave","name":"output","policy":"drop"}}]}`
+const goodNft = `{"nftables":[{"metainfo":{}},{"table":{"family":"ip","name":"enclave"}},
+{"chain":{"family":"ip","table":"enclave","name":"input","policy":"drop"}},
+{"chain":{"family":"ip","table":"enclave","name":"forward","policy":"drop"}},
+{"chain":{"family":"ip","table":"enclave","name":"output","policy":"drop"}}]}`
 
 const unitsCmd = "systemctl list-units --all --plain --no-legend --state=active"
 
@@ -121,7 +121,7 @@ func TestChecksNotOk(t *testing.T) {
 			put(t, root, "sys/dev/block/253:1/dm/uuid", "CRYPT-VERITY-x\n")
 		}},
 		{"var_tpm_bound", func(t *testing.T, root string, r *fakeRunner) {
-			r.out[luksDumpCmd] = strings.Replace(goodLuksDump, "enklave-tpm2-nv", "systemd-tpm2", 1)
+			r.out[luksDumpCmd] = strings.Replace(goodLuksDump, "enclave-tpm2-nv", "systemd-tpm2", 1)
 		}},
 		{"var_authenticated", func(t *testing.T, root string, r *fakeRunner) {
 			r.out[recordReadCmd] = strings.Repeat("\xAA", 32) // swapped volume
@@ -136,7 +136,7 @@ func TestChecksNotOk(t *testing.T) {
 			r.out[hierCmd] = strings.Replace(lockedHier, "disableClear:              1", "disableClear:              0", 1)
 		}},
 		{"pcr11_sealed", func(t *testing.T, root string, r *fakeRunner) {
-			put(t, root, "run/enklave/policy.json", `{"pcr11_policy":"`+strings.Repeat("cc", 32)+`"}`)
+			put(t, root, "run/enclave/policy.json", `{"pcr11_policy":"`+strings.Repeat("cc", 32)+`"}`)
 		}},
 		{"no_pkg_manager", func(t *testing.T, root string, r *fakeRunner) { put(t, root, "usr/bin/dpkg", "x") }},
 		{"apparmor", func(t *testing.T, root string, r *fakeRunner) {
@@ -152,7 +152,7 @@ func TestChecksNotOk(t *testing.T) {
 		{"no_credentials", func(t *testing.T, root string, r *fakeRunner) {
 			put(t, root, "proc/cmdline", "usrhash=ab lockdown=confidentiality root=tmpfs\n")
 		}},
-		{"role", func(t *testing.T, root string, r *fakeRunner) { put(t, root, "usr/lib/enklave/role", "bogus\n") }},
+		{"role", func(t *testing.T, root string, r *fakeRunner) { put(t, root, "usr/lib/enclave/role", "bogus\n") }},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -204,7 +204,7 @@ func TestRunnerErrorIsNotOk(t *testing.T) {
 
 func TestNftChainMissingAndWrongTable(t *testing.T) {
 	root, r := goodRoot(t)
-	r.out["nft -j list ruleset"] = strings.ReplaceAll(goodNft, `"table":"enklave"`, `"table":"other"`)
+	r.out["nft -j list ruleset"] = strings.ReplaceAll(goodNft, `"table":"enclave"`, `"table":"other"`)
 	if find(t, RunChecks(root, r), "nft_default_drop").OK {
 		t.Error("wrong table accepted")
 	}
@@ -218,11 +218,11 @@ func TestNftRequiresIPFamily(t *testing.T) {
 	root, r := goodRoot(t)
 	r.out["nft -j list ruleset"] = strings.ReplaceAll(goodNft, `"family":"ip"`, `"family":"inet"`)
 	if x := find(t, RunChecks(root, r), "nft_default_drop"); x.OK {
-		t.Errorf("inet enklave table accepted: %+v", x)
+		t.Errorf("inet enclave table accepted: %+v", x)
 	}
 	// An unrelated inet chain next to the ip table does not change the result.
 	r.out["nft -j list ruleset"] = strings.Replace(goodNft, `]}`,
-		`,{"chain":{"family":"inet","table":"enklave","name":"input","policy":"accept"}}]}`, 1)
+		`,{"chain":{"family":"inet","table":"enclave","name":"input","policy":"accept"}}]}`, 1)
 	if x := find(t, RunChecks(root, r), "nft_default_drop"); !x.OK {
 		t.Errorf("ip table with extra inet chain rejected: %+v", x)
 	}
@@ -231,7 +231,7 @@ func TestNftRequiresIPFamily(t *testing.T) {
 func TestRoleValid(t *testing.T) {
 	for _, role := range []string{"ref", "client", "gateway", "terminal", "console", "sluice", "backup", "fileserver"} {
 		root, r := goodRoot(t)
-		put(t, root, "usr/lib/enklave/role", "\n "+role+" \n")
+		put(t, root, "usr/lib/enclave/role", "\n "+role+" \n")
 		if x := find(t, RunChecks(root, r), "role"); !x.OK || x.Detail != role {
 			t.Errorf("%s: %+v", role, x)
 		}
@@ -245,7 +245,7 @@ func TestMarker(t *testing.T) {
 			t.Fatal("marker emitted without test-profile")
 		}
 	}
-	put(t, root, "usr/lib/enklave/test-profile", "")
+	put(t, root, "usr/lib/enclave/test-profile", "")
 	rs := RunChecks(root, r)
 	if find(t, rs, "marker").OK {
 		t.Error("marker ok without file")
@@ -314,7 +314,7 @@ func TestRequireSecureBoot(t *testing.T) {
 			if c.logOnly {
 				args = append(args, "--log-only")
 			}
-			code := Main("enklave-selftest", append([]string{"require-secureboot"}, args...), &fakeRunner{}, func(Runner) { off++ }, &errb)
+			code := Main("enclave-selftest", append([]string{"require-secureboot"}, args...), &fakeRunner{}, func(Runner) { off++ }, &errb)
 			if code != c.wantCode {
 				t.Errorf("code %d want %d", code, c.wantCode)
 			}
@@ -332,7 +332,7 @@ func TestArgv0Dispatch(t *testing.T) {
 	root := t.TempDir()
 	off := 0
 	var errb bytes.Buffer
-	code := Main("/usr/lib/enklave/require-secureboot", []string{"--root", root}, &fakeRunner{}, func(Runner) { off++ }, &errb)
+	code := Main("/usr/lib/enclave/require-secureboot", []string{"--root", root}, &fakeRunner{}, func(Runner) { off++ }, &errb)
 	if code != 1 || off != 1 {
 		t.Errorf("code=%d off=%d", code, off)
 	}
@@ -384,7 +384,7 @@ func TestRequireSecureBootUsageErrorsStillGuard(t *testing.T) {
 		{"unknown-flag", "require-secureboot", func(r string) []string { return []string{"--root", r, "--bogus"} }, true, 2},
 		{"stray-positional", "require-secureboot", func(r string) []string { return []string{"--root", r, "stray"} }, true, 2},
 		{"doubled-name", "require-secureboot", func(r string) []string { return []string{"--root", r, "require-secureboot"} }, true, 2},
-		{"subcmd-unknown-flag", "enklave-selftest", func(r string) []string { return []string{"require-secureboot", "--root", r, "--bogus"} }, true, 2},
+		{"subcmd-unknown-flag", "enclave-selftest", func(r string) []string { return []string{"require-secureboot", "--root", r, "--bogus"} }, true, 2},
 		{"log-only-usage", "require-secureboot", func(r string) []string { return []string{"--root", r, "--log-only", "x"} }, false, 2},
 	}
 	for _, c := range cases {
@@ -469,15 +469,15 @@ func TestStatErrorsAreNotOk(t *testing.T) {
 
 func TestMainUsageAndOut(t *testing.T) {
 	var errb bytes.Buffer
-	if c := Main("enklave-selftest", []string{"bogus"}, &fakeRunner{}, func(Runner) {}, &errb); c != 2 {
+	if c := Main("enclave-selftest", []string{"bogus"}, &fakeRunner{}, func(Runner) {}, &errb); c != 2 {
 		t.Errorf("code %d", c)
 	}
-	if c := Main("enklave-selftest", []string{}, &fakeRunner{}, func(Runner) {}, &errb); c != 2 {
+	if c := Main("enclave-selftest", []string{}, &fakeRunner{}, func(Runner) {}, &errb); c != 2 {
 		t.Errorf("no --out: code %d", c)
 	}
 	root, r := goodRoot(t)
 	out := filepath.Join(t.TempDir(), "out.jsonl")
-	if c := Main("enklave-selftest", []string{"--out", out, "--root", root}, r, func(Runner) {}, &errb); c != 0 {
+	if c := Main("enclave-selftest", []string{"--out", out, "--root", root}, r, func(Runner) {}, &errb); c != 0 {
 		t.Errorf("code %d: %s", c, errb.String())
 	}
 	b, _ := os.ReadFile(out)
@@ -485,7 +485,7 @@ func TestMainUsageAndOut(t *testing.T) {
 		t.Errorf("%s", b)
 	}
 	// failing root -> exit 1
-	if c := Main("enklave-selftest", []string{"--out", out, "--root", t.TempDir()}, &fakeRunner{}, func(Runner) {}, &errb); c != 1 {
+	if c := Main("enclave-selftest", []string{"--out", out, "--root", t.TempDir()}, &fakeRunner{}, func(Runner) {}, &errb); c != 1 {
 		t.Errorf("code %d", c)
 	}
 }

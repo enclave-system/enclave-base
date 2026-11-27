@@ -1,0 +1,27 @@
+# The only persistent storage: the encrypted, integrity-protected and
+# TPM-authenticated state volume. Everything else (/var itself, journal,
+# caches) lives on the tmpfs root and is volatile.
+#
+# Mounted READ-ONLY: no process, root included, can write the state through
+# this mount. Data below data/ is written only by "enclave-varauth
+# state-exec", which makes the volume writable inside its own private mount
+# namespace for the duration of one commit (authenticated manifest bound to
+# the TPM counter). A direct write would otherwise go unnoticed until the
+# next boot fails closed on the manifest mismatch.
+[Unit]
+Description=Encrypted persistent enclave state (read-only)
+DefaultDependencies=no
+Requires=enclave-var-unlock.service enclave-var-auth.service
+After=enclave-var-unlock.service enclave-var-auth.service local-fs-pre.target
+Before=local-fs.target umount.target
+Conflicts=umount.target
+FailureAction=poweroff-force
+
+[Mount]
+What=/dev/mapper/var
+Where=/var/lib/enclave
+Type=ext4
+Options=ro,nosuid,nodev,noexec
+
+[Install]
+RequiredBy=local-fs.target

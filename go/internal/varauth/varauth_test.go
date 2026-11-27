@@ -17,10 +17,10 @@ import (
 	"testing"
 	"time"
 
-	"enklave.local/base/internal/ekcert"
-	"enklave.local/base/internal/sbstate"
-	"enklave.local/base/internal/sbstate/sbtest"
-	"enklave.local/base/internal/tpmpolicy"
+	"enclave.local/base/internal/ekcert"
+	"enclave.local/base/internal/sbstate"
+	"enclave.local/base/internal/sbstate/sbtest"
+	"enclave.local/base/internal/tpmpolicy"
 )
 
 func b64(s string) string      { return base64.StdEncoding.EncodeToString([]byte(s)) }
@@ -100,8 +100,8 @@ func TestInterruptedProvisioningFailsClosed(t *testing.T) {
 	for _, step := range []string{"salt-created", "epoch-defined", "locked", "secret-written", "formatted", "state-initialized"} {
 		t.Run(step, func(t *testing.T) {
 			e := newEnv(t, "test")
-			os.MkdirAll(filepath.Join(e.c.espMount(), "EFI/enklave"), 0o700)
-			os.WriteFile(filepath.Join(e.c.espMount(), "EFI/enklave/test-pause"), []byte(step), 0o600)
+			os.MkdirAll(filepath.Join(e.c.espMount(), "EFI/enclave"), 0o700)
+			os.WriteFile(filepath.Join(e.c.espMount(), "EFI/enclave/test-pause"), []byte(step), 0o600)
 			old := pauseHook
 			pauseHook = func(s string) { panic(crash{s}) }
 			func() {
@@ -113,7 +113,7 @@ func TestInterruptedProvisioningFailsClosed(t *testing.T) {
 				e.boot(t) //nolint:errcheck
 			}()
 			pauseHook = old
-			os.Remove(filepath.Join(e.c.espMount(), "EFI/enklave/test-pause"))
+			os.Remove(filepath.Join(e.c.espMount(), "EFI/enclave/test-pause"))
 			e.later()
 			if err := e.boot(t); err == nil {
 				t.Fatal("partial provisioning accepted")
@@ -240,7 +240,7 @@ func TestPlatformHierarchy(t *testing.T) {
 	if err := e.boot(t); err != nil {
 		t.Fatal(err)
 	}
-	if e.f.phEnable || readFile(e.c.PlatformFile()) != "disabled-by-enklave\n" {
+	if e.f.phEnable || readFile(e.c.PlatformFile()) != "disabled-by-enclave\n" {
 		t.Errorf("platform not disabled: %v %q", e.f.phEnable, readFile(e.c.PlatformFile()))
 	}
 }
@@ -310,8 +310,8 @@ func TestInterruptedHealRecovers(t *testing.T) {
 	}
 	e.later()
 	e.setImage(t, "ref", "test", 1, 1)
-	os.MkdirAll(filepath.Join(e.c.espMount(), "EFI/enklave"), 0o700)
-	os.WriteFile(filepath.Join(e.c.espMount(), "EFI/enklave/test-pause"), []byte("healed-tpm"), 0o600)
+	os.MkdirAll(filepath.Join(e.c.espMount(), "EFI/enclave"), 0o700)
+	os.WriteFile(filepath.Join(e.c.espMount(), "EFI/enclave/test-pause"), []byte("healed-tpm"), 0o600)
 	old := pauseHook
 	pauseHook = func(s string) { panic(crash{s}) }
 	func() {
@@ -319,7 +319,7 @@ func TestInterruptedHealRecovers(t *testing.T) {
 		e.boot(t)                    //nolint:errcheck
 	}()
 	pauseHook = old
-	os.Remove(filepath.Join(e.c.espMount(), "EFI/enklave/test-pause"))
+	os.Remove(filepath.Join(e.c.espMount(), "EFI/enclave/test-pause"))
 	if err := e.boot(t); err != nil {
 		t.Fatalf("interrupted heal not recoverable by the healing release: %v", err)
 	}
@@ -823,8 +823,8 @@ func TestInterruptedProvisioningRecovery(t *testing.T) {
 		"locked": true, "secret-written": true, "formatted": true, "state-initialized": true} {
 		t.Run(step, func(t *testing.T) {
 			e := newEnv(t, "test")
-			os.MkdirAll(filepath.Join(e.c.espMount(), "EFI/enklave"), 0o700)
-			os.WriteFile(filepath.Join(e.c.espMount(), "EFI/enklave/test-pause"), []byte(step), 0o600)
+			os.MkdirAll(filepath.Join(e.c.espMount(), "EFI/enclave"), 0o700)
+			os.WriteFile(filepath.Join(e.c.espMount(), "EFI/enclave/test-pause"), []byte(step), 0o600)
 			old := pauseHook
 			pauseHook = func(s string) { panic(crash{s}) }
 			func() {
@@ -832,7 +832,7 @@ func TestInterruptedProvisioningRecovery(t *testing.T) {
 				e.boot(t)                    //nolint:errcheck
 			}()
 			pauseHook = old
-			os.Remove(filepath.Join(e.c.espMount(), "EFI/enklave/test-pause"))
+			os.Remove(filepath.Join(e.c.espMount(), "EFI/enclave/test-pause"))
 			e.later()
 			e.setImage(t, "ref", "test", 1, 1)
 			err := e.boot(t)
@@ -891,8 +891,8 @@ func TestDbxUpdatePowerLossAtPausePoints(t *testing.T) {
 			e.later()
 			e.setImage(t, "ref", "test", 1, 0)
 			e.shipDbx(t, "dbx-epoch0.auth", bytes.Repeat([]byte{0xd0}, 32))
-			os.MkdirAll(filepath.Join(e.c.espMount(), "EFI/enklave"), 0o700)
-			os.WriteFile(filepath.Join(e.c.espMount(), "EFI/enklave/test-pause"), []byte(step), 0o600)
+			os.MkdirAll(filepath.Join(e.c.espMount(), "EFI/enclave"), 0o700)
+			os.WriteFile(filepath.Join(e.c.espMount(), "EFI/enclave/test-pause"), []byte(step), 0o600)
 			old := pauseHook
 			pauseHook = func(s string) { panic(crash{s}) }
 			func() {
@@ -904,7 +904,7 @@ func TestDbxUpdatePowerLossAtPausePoints(t *testing.T) {
 				e.boot(t) //nolint:errcheck
 			}()
 			pauseHook = old
-			os.Remove(filepath.Join(e.c.espMount(), "EFI/enklave/test-pause"))
+			os.Remove(filepath.Join(e.c.espMount(), "EFI/enclave/test-pause"))
 			e.f.powerCut()
 			if step == "pcr7-bridge" {
 				e.mustBoot(t, "pending") // nothing reached the firmware yet
@@ -1135,10 +1135,10 @@ func TestStateService(t *testing.T) {
 		"caller in another unit":          {StateRequest{Op: "exec", Writer: "config"}, "/system.slice/evil.service", "not authorized"},
 		"caller outside any unit":         {StateRequest{Op: "exec", Writer: "config"}, "/", "not authorized"},
 		"transient unit of root":          {StateRequest{Op: "exec", Writer: "config"}, "/system.slice/run-u42.service", "not authorized"},
-		"fake cgroup named like the unit": {StateRequest{Op: "exec", Writer: "config"}, "/fake/enklave-config.service", "not authorized"},
-		"cgroup below another unit":       {StateRequest{Op: "exec", Writer: "config"}, "/system.slice/evil.service/enklave-config.service", "not authorized"},
-		"unit name without the slice":     {StateRequest{Op: "exec", Writer: "config"}, "enklave-config.service", "not authorized"},
-		"user slice cgroup of that name":  {StateRequest{Op: "exec", Writer: "config"}, "/user.slice/enklave-config.service", "not authorized"},
+		"fake cgroup named like the unit": {StateRequest{Op: "exec", Writer: "config"}, "/fake/enclave-config.service", "not authorized"},
+		"cgroup below another unit":       {StateRequest{Op: "exec", Writer: "config"}, "/system.slice/evil.service/enclave-config.service", "not authorized"},
+		"unit name without the slice":     {StateRequest{Op: "exec", Writer: "config"}, "enclave-config.service", "not authorized"},
+		"user slice cgroup of that name":  {StateRequest{Op: "exec", Writer: "config"}, "/user.slice/enclave-config.service", "not authorized"},
 		"writer not in the image":         {StateRequest{Op: "exec", Writer: "sh"}, configCgroup, "unknown state writer"},
 		"unknown operation":               {StateRequest{Op: "key"}, configCgroup, "unknown operation"},
 		"read of a file not in state":     {StateRequest{Op: "read", Path: "../.manifest"}, "/system.slice/x.service", "not exist"},
@@ -1249,7 +1249,7 @@ func TestWriterDefinitions(t *testing.T) {
 	// a writer with input "none" never sees the caller's input
 	e := newEnv(t, "prod")
 	os.WriteFile(filepath.Join(e.c.WritersDir, "tick.json"),
-		[]byte(`{"unit":"tick.service","input":"none","exec":["/bin/sh","-c","cat > \"$ENKLAVE_STATE_DIR/tick\"; echo tick >> \"$ENKLAVE_STATE_DIR/tick\""]}`), 0o644)
+		[]byte(`{"unit":"tick.service","input":"none","exec":["/bin/sh","-c","cat > \"$ENCLAVE_STATE_DIR/tick\"; echo tick >> \"$ENCLAVE_STATE_DIR/tick\""]}`), 0o644)
 	if err := e.boot(t); err != nil {
 		t.Fatal(err)
 	}

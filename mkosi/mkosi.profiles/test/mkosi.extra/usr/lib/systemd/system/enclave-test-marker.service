@@ -1,0 +1,17 @@
+# Test profile: records this boot in the authenticated state store AFTER the
+# selftest ran (marker: boot 1 false, later boots true; bootlog changes on
+# every boot for the splice/rollback proofs). ESP:/EFI/enclave/test-pause-state
+# may name a commit phase at which state-exec pauses (crash proofs).
+[Unit]
+Description=Record this boot in the enclave state (test profile)
+After=enclave-selftest.service
+RequiresMountsFor=/var/lib/enclave
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/enclave/test-record-boot
+
+[Install]
+# Not multi-user.target: a target is ordered after the units it wants, which
+# would form a cycle with After=multi-user.target. default.target = graphical.target.
+WantedBy=graphical.target

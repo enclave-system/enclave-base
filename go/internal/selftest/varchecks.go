@@ -10,28 +10,28 @@ import (
 	"path/filepath"
 	"strings"
 
-	"enklave.local/base/internal/sbstate"
-	"enklave.local/base/internal/tpmpolicy"
-	"enklave.local/base/internal/varauth"
+	"enclave.local/base/internal/sbstate"
+	"enclave.local/base/internal/tpmpolicy"
+	"enclave.local/base/internal/varauth"
 )
 
 // stateMount is where the encrypted persistent state volume is mounted.
-const stateMount = "/var/lib/enklave"
+const stateMount = "/var/lib/enclave"
 
 // varConfig maps the varauth runtime paths below root.
 func varConfig(root string) varauth.Config {
 	c := varauth.DefaultConfig()
-	c.RunDir = filepath.Join(root, "run/enklave")
-	c.Work = filepath.Join(root, "run/enklave/selftest-work")
+	c.RunDir = filepath.Join(root, "run/enclave")
+	c.Work = filepath.Join(root, "run/enclave/selftest-work")
 	c.PubKey = filepath.Join(root, "run/systemd/tpm2-pcr-public-key.pem")
-	c.RoleFile = filepath.Join(root, "usr/lib/enklave/role")
-	c.TestMarker = filepath.Join(root, "usr/lib/enklave/test-profile")
-	c.ReleaseFile = filepath.Join(root, "usr/lib/enklave/release.json")
-	c.StateRoot = filepath.Join(root, "var/lib/enklave")
-	c.EKCADir = filepath.Join(root, "usr/share/enklave/tpm-ek-ca")
-	c.EKTestCADir = filepath.Join(root, "usr/share/enklave/tpm-ek-ca-test")
-	c.WritersDir = filepath.Join(root, "usr/lib/enklave/state-writers.d")
-	c.UpdatesDir = filepath.Join(root, "usr/lib/enklave/efi-updates")
+	c.RoleFile = filepath.Join(root, "usr/lib/enclave/role")
+	c.TestMarker = filepath.Join(root, "usr/lib/enclave/test-profile")
+	c.ReleaseFile = filepath.Join(root, "usr/lib/enclave/release.json")
+	c.StateRoot = filepath.Join(root, "var/lib/enclave")
+	c.EKCADir = filepath.Join(root, "usr/share/enclave/tpm-ek-ca")
+	c.EKTestCADir = filepath.Join(root, "usr/share/enclave/tpm-ek-ca-test")
+	c.WritersDir = filepath.Join(root, "usr/lib/enclave/state-writers.d")
+	c.UpdatesDir = filepath.Join(root, "usr/lib/enclave/efi-updates")
 	c.EventLog = filepath.Join(root, "sys/kernel/security/tpm0/binary_bios_measurements")
 	c.EFI = sbstate.EFIVarFS{Dir: filepath.Join(root, "sys/firmware/efi/efivars")}
 	return c
@@ -74,15 +74,15 @@ func luksDump(root string, r Runner) (string, string, error) {
 	return dev, string(out), nil
 }
 
-// checkVarTPM: the volume is bound to the TPM through the enklave NV secret
+// checkVarTPM: the volume is bound to the TPM through the enclave NV secret
 // (no systemd-tpm2 token, which older UKIs could satisfy).
 func checkVarTPM(root string, r Runner) (string, error) {
 	dev, dump, err := luksDump(root, r)
 	if err != nil {
 		return "", err
 	}
-	if !strings.Contains(dump, "enklave-tpm2-nv") {
-		return "", fmt.Errorf("no enklave-tpm2-nv token on %s", dev)
+	if !strings.Contains(dump, "enclave-tpm2-nv") {
+		return "", fmt.Errorf("no enclave-tpm2-nv token on %s", dev)
 	}
 	if strings.Contains(dump, "systemd-tpm2") {
 		return "", fmt.Errorf("unexpected systemd-tpm2 token on %s", dev)
@@ -140,7 +140,7 @@ func checkVarAuthenticated(root string, r Runner) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	rec, err := readTrim(root, "run/enklave/var-authenticated")
+	rec, err := readTrim(root, "run/enclave/var-authenticated")
 	if err != nil {
 		return "", err
 	}
@@ -218,7 +218,7 @@ var StateCall = func(root string, req varauth.StateRequest) (varauth.StateReply,
 // counter and the version verified at boot. The state service answers (it
 // alone holds the state keys); the key file must be gone from /run.
 func checkVarRollback(root string, _ Runner) (string, error) {
-	if err := mustNotExist(root, "run/enklave/state.key"); err != nil {
+	if err := mustNotExist(root, "run/enclave/state.key"); err != nil {
 		return "", fmt.Errorf("state keys left in /run: %w", err)
 	}
 	rep, err := StateCall(root, varauth.StateRequest{Op: "status"})
@@ -228,7 +228,7 @@ func checkVarRollback(root string, _ Runner) (string, error) {
 	if rep.Version != rep.Counter {
 		return "", fmt.Errorf("state manifest version %d != TPM counter %d", rep.Version, rep.Counter)
 	}
-	rec, err := readTrim(root, "run/enklave/var-counter")
+	rec, err := readTrim(root, "run/enclave/var-counter")
 	if err != nil {
 		return "", err
 	}
@@ -249,18 +249,18 @@ func checkTPMLocked(root string, r Runner) (string, error) {
 	if !h.Locked() {
 		return "", fmt.Errorf("TPM hierarchies not locked: %+v", h)
 	}
-	ps, err := readTrim(root, "run/enklave/platform")
+	ps, err := readTrim(root, "run/enclave/platform")
 	if err != nil {
 		return "", err
 	}
 	switch {
-	case !h.PhEnable && (ps == "disabled" || ps == "disabled-by-enklave"):
+	case !h.PhEnable && (ps == "disabled" || ps == "disabled-by-enclave"):
 	case h.PhEnable && ps == "firmware-auth":
 	default:
 		return "", fmt.Errorf("platform hierarchy state %q with phEnable=%v", ps, h.PhEnable)
 	}
 	// The endorsement key (salt key) is DA protected; a TPM in lockout
-	// refuses salted sessions. enklave disables the lockout (no enklave
+	// refuses salted sessions. enclave disables the lockout (no enclave
 	// secret is a guessable authValue).
 	da, err := varauth.ReadDA(r)
 	if err != nil {
@@ -276,7 +276,7 @@ func checkTPMLocked(root string, r Runner) (string, error) {
 		return "", err
 	}
 	if len(foreign) > 0 {
-		return "", fmt.Errorf("TPM holds objects enklave does not account for (%s): with the DA lockout disabled their authValues are not protected against guessing", strings.Join(foreign, ", "))
+		return "", fmt.Errorf("TPM holds objects enclave does not account for (%s): with the DA lockout disabled their authValues are not protected against guessing", strings.Join(foreign, ", "))
 	}
 	return "ownerAuthSet lockoutAuthSet endorsementAuthSet disableClear, DA lockout disabled and no foreign TPM objects, platform " + ps, nil
 }
@@ -288,7 +288,7 @@ func checkPCR11Sealed(root string, r Runner) (string, error) {
 		return "", err
 	}
 	signed, err := varauth.SignedPCR11Policies(filepath.Join(root, "run/systemd/tpm2-pcr-signature.json"),
-		filepath.Join(root, "run/enklave/policy.json"))
+		filepath.Join(root, "run/enclave/policy.json"))
 	if err != nil {
 		return "", err
 	}
@@ -304,7 +304,7 @@ func checkPCR11Sealed(root string, r Runner) (string, error) {
 // release (dbx revocations, db/KEK appends) is in the firmware and no PCR 7
 // transition is pending.
 func checkEFIUpdates(root string, _ Runner) (string, error) {
-	s, err := readTrim(root, "run/enklave/efi-updates")
+	s, err := readTrim(root, "run/enclave/efi-updates")
 	if err != nil {
 		return "", err
 	}
@@ -315,7 +315,7 @@ func checkEFIUpdates(root string, _ Runner) (string, error) {
 }
 
 // checkStateReadOnly: the state volume is mounted read-only; only
-// "enklave-varauth state-exec" writes it, in a private mount namespace.
+// "enclave-varauth state-exec" writes it, in a private mount namespace.
 func checkStateReadOnly(root string, _ Runner) (string, error) {
 	m, err := findMount(root, stateMount)
 	if err != nil {
@@ -335,7 +335,7 @@ func checkStateReadOnly(root string, _ Runner) (string, error) {
 // --forbid-dev-keys and rejects such builds. A test-profile image that
 // claims production keys is always an error (the build refuses to sign it).
 func checkDevKeys(root string, forbidDev bool) (string, error) {
-	b, err := os.ReadFile(filepath.Join(root, "usr/lib/enklave/release.json"))
+	b, err := os.ReadFile(filepath.Join(root, "usr/lib/enclave/release.json"))
 	if err != nil {
 		return "", err
 	}
@@ -343,7 +343,7 @@ func checkDevKeys(root string, forbidDev bool) (string, error) {
 	if err := json.Unmarshal(b, &rel); err != nil {
 		return "", err
 	}
-	_, terr := os.Stat(filepath.Join(root, "usr/lib/enklave/test-profile"))
+	_, terr := os.Stat(filepath.Join(root, "usr/lib/enclave/test-profile"))
 	test := terr == nil
 	switch {
 	case rel.DevKeys && forbidDev:

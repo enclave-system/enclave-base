@@ -37,13 +37,13 @@ func powerOff(r Runner, sys func() error, sleep func(time.Duration), log io.Writ
 		if x.err == nil {
 			return
 		}
-		fmt.Fprintf(log, "enklave: systemctl poweroff failed: %v\n", x.err)
+		fmt.Fprintf(log, "enclave: systemctl poweroff failed: %v\n", x.err)
 	case <-time.After(cmdTimeout):
-		fmt.Fprintln(log, "enklave: systemctl poweroff timed out")
+		fmt.Fprintln(log, "enclave: systemctl poweroff timed out")
 	}
 	for i := 0; maxRetries == 0 || i < maxRetries; i++ {
 		if err := sys(); err != nil {
-			fmt.Fprintf(log, "enklave: reboot(POWER_OFF) failed: %v\n", err)
+			fmt.Fprintf(log, "enclave: reboot(POWER_OFF) failed: %v\n", err)
 		}
 		sleep(retryEvery)
 	}
@@ -58,7 +58,7 @@ func requireSecureBoot(args []string, r Runner, off PowerOff, stderr io.Writer) 
 	usage := perr != nil || fs.NArg() != 0
 	if usage {
 		// Fail closed: a usage error must never skip the guard.
-		fmt.Fprintln(stderr, "usage: enklave-selftest require-secureboot [--root /] [--log-only]")
+		fmt.Fprintln(stderr, "usage: enclave-selftest require-secureboot [--root /] [--log-only]")
 	}
 	_, err := efiBool(*root, "SecureBoot", 1)
 	switch {
@@ -68,9 +68,9 @@ func requireSecureBoot(args []string, r Runner, off PowerOff, stderr io.Writer) 
 		return 0
 	}
 	if *logOnly {
-		fmt.Fprintf(stderr, "enklave: Secure Boot not enabled (%v); log-only, not powering off\n", err)
+		fmt.Fprintf(stderr, "enclave: Secure Boot not enabled (%v); log-only, not powering off\n", err)
 	} else {
-		fmt.Fprintf(stderr, "enklave: Secure Boot not enabled (%v); powering off\n", err)
+		fmt.Fprintf(stderr, "enclave: Secure Boot not enabled (%v); powering off\n", err)
 		off(r)
 	}
 	if usage {
@@ -87,7 +87,7 @@ func Main(argv0 string, args []string, r Runner, off PowerOff, stderr io.Writer)
 	if len(args) > 0 && args[0] == "require-secureboot" {
 		return requireSecureBoot(args[1:], r, off, stderr)
 	}
-	fs := flag.NewFlagSet("enklave-selftest", flag.ContinueOnError)
+	fs := flag.NewFlagSet("enclave-selftest", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	out := fs.String("out", "", "output file or device (required)")
 	root := fs.String("root", "/", "filesystem root")
@@ -96,12 +96,12 @@ func Main(argv0 string, args []string, r Runner, off PowerOff, stderr io.Writer)
 		return 2
 	}
 	if *out == "" || fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "usage: enklave-selftest --out PATH [--root /] [--forbid-dev-keys] | require-secureboot [--root /] [--log-only]")
+		fmt.Fprintln(stderr, "usage: enclave-selftest --out PATH [--root /] [--forbid-dev-keys] | require-secureboot [--root /] [--log-only]")
 		return 2
 	}
 	w, err := openOut(*out)
 	if err != nil {
-		fmt.Fprintln(stderr, "enklave-selftest:", err)
+		fmt.Fprintln(stderr, "enclave-selftest:", err)
 		return 1
 	}
 	defer w.Close()

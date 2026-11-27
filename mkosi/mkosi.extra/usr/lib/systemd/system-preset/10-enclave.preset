@@ -1,0 +1,12 @@
+# enclave: explicit allow-list. The first matching line wins across all
+# preset files (sorted by name), so this file overrides 90-systemd.preset.
+# Profiles and component repos put their own enable lines in a file sorting
+# before this one (e.g. 05-enclave-test.preset).
+enable enclave-etc.service
+enable enclave-require-secureboot.service
+enable var-lib-enclave.mount
+enable enclave-state.service
+enable enclave-pcr11-sealed.service
+enable nftables.service
+enable apparmor.service
+disable *

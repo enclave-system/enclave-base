@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"enklave.local/base/internal/varauth"
+	"enclave.local/base/internal/varauth"
 )
 
 // Runner runs external commands (nft, cryptsetup, systemctl).
@@ -120,7 +120,7 @@ func RunChecksWith(root string, r Runner, o Options) []Result {
 	for _, c := range checkList(o) {
 		run(c)
 	}
-	if _, err := os.Stat(filepath.Join(root, "usr/lib/enklave/test-profile")); err == nil {
+	if _, err := os.Stat(filepath.Join(root, "usr/lib/enclave/test-profile")); err == nil {
 		run(check{"marker", checkMarker})
 	}
 	return out
@@ -267,7 +267,7 @@ func checkNoPkg(root string, _ Runner) (string, error) {
 	return "", nil
 }
 
-// nftFamily is the family of the base "enklave" table. The enklave kernels are
+// nftFamily is the family of the base "enclave" table. The enclave kernels are
 // built without IPv6, and "inet" tables need CONFIG_NF_TABLES_INET (depends on
 // IPV6), so the ruleset uses an "ip" table.
 const nftFamily = "ip"
@@ -292,13 +292,13 @@ func checkNft(_ string, r Runner) (string, error) {
 	}
 	pol := map[string]string{}
 	for _, e := range doc.Nftables {
-		if c := e.Chain; c != nil && c.Family == nftFamily && c.Table == "enklave" {
+		if c := e.Chain; c != nil && c.Family == nftFamily && c.Table == "enclave" {
 			pol[c.Name] = c.Policy
 		}
 	}
 	for _, n := range []string{"input", "forward", "output"} {
 		if pol[n] != "drop" {
-			return "", fmt.Errorf("%s enklave chain %s policy %q, want drop", nftFamily, n, pol[n])
+			return "", fmt.Errorf("%s enclave chain %s policy %q, want drop", nftFamily, n, pol[n])
 		}
 	}
 	return "input/forward/output drop", nil
@@ -363,7 +363,7 @@ func checkNoCredentials(root string, _ Runner) (string, error) {
 }
 
 func checkRole(root string, _ Runner) (string, error) {
-	v, err := readTrim(root, "usr/lib/enklave/role")
+	v, err := readTrim(root, "usr/lib/enclave/role")
 	if err != nil {
 		return "", err
 	}

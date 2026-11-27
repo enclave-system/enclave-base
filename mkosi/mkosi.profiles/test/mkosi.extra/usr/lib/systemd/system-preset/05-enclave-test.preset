@@ -1,0 +1,9 @@
+# Test profile additions; sorts before 10-enclave.preset ("disable *").
+enable enclave-selftest.service
+enable enclave-test-marker.service
+enable enclave-test-pcrs.service
+enable enclave-test-unseal-probe.service
+enable enclave-test-state-ro.service
+enable enclave-test-state-auth.service
+enable systemd-networkd.service
+enable systemd-networkd.socket

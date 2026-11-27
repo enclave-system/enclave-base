@@ -1,0 +1,14 @@
+# Test profile only (B8): an unauthorized root caller must not be able to
+# commit state. Runs before the marker unit, whose writer must still work.
+[Unit]
+Description=Probe: unauthorized state commits must be refused (test profile)
+After=enclave-selftest.service enclave-test-state-ro.service
+Before=enclave-test-marker.service
+RequiresMountsFor=/var/lib/enclave
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/enclave/test-state-auth
+
+[Install]
+WantedBy=graphical.target

@@ -1,10 +1,10 @@
-# enklave-base
+# enclave-base
 
-Foundation repo of the enklave ecosystem: minimal, signed, immutable Linux
+Foundation repo of the enclave ecosystem: minimal, signed, immutable Linux
 images for a hardened custom OS, built with mkosi on Debian 13 (trixie).
 
 Specification (outside this repo):
-`docs\superpowers\specs\2026-11-26-enklave-design.md`
+`docs\superpowers\specs\2026-11-26-enclave-design.md`
 
 **Build runs only on the Linux build host** (Debian 13). Windows is used
 for editing and committing only.
@@ -18,44 +18,44 @@ Pinned tool versions live in `BUILDHOST.lock`.
 
 ## PKI
 
-`pki/enklave-pki init <dir>` generates all signing keys (Secure Boot, dm-verity,
+`pki/enclave-pki init <dir>` generates all signing keys (Secure Boot, dm-verity,
 module signing, config signing, update GPG, PCR policy). Protecting that
 directory is the operator's job:
 
 - Generate the production PKI on an offline machine.
 - Keep the directory mode 0700 on encrypted, offline media.
 - Never copy secret keys to the build host or into the repo.
-- The dev PKI (`~/enklave-pki-dev` on the build host) is for development only.
+- The dev PKI (`~/enclave-pki-dev` on the build host) is for development only.
 
 - Three profiles exist, and the profile is part of every TPM policy (so the
   state of one can never be opened by another):
   - `prod`: production configuration, production keys. The build refuses to
     sign it with a dev PKI.
   - `dev`: the production configuration signed with a dev PKI
-    (`make ENKLAVE_DEV_PROD=1 ref`). For development VMs only.
+    (`make ENCLAVE_DEV_PROD=1 ref`). For development VMs only.
   - `test`: the test profile (selftest, serial console). Dev PKI only.
-- `enklave-pki init --dev <dir>` marks a development PKI (`DEV-KEYS`).
+- `enclave-pki init --dev <dir>` marks a development PKI (`DEV-KEYS`).
 - A build signed with a dev PKI carries a marker that is measured and visible
   at runtime: `"dev_keys":true` in the verity-protected
-  `/usr/lib/enklave/release.json` (covered by PCR 11 through the usr root
+  `/usr/lib/enclave/release.json` (covered by PCR 11 through the usr root
   hash) and in the release's policy JSON. Such an image prints
   `[DEV KEYS: development build, never ship]` on the serial port at every boot
   and the selftest reports the check `dev_keys`. Production acceptance runs
-  `enklave-selftest --forbid-dev-keys`, which fails for a dev-signed build.
-  `enklave-sign-policy` refuses to sign an image whose marker does not match
+  `enclave-selftest --forbid-dev-keys`, which fails for a dev-signed build.
+  `enclave-sign-policy` refuses to sign an image whose marker does not match
   the PKI.
 
 ## Persistent state, /var and the TPM
 
 The root file system is a tmpfs; `/var` is volatile. The **only persistent
-storage** is the state volume mounted at `/var/lib/enklave` (1 GiB partition
-`enklave-var` on the disk that carries `/usr`):
+storage** is the state volume mounted at `/var/lib/enclave` (1 GiB partition
+`enclave-var` on the disk that carries `/usr`):
 
 - LUKS2 `aes-xts-plain64` (512-bit), `hmac-sha256` integrity, argon2id keyslot.
 - The 64-byte volume key lives only in TPM NV index `0x01800E02`, read once per
   boot and then read-locked.
 - The volume is mounted **read-only**.
-- State lives in `/var/lib/enklave/data`. Every commit updates an HMAC
+- State lives in `/var/lib/enclave/data`. Every commit updates an HMAC
   manifest (path, type, mode, owner, hash of every entry; key derived from
   the volume key) whose version is bound to the TPM NV counter `0x01800E03`.
   Boot fails closed on any spliced, older or foreign content (dm-integrity
@@ -64,11 +64,11 @@ storage** is the state volume mounted at `/var/lib/enklave` (1 GiB partition
 
 ### The state service: who may write and how to read
 
-`enklave-state.service` (`enklave-varauth state-serve`) is the only writer
+`enclave-state.service` (`enclave-varauth state-serve`) is the only writer
 and the only holder of the state keys at runtime:
 
 - **Keys.** The unlock step leaves the manifest key and the counter
-  authorization in `/run/enklave/state.key`. The state service reads and
+  authorization in `/run/enclave/state.key`. The state service reads and
   deletes the file before it reports ready, and `local-fs.target` requires
   the service, so no ordinary service ever runs while the file exists.
   Afterwards the keys exist in that process only. The process is not
@@ -77,21 +77,21 @@ and the only holder of the state keys at runtime:
   processes, root included, from reading its memory.
 - **Writers are defined by the image.** A commit is not "run this command".
   The caller names a writer, and the command of a writer is fixed in the
-  verity-protected `/usr/lib/enklave/state-writers.d/<id>.json`:
+  verity-protected `/usr/lib/enclave/state-writers.d/<id>.json`:
   `{"unit": "<x>.service", "input": "<kind>", "exec": [...]}`.
 - **Input is verified by the service, not by the writer.** Every writer
   declares what it consumes:
   - `"input": "none"`: the writer gets nothing from the caller. What it
     writes is decided by the image alone.
   - `"input": "signed-bundle"`: the caller passes a 64-byte Ed25519 signature
-    followed by an enklave bundle (`enklave-cfg build`, `sign`). Before
+    followed by an enclave bundle (`enclave-cfg build`, `sign`). Before
     anything runs, the service checks the signature against the
     config-signing key of the image, that the bundle is for this role, and
     that its version is **higher than the last version this writer
     accepted**. That last version is stored inside the authenticated state
     (covered by the manifest MAC and the TPM counter), so it cannot be turned
-    back. The writer then gets the verified bundle (`$ENKLAVE_INPUT_BUNDLE`,
-    `$ENKLAVE_INPUT_SIG`, `$ENKLAVE_INPUT_VERSION`, and on stdin).
+    back. The writer then gets the verified bundle (`$ENCLAVE_INPUT_BUNDLE`,
+    `$ENCLAVE_INPUT_SIG`, `$ENCLAVE_INPUT_VERSION`, and on stdin).
     A bundle is bound to the role and to its version, not to a writer, so an
     image defines at most one signed-bundle writer (enforced by the service
     and the image build); otherwise a bundle signed for one writer could be
@@ -108,15 +108,15 @@ and the only holder of the state keys at runtime:
   a transient unit (`systemd-run`) is refused.
 - **The volume is writable only inside the service** (`PrivateMounts=yes`),
   for the duration of one commit.
-- **Reads are authenticated.** `enklave-varauth state-read <path>` (package
+- **Reads are authenticated.** `enclave-varauth state-read <path>` (package
   `varauth`, `StateCall`) returns a file only after checking the manifest
   MAC, the manifest version against the TPM counter and the file's hash.
   Consumers read state this way; the base image's own consumers do (the
   selftest). A write that bypassed the service is therefore detected at the
   next read, not only at the next boot.
 
-Usage: `enklave-varauth state-exec <writer> < input`,
-`enklave-varauth state-read <path>`, `enklave-varauth state-status`.
+Usage: `enclave-varauth state-exec <writer> < input`,
+`enclave-varauth state-read <path>`, `enclave-varauth state-status`.
 
 What this guarantees, exactly:
 
@@ -153,7 +153,7 @@ The volume key, the record, the administration of the counter and the owner,
 endorsement and lockout hierarchies are governed by
 
     P = PolicyAuthorizeNV(V)
-    V = PolicyAuthorize(PCR key, "enklave-var-v1:<role>:<profile>") + PolicyPCR(7 = recorded, 12 = 0)
+    V = PolicyAuthorize(PCR key, "enclave-var-v1:<role>:<profile>") + PolicyPCR(7 = recorded, 12 = 0)
         (during a signed Secure Boot update: a PolicyOR over two to four such
         digests, each for one exact PCR 7 value)
 
@@ -173,7 +173,7 @@ Two indices have their own policies:
   derived from the volume key; that authValue can be set under P only.
 
 The authorized part is the release's signed approved policy
-(`/EFI/enklave/policy/<uki>.json` on the ESP, made by `enklave-sign-policy`):
+(`/EFI/enclave/policy/<uki>.json` on the ESP, made by `enclave-sign-policy`):
 PCR 11 of exactly that UKI in the phase `enter-initrd:leave-initrd`, and its
 **security epoch** not revoked in the bits index `0x01800E04`. Role and profile
 are part of the policyRef, so a test-profile UKI cannot open a production
@@ -184,7 +184,7 @@ order:
 
 1. The platform is checked. DMA remapping is active (IOMMU, see "Why PCR 1
    is not bound"). The TPM implements `TPM2_PolicyAuthorizeNV` and holds no
-   object that is not enklave's or the vendor's. The firmware's event log
+   object that is not enclave's or the vendor's. The firmware's event log
    replays to PCR 7 and measures db, dbx and KEK exactly once each and
    verbatim (otherwise the device could not take a signed dbx update later
    under an exact PCR 7 binding; it is not enrolled).
@@ -225,10 +225,10 @@ losses in exactly the same way, and it would have to run on every boot (the
 binding must be re-checked on every boot, or an interposer swaps the salt
 key). The lockout would still have to be reset under policy P each boot. What
 makes disabling it sound is an invariant, and the invariant is enforced: no
-secret in this TPM is a guessable authValue. All enklave authValues are
-256-bit random values and all enklave indices are `NO_DA`. **Every unlock, in
+secret in this TPM is a guessable authValue. All enclave authValues are
+256-bit random values and all enclave indices are `NO_DA`. **Every unlock, in
 every profile, fails closed before it touches the lockout if the TPM holds
-any object enklave does not account for** (anything outside the enklave
+any object enclave does not account for** (anything outside the enclave
 indices, the salt key, the vendor's EK certificates and keys, and the storage
 root key that systemd creates with an empty authValue); first provisioning
 does the same. The selftest check `tpm_locked` reports the same condition and
@@ -242,8 +242,8 @@ or RSA 2048). Its public area is never taken on trust from the TPM bus. On
 
 - the EK certificate is read from the TPM (NV `0x01C0000A` ECC, `0x01C00002`
   RSA; intermediate certificates from NV `0x01C00100`–`0x01C001FF`), or, for
-  TPMs that do not carry it, from `ESP:/EFI/enklave/ekcert/` (below), and
-  must chain to a TPM vendor CA in `/usr/share/enklave/tpm-ek-ca` (AMD, Atmel,
+  TPMs that do not carry it, from `ESP:/EFI/enclave/ekcert/` (below), and
+  must chain to a TPM vendor CA in `/usr/share/enclave/tpm-ek-ca` (AMD, Atmel,
   Infineon, Intel, NationZ, Nuvoton, Qualcomm, STMicro; provenance in
   `SOURCE`, hashes in `SHA256SUMS`);
 - the certificate must be an EK certificate as the TCG EK Credential Profile
@@ -273,9 +273,9 @@ Not accepted on purpose:
 
 - **Virtual TPMs.** The Microsoft CA that certifies Hyper-V/Azure virtual TPMs
   is not shipped.
-- **The test CA.** `enklave-pki ek-test-ca` creates a CA for the emulated TPMs
+- **The test CA.** `enclave-pki ek-test-ca` creates a CA for the emulated TPMs
   of the VM tests (`swtpm_setup --create-ek-cert`). Its certificates go into
-  test-profile images only (`/usr/share/enklave/tpm-ek-ca-test`); the build
+  test-profile images only (`/usr/share/enclave/tpm-ek-ca-test`); the build
   asserts that other images do not contain them, and the runtime reads them
   in the test profile only.
 - **SHA-1 signed EK certificates** of TPMs from before 2016.
@@ -288,7 +288,7 @@ refused, from the TPM and from the ESP alike, and so is every device without
 a vendor certificate (an admission proves nothing about the kind of TPM). A
 discrete TPM has a bus that can be tapped and reset; a firmware TPM has none.
 
-- Role `client` **must** be built with it. `enklave-sign-policy` refuses to
+- Role `client` **must** be built with it. `enclave-sign-policy` refuses to
   sign, `mkosi.finalize` refuses to build and the unlock step refuses to run
   a client release without it. Only test-profile builds (emulated TPMs in
   VMs) are exempt.
@@ -298,13 +298,13 @@ discrete TPM has a bus that can be tapped and reset; a firmware TPM has none.
 **TPMs that do not carry their EK certificate: certificate on the ESP.** Some
 firmware TPMs keep no certificate in NV (AMD fTPM, Intel PTT on some
 platforms); the vendor publishes it through a web service keyed by the EK
-public key. Fetch it once per device, out of band (`enklave-varauth ek-name`
+public key. Fetch it once per device, out of band (`enclave-varauth ek-name`
 prints the EK Names; `tpm2_createek -G ecc -c ek.ctx -u ek.pub` gives the
 public key the vendor service asks for), and ship it with the release:
 
     make EK_CERTS=<dir with *.cer / *.pem> ...
 
-`enklave-sign-policy` copies the files to `ESP:/EFI/enklave/ekcert/`. The
+`enclave-sign-policy` copies the files to `ESP:/EFI/enclave/ekcert/`. The
 location gives them no authority. The device verifies each one exactly like
 a certificate from NV (vendor CA, EK usage, TPM attributes, `require_ftpm`),
 and its endorsement key must be the key of one of the verified certificates.
@@ -313,7 +313,7 @@ certificate in NV. A directory with the certificates of a whole fleet works:
 every device finds its own.
 
 **Production accepts vendor-certified endorsement keys only.** This is
-enforced in code: `enklave-sign-policy` refuses to sign a per-device
+enforced in code: `enclave-sign-policy` refuses to sign a per-device
 admission for a `prod` image, and a `prod` release ignores any admission it
 finds. The reason: whoever signs an admission cannot tell the Name of an
 emulated TPM (whose private key is a file) from the Name of a real one. A
@@ -324,9 +324,9 @@ development VMs have no certificate that a non-test image trusts. Such a
 device is admitted individually, by a signature, never by a list in the
 image:
 
-- `make EK_ADMIT=<file>` (one EK Name per line) lets `enklave-sign-policy`
+- `make EK_ADMIT=<file>` (one EK Name per line) lets `enclave-sign-policy`
   sign, for each Name, one additional policy for the policyRef derived from
-  `enklave-var-v1:<role>:<profile>` and that Name (a digest: `ek1:<base64>`).
+  `enclave-var-v1:<role>:<profile>` and that Name (a digest: `ek1:<base64>`).
   It is stored next to the release's policy on the ESP. No image contains an
   allowlist (asserted by the build).
 - The device computes the Name of its own EK, looks for the policy signed
@@ -356,7 +356,7 @@ Rules:
        make EFI_UPDATES=updates SECURITY_EPOCH=<N+1> ...
 
    The release carries the KEK-signed dbx append in
-   `/usr/lib/enklave/efi-updates/` and applies it itself (next section). The
+   `/usr/lib/enclave/efi-updates/` and applies it itself (next section). The
    firmware then refuses the old UKIs, also after a TPM clear.
 4. If a vulnerable epoch may have leaked the volume key or TPM authorization,
    also set `HEAL_BELOW` (see below).
@@ -449,7 +449,7 @@ Properties:
   own PCR 7 at provisioning and after each signed update.
 
 **Status, visible in production.** Every boot writes
-`/run/enklave-status/secure-boot-updates.json` (world-readable:
+`/run/enclave-status/secure-boot-updates.json` (world-readable:
 `{"status": "current|pending|failed|blocked", "ok": bool, "detail": ...}`),
 for the console to collect. `failed` and `blocked` are also logged as a
 critical journal message (`SECURE BOOT UPDATE NOT IN PLACE`) and on the
@@ -507,7 +507,7 @@ obtained under a revoked epoch is useless afterwards.
   certificate or the signed admission of the device) and must have the Name recorded at
   provisioning. Another endorsement key fails closed and nothing is wiped.
 - **The wipe applies to every role alike**, including `backup` and
-  `fileserver`. What is lost is exactly the state volume `/var/lib/enklave`:
+  `fileserver`. What is lost is exactly the state volume `/var/lib/enclave`:
   enrollment and configuration, which are restored through the console
   (re-enrollment). The data volumes of backup and file servers are separate
   volumes and are not touched by healing; their keys must not be kept in the
@@ -540,7 +540,7 @@ system) and boot again.
 ### Factory reset and interrupted provisioning
 
 Factory reset: clear the TPM in the firmware setup (physical presence; this
-wipes all owner objects and re-enables Clear) and delete the `enklave-var`
+wipes all owner objects and re-enables Clear) and delete the `enclave-var`
 partition; the next boot provisions a fresh state volume.
 
 An interrupted first boot fails closed at every later boot. Recovery depends
@@ -581,7 +581,7 @@ is approved, check on one device (a test-profile build prints the reasons on
 the serial port; each item fails closed if it does not hold):
 
 1. **EK certificate.** The TPM carries one in NV, or the vendor service
-   delivers one. It chains to a CA in `/usr/share/enklave/tpm-ek-ca`, and it
+   delivers one. It chains to a CA in `/usr/share/enclave/tpm-ek-ca`, and it
    is marked as an EK certificate (extended key usage 2.23.133.8.1, or no
    extended key usage and a TCG certificate policy) with TPM manufacturer,
    model and version in the subjectAltName. If a vendor's certificates

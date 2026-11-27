@@ -66,7 +66,7 @@ const (
 
 func TestRefAndFileDecode(t *testing.T) {
 	ref, err := Ref("ref", "prod")
-	if err != nil || ref != "enklave-var-v1:ref:prod" {
+	if err != nil || ref != "enclave-var-v1:ref:prod" {
 		t.Fatalf("%q %v", ref, err)
 	}
 	for _, bad := range [][2]string{{"evil", "prod"}, {"ref", "debug"}, {"ref:x", "prod"}, {"", ""}} {
@@ -87,7 +87,7 @@ func TestRefAndFileDecode(t *testing.T) {
 	mut := func(f func(*File)) File { c := good; f(&c); return c }
 	for _, bad := range []File{
 		mut(func(f *File) { f.Version = 1 }),
-		mut(func(f *File) { f.Ref = "enklave-var-v1:ref:test" }),
+		mut(func(f *File) { f.Ref = "enclave-var-v1:ref:test" }),
 		mut(func(f *File) { f.Profile = "test" }),
 		mut(func(f *File) { f.PCR11Policy = "zz" }),
 		mut(func(f *File) { f.Approved = "00" }),
@@ -169,7 +169,7 @@ func TestRefEK(t *testing.T) {
 	if _, _, err := f.DecodeRef("ref", "prod", RefEK(base, name)); err == nil {
 		t.Error("policy with profile dev accepted by a prod image")
 	}
-	if _, _, err := f.DecodeRef("ref", "dev", "enklave-var-v1:ref:devil"); err == nil {
+	if _, _, err := f.DecodeRef("ref", "dev", "enclave-var-v1:ref:devil"); err == nil {
 		t.Error("foreign ref accepted")
 	}
 }

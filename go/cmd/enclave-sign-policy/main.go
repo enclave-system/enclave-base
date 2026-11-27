@@ -1,0 +1,502 @@
+// Command enclave-sign-policy runs on the build host after mkosi. It
+//
+//  1. reads the single PCR 11 policy from the UKI's .pcrsig and proves that it
+//     is exactly the phase enter-initrd:leave-initrd (recomputed with
+//     systemd-measure from the UKI's own sections),
+//  2. derives the TPM Name of the epoch index E on an ephemeral swtpm (same
+//     public area as on the target: handle, attributes, authPolicy),
+//  3. computes and signs the approved policy for the given security epoch
+//     (see internal/tpmpolicy) with the PCR signing key,
+//  4. writes the JSON next to the UKI and, with --image, into the image's ESP
+//     at /EFI/enclave/policy/<uki>.json (mtools).
+//
+// It refuses to sign when the release metadata that went into the image
+// (--release, the verity-protected release.json) disagrees with the PKI
+// about the dev-key marker or with --epoch, and when profile and PKI do not
+// fit: "prod" needs production keys, "dev" (production configuration, dev
+// keys) and "test" need a DEV-KEYS PKI.
+//
+// With --admit-ek it also signs one policy per listed endorsement-key Name,
+// for the per-device ref RefEK(<ref>, <Name>) (B1): the admission of a TPM
+// without EK certificate. FAT names: <uki>.ek-<first 8 Name bytes>.json.
+//
+// Usage:
+//
+//	enclave-sign-policy --uki X.efi --key pcr-signing.key --pub pcr-signing.pub \
+//	    --epoch N --role R --profile prod|test --pki DIR --release release.json \
+//	    --out X.policy.json [--image X.raw] [--admit-ek names.txt]
+package main
+
+import (
+	"bytes"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"debug/pe"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"flag"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"enclave.local/base/internal/ekcert"
+	"enclave.local/base/internal/tpmpolicy"
+	"enclave.local/base/internal/varauth"
+)
+
+const phase = "enter-initrd:leave-initrd"
+
+func die(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "enclave-sign-policy: "+format+"\n", a...)
+	os.Exit(1)
+}
+
+func run(env []string, name string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	cmd.Env = append(os.Environ(), env...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return out, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return out, nil
+}
+
+// sectionData returns the measured bytes of a PE section (min of virtual
+// and raw size, as systemd-stub and ukify use).
+func sectionData(s *pe.Section) ([]byte, error) {
+	b, err := s.Data()
+	if err != nil {
+		return nil, err
+	}
+	if n := int(s.VirtualSize); n < len(b) {
+		b = b[:n]
+	}
+	return b, nil
+}
+
+// pcrPolicyDigest computes PolicyPCR(sha256:11 = value) from a zero digest.
+func pcrPolicyDigest(value []byte) []byte {
+	sel := []byte{0, 0, 0, 1, 0x00, 0x0b, 3, 0x00, 0x08, 0x00} // TPML_PCR_SELECTION {sha256: 11}
+	pd := sha256.Sum256(value)
+	h := sha256.New()
+	h.Write(make([]byte, 32))
+	var cc [4]byte
+	binary.BigEndian.PutUint32(cc[:], 0x0000017F) // TPM_CC_PolicyPCR
+	h.Write(cc[:])
+	h.Write(sel)
+	h.Write(pd[:])
+	return h.Sum(nil)
+}
+
+// provePhase recomputes PCR 11 for the phase from the UKI's sections and
+// returns the matching PolicyPCR digest.
+func provePhase(f *pe.File, tmp string) ([]byte, error) {
+	measured := []string{".linux", ".osrel", ".cmdline", ".initrd", ".ucode", ".splash", ".dtb", ".dtbauto",
+		".uname", ".sbat", ".pcrpkey", ".profile", ".hwids"}
+	var args []string
+	for _, name := range measured {
+		s := f.Section(name)
+		if s == nil {
+			continue
+		}
+		b, err := sectionData(s)
+		if err != nil {
+			return nil, err
+		}
+		p := filepath.Join(tmp, strings.TrimPrefix(name, "."))
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			return nil, err
+		}
+		args = append(args, fmt.Sprintf("--%s=%s", strings.TrimPrefix(name, "."), p))
+	}
+	args = append([]string{"calculate", "--bank=sha256", "--phase=" + phase, "--json=short"}, args...)
+	out, err := run(nil, "/usr/lib/systemd/systemd-measure", args...)
+	if err != nil {
+		return nil, err
+	}
+	var doc struct {
+		SHA256 []struct {
+			Phase string `json:"phase"`
+			PCR   int    `json:"pcr"`
+			Hash  string `json:"hash"`
+		} `json:"sha256"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil || len(doc.SHA256) != 1 || doc.SHA256[0].Phase != phase {
+		return nil, fmt.Errorf("unexpected systemd-measure output %s (%v)", out, err)
+	}
+	v, err := hex.DecodeString(doc.SHA256[0].Hash)
+	if err != nil || len(v) != 32 {
+		return nil, fmt.Errorf("bad PCR 11 value %q", doc.SHA256[0].Hash)
+	}
+	return pcrPolicyDigest(v), nil
+}
+
+func freePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+func digest(out []byte) ([]byte, error) {
+	f := strings.Fields(string(out))
+	for i := len(f) - 1; i >= 0; i-- {
+		if b, err := hex.DecodeString(strings.TrimPrefix(f[i], "0x")); err == nil && len(b) == 32 {
+			return b, nil
+		}
+	}
+	return nil, fmt.Errorf("no digest in %q", out)
+}
+
+// epochName defines E exactly as the target does (on a throw-away swtpm),
+// initializes it and returns its TPM Name.
+func epochName(pub, ref, tmp string) ([]byte, error) {
+	state := filepath.Join(tmp, "swtpm")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		return nil, err
+	}
+	port, err := freePort()
+	if err != nil {
+		return nil, err
+	}
+	pid := filepath.Join(tmp, "swtpm.pid")
+	if _, err := run(nil, "swtpm", "socket", "--tpmstate", "dir="+state, "--tpm2",
+		"--server", fmt.Sprintf("type=tcp,port=%d,bindaddr=127.0.0.1", port),
+		"--ctrl", fmt.Sprintf("type=tcp,port=%d,bindaddr=127.0.0.1", port+1),
+		"--flags", "not-need-init,startup-clear", "--daemon", "--pid", "file="+pid); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if b, err := os.ReadFile(pid); err == nil {
+			if n, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+				if p, err := os.FindProcess(n); err == nil {
+					p.Kill() //nolint:errcheck
+				}
+			}
+		}
+	}()
+	time.Sleep(500 * time.Millisecond)
+	env := []string{fmt.Sprintf("TPM2TOOLS_TCTI=swtpm:host=127.0.0.1,port=%d", port)}
+	w := func(n string) string { return filepath.Join(tmp, n) }
+	if err := os.WriteFile(w("ref.bin"), []byte(ref), 0o600); err != nil {
+		return nil, err
+	}
+	steps := [][]string{
+		{"tpm2_loadexternal", "-C", "o", "-G", "rsa", "-u", pub, "-c", w("key.ctx"), "-n", w("key.name")},
+		{"tpm2_startauthsession", "-S", w("t.ctx")},
+		{"tpm2_policyauthorize", "-S", w("t.ctx"), "-n", w("key.name"), "-q", w("ref.bin"), "-L", w("b1.bin")},
+		{"tpm2_flushcontext", w("t.ctx")},
+		{"tpm2_startauthsession", "-S", w("t.ctx")},
+		{"tpm2_policycommandcode", "-S", w("t.ctx"), "TPM2_CC_NV_SetBits"},
+		{"tpm2_policynvwritten", "-S", w("t.ctx"), "-L", w("b2.bin"), "c"},
+		{"tpm2_flushcontext", w("t.ctx")},
+		{"tpm2_startauthsession", "-S", w("t.ctx")},
+		{"tpm2_policyor", "-S", w("t.ctx"), "-l", "sha256:" + w("b1.bin") + "," + w("b2.bin"), "-L", w("pe.bin")},
+		{"tpm2_flushcontext", w("t.ctx")},
+		{"tpm2_nvdefine", varauth.Epoch.Handle, "-C", "o", "-s", strconv.Itoa(varauth.Epoch.Size),
+			"-a", fmt.Sprintf("0x%08x", varauth.Epoch.Define), "-L", w("pe.bin"), "-g", "sha256"},
+		{"tpm2_startauthsession", "--policy-session", "-S", w("s.ctx")},
+		{"tpm2_policycommandcode", "-S", w("s.ctx"), "TPM2_CC_NV_SetBits"},
+		{"tpm2_policynvwritten", "-S", w("s.ctx"), "c"},
+		{"tpm2_policyor", "-S", w("s.ctx"), "-l", "sha256:" + w("b1.bin") + "," + w("b2.bin")},
+		{"tpm2_nvsetbits", varauth.Epoch.Handle, "-C", varauth.Epoch.Handle, "-i", "0", "-P", "session:" + w("s.ctx")},
+		{"tpm2_flushcontext", w("s.ctx")},
+	}
+	for _, st := range steps {
+		if _, err := run(env, st[0], st[1:]...); err != nil {
+			return nil, err
+		}
+	}
+	out, err := run(env, "tpm2_nvreadpublic", varauth.Epoch.Handle)
+	if err != nil {
+		return nil, err
+	}
+	p, err := varauth.ParseNVPublic(out)
+	if err != nil {
+		return nil, err
+	}
+	if p.Attributes != varauth.Epoch.Final {
+		return nil, fmt.Errorf("epoch index attributes 0x%08x, want 0x%08x", p.Attributes, varauth.Epoch.Final)
+	}
+	return p.Name, nil
+}
+
+func loadKey(path string) (*rsa.PrivateKey, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	blk, _ := pem.Decode(b)
+	if blk == nil {
+		return nil, errors.New("no PEM block in private key")
+	}
+	if k, err := x509.ParsePKCS8PrivateKey(blk.Bytes); err == nil {
+		if rk, ok := k.(*rsa.PrivateKey); ok {
+			return rk, nil
+		}
+		return nil, errors.New("PCR signing key is not RSA")
+	}
+	return x509.ParsePKCS1PrivateKey(blk.Bytes)
+}
+
+// espOffset returns the byte offset of the ESP in a GPT image (sfdisk -J).
+func espOffset(image string) (int64, error) {
+	out, err := run(nil, "sfdisk", "-J", image)
+	if err != nil {
+		return 0, err
+	}
+	var doc struct {
+		PartitionTable struct {
+			SectorSize int64 `json:"sectorsize"`
+			Partitions []struct {
+				Start int64  `json:"start"`
+				Type  string `json:"type"`
+			} `json:"partitions"`
+		} `json:"partitiontable"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		return 0, err
+	}
+	ss := doc.PartitionTable.SectorSize
+	if ss == 0 {
+		ss = 512
+	}
+	for _, p := range doc.PartitionTable.Partitions {
+		if strings.EqualFold(p.Type, "C12A7328-F81F-11D2-BA4B-00A0C93EC93B") {
+			return p.Start * ss, nil
+		}
+	}
+	return 0, errors.New("no ESP in image")
+}
+
+func embed(image, file, name string) error { return embedAt(image, file, "policy", name) }
+
+// embedAt copies a file to ESP:/EFI/enclave/<dir>/<name> of a disk image.
+func embedAt(image, file, dir, name string) error {
+	off, err := espOffset(image)
+	if err != nil {
+		return err
+	}
+	img := fmt.Sprintf("%s@@%d", image, off)
+	for _, d := range []string{"::/EFI/enclave", "::/EFI/enclave/" + dir} {
+		if _, err := run(nil, "mdir", "-i", img, d); err != nil {
+			if _, err := run(nil, "mmd", "-i", img, d); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := run(nil, "mcopy", "-o", "-i", img, file, "::/EFI/enclave/"+dir+"/"+name); err != nil {
+		return err
+	}
+	got, err := run(nil, "mtype", "-i", img, "::/EFI/enclave/"+dir+"/"+name)
+	if err != nil {
+		return err
+	}
+	want, _ := os.ReadFile(file)
+	if !bytes.Equal(bytes.TrimSpace(got), bytes.TrimSpace(want)) {
+		return errors.New("file in ESP differs after copy")
+	}
+	return nil
+}
+
+func main() {
+	uki := flag.String("uki", "", "UKI (.efi)")
+	keyPath := flag.String("key", "", "PCR signing private key (PEM)")
+	pub := flag.String("pub", "", "PCR signing public key (PEM)")
+	epoch := flag.Int("epoch", -1, "security epoch of this release")
+	out := flag.String("out", "", "output JSON")
+	image := flag.String("image", "", "disk image whose ESP receives the JSON (optional)")
+	role := flag.String("role", "", "image role (ref, client, ...)")
+	profile := flag.String("profile", "", "prod, dev or test")
+	pkiDir := flag.String("pki", "", "PKI directory (checked for the DEV-KEYS marker)")
+	admit := flag.String("admit-ek", "", "file with EK Names (one per line): sign a per-device admission for each (TPMs without EK certificate)")
+	ekCerts := flag.String("ek-certs", "", "directory with EK certificates fetched from the TPM vendor (Intel PTT, AMD fTPM): copied to ESP:/EFI/enclave/ekcert of --image; the device verifies them against the vendor CAs")
+	releasePath := flag.String("release", "", "release.json that went into the image (checked for the dev-key marker and epoch)")
+	flag.Parse()
+	if *uki == "" || *keyPath == "" || *pub == "" || *epoch < 0 || *out == "" || *pkiDir == "" || *releasePath == "" {
+		flag.Usage()
+		os.Exit(2)
+	}
+	ref, err := tpmpolicy.Ref(*role, *profile)
+	if err != nil {
+		die("%v", err)
+	}
+	// OOS-1 / B1: the profile is part of the policyRef. "prod" exists only
+	// with production keys; a production configuration signed with a
+	// development PKI is "dev"; "test" and "dev" exist only with dev keys.
+	_, devErr := os.Stat(filepath.Join(*pkiDir, "DEV-KEYS"))
+	dev := devErr == nil
+	switch {
+	case *profile != "prod" && !dev:
+		die("refusing to sign a %s-profile image with non-dev keys (%s has no DEV-KEYS marker)", *profile, *pkiDir)
+	case *profile == "prod" && dev:
+		die("refusing to sign a prod image with dev keys (%s/DEV-KEYS); a development build of the production configuration has profile dev (make ENCLAVE_DEV_PROD=1)", *pkiDir)
+	case *profile == "dev":
+		fmt.Fprintln(os.Stderr, "enclave-sign-policy: WARNING: production configuration signed with DEV keys (profile dev, development build, never ship)")
+	}
+	// B1: per-device admissions. Each is a policy signed for the ref that
+	// names ONE endorsement key; it is useless on any other device.
+	var admitted [][]byte
+	if *admit != "" {
+		ab, err := os.ReadFile(*admit)
+		if err != nil {
+			die("%v", err)
+		}
+		names, err := ekcert.ParseAllowlist(ab)
+		if err != nil {
+			die("%s: %v", *admit, err)
+		}
+		for n := range names {
+			b, _ := hex.DecodeString(n)
+			admitted = append(admitted, b)
+		}
+		sort.Slice(admitted, func(i, j int) bool { return bytes.Compare(admitted[i], admitted[j]) < 0 })
+		// G5: the signer cannot tell the Name of an emulated TPM from a real
+		// one; a vendor certificate can. Production accepts certified
+		// endorsement keys only (the runtime enforces the same).
+		if *profile == "prod" && len(admitted) > 0 {
+			die("refusing to sign per-device admissions for a prod image: production accepts only endorsement keys with a TPM vendor certificate (in the TPM, or fetched from the vendor and shipped with --ek-certs)")
+		}
+	}
+	// M2: the image must carry the truth about its keys (verity-protected
+	// release.json, covered by PCR 11 through the usr root hash).
+	rb, err := os.ReadFile(*releasePath)
+	if err != nil {
+		die("%v", err)
+	}
+	var rel tpmpolicy.Release
+	if err := json.Unmarshal(rb, &rel); err != nil {
+		die("%s: %v", *releasePath, err)
+	}
+	if rel.DevKeys != dev {
+		die("%s says dev_keys=%v but %s is %sa DEV-KEYS PKI: refusing to sign an image with a wrong dev-key marker",
+			*releasePath, rel.DevKeys, *pkiDir, map[bool]string{true: "", false: "not "}[dev])
+	}
+	if err := tpmpolicy.CheckRoleRelease(*role, *profile, rel); err != nil {
+		die("%v", err)
+	}
+	if rel.RequireFTPM && len(admitted) > 0 {
+		die("refusing to sign per-device admissions for a release with require_ftpm: only a vendor certificate proves a firmware TPM")
+	}
+	if *ekCerts != "" && *image == "" {
+		die("--ek-certs needs --image")
+	}
+	if rel.Epoch != *epoch {
+		die("%s is for epoch %d, signing for epoch %d", *releasePath, rel.Epoch, *epoch)
+	}
+	tmp, err := os.MkdirTemp("", "enclave-sign-policy")
+	if err != nil {
+		die("%v", err)
+	}
+	defer os.RemoveAll(tmp)
+
+	f, err := pe.Open(*uki)
+	if err != nil {
+		die("%v", err)
+	}
+	defer f.Close()
+	s := f.Section(".pcrsig")
+	if s == nil {
+		die("%s has no .pcrsig section", *uki)
+	}
+	raw, err := sectionData(s)
+	if err != nil {
+		die("%v", err)
+	}
+	var sig map[string][]struct {
+		PCRs []int  `json:"pcrs"`
+		Pol  string `json:"pol"`
+	}
+	if err := json.Unmarshal(bytes.TrimRight(raw, "\x00"), &sig); err != nil {
+		die("parse .pcrsig: %v", err)
+	}
+	if len(sig) != 1 || len(sig["sha256"]) != 1 || len(sig["sha256"][0].PCRs) != 1 || sig["sha256"][0].PCRs[0] != 11 {
+		die(".pcrsig must hold exactly one sha256 PCR 11 policy, got %s", raw)
+	}
+	pol, err := hex.DecodeString(sig["sha256"][0].Pol)
+	if err != nil || len(pol) != 32 {
+		die("bad pol in .pcrsig")
+	}
+	want, err := provePhase(f, tmp)
+	if err != nil {
+		die("recomputing PCR 11: %v", err)
+	}
+	if !bytes.Equal(want, pol) {
+		die(".pcrsig policy %x is not the %s phase (%x)", pol, phase, want)
+	}
+
+	key, err := loadKey(*keyPath)
+	if err != nil {
+		die("%v", err)
+	}
+	keys := "production keys"
+	if dev {
+		keys = "DEV KEYS"
+	}
+	base := strings.TrimSuffix(filepath.Base(*uki), ".efi")
+	// sign signs the approved policy for one policyRef and embeds it.
+	sign := func(ref, ekHex, outPath, espName string, n int) {
+		etmp := filepath.Join(tmp, fmt.Sprintf("epoch-%d", n))
+		if err := os.MkdirAll(etmp, 0o700); err != nil {
+			die("%v", err)
+		}
+		name, err := epochName(*pub, ref, etmp)
+		if err != nil {
+			die("epoch index name: %v", err)
+		}
+		approved, err := tpmpolicy.Approved(pol, *epoch, name)
+		if err != nil {
+			die("%v", err)
+		}
+		h := sha256.Sum256(tpmpolicy.SignedMessage(approved, ref))
+		signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, h[:])
+		if err != nil {
+			die("%v", err)
+		}
+		doc := tpmpolicy.File{Version: 2, Role: *role, Profile: *profile, Epoch: *epoch, PCR11Policy: hex.EncodeToString(pol),
+			Approved: hex.EncodeToString(approved), Ref: ref, Signature: base64.StdEncoding.EncodeToString(signature), DevKeys: dev, EK: ekHex}
+		b, _ := json.MarshalIndent(doc, "", "  ")
+		if err := os.WriteFile(outPath, append(b, '\n'), 0o644); err != nil {
+			die("%v", err)
+		}
+		fmt.Printf("enclave-sign-policy: %s: phase %s proven, ref %s, epoch %d, %s, approved %x\n", filepath.Base(*uki), phase, ref, *epoch, keys, approved)
+		if *image != "" {
+			if err := embed(*image, outPath, espName); err != nil {
+				die("embedding into %s: %v", *image, err)
+			}
+			fmt.Printf("enclave-sign-policy: embedded as ESP:/EFI/enclave/policy/%s\n", espName)
+		}
+	}
+	if *ekCerts != "" {
+		files, _ := filepath.Glob(filepath.Join(*ekCerts, "*"))
+		sort.Strings(files)
+		for _, f := range files {
+			if err := embedAt(*image, f, "ekcert", filepath.Base(f)); err != nil {
+				die("embedding %s into %s: %v", f, *image, err)
+			}
+			fmt.Printf("enclave-sign-policy: EK certificate embedded as ESP:/EFI/enclave/ekcert/%s\n", filepath.Base(f))
+		}
+	}
+	sign(ref, "", *out, base+".json", 0)
+	for i, name := range admitted {
+		short := hex.EncodeToString(name[2:10])
+		sign(tpmpolicy.RefEK(ref, name), hex.EncodeToString(name), strings.TrimSuffix(*out, ".json")+".ek-"+short+".json", base+".ek-"+short+".json", i+1)
+	}
+}

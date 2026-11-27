@@ -1,8 +1,8 @@
 // Package tpmpolicy holds the TPM 2.0 policy arithmetic and the signed
 // "approved policy" file shared by the build-time signer
-// (cmd/enklave-sign-policy) and the runtime (internal/varauth).
+// (cmd/enclave-sign-policy) and the runtime (internal/varauth).
 //
-// An enklave UKI of role R, profile P (prod|test) and security epoch N comes
+// An enclave UKI of role R, profile P (prod|test) and security epoch N comes
 // with one signed approved policy:
 //
 //	approved = PolicyNV(E, operandB = bit N, offset 0, TPM_EO_BITCLEAR)
@@ -31,8 +31,8 @@ import (
 )
 
 const (
-	// RefPrefix is the versioned prefix of every enklave policyRef.
-	RefPrefix = "enklave-var-v1"
+	// RefPrefix is the versioned prefix of every enclave policyRef.
+	RefPrefix = "enclave-var-v1"
 	// MaxEpoch is the highest epoch representable in the 64-bit E index.
 	MaxEpoch = 63
 
@@ -128,7 +128,7 @@ func Approved(pcr11Policy []byte, epoch int, epochName []byte) ([]byte, error) {
 }
 
 // File is the signed approved policy shipped next to the UKI on the ESP
-// (/EFI/enklave/policy/<uki>.json). Only approved||ref is covered by the
+// (/EFI/enclave/policy/<uki>.json). Only approved||ref is covered by the
 // TPM-verified signature; role, profile and epoch are bound because the
 // runtime recomputes approved and ref from its own, verity-protected values.
 type File struct {
@@ -186,7 +186,7 @@ func SignedMessage(approved []byte, ref string) []byte {
 }
 
 // Release is the verity-protected release metadata in
-// /usr/lib/enklave/release.json.
+// /usr/lib/enclave/release.json.
 type Release struct {
 	Epoch     int `json:"epoch"`
 	HealBelow int `json:"heal_below"` // /var provisioned under an epoch < HealBelow is rekeyed

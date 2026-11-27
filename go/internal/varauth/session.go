@@ -17,8 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"enklave.local/base/internal/ekcert"
-	"enklave.local/base/internal/tpmpolicy"
+	"enclave.local/base/internal/ekcert"
+	"enclave.local/base/internal/tpmpolicy"
 )
 
 // PCR selections of the PCR-bound part of policy P.
@@ -86,7 +86,7 @@ func (t *tpm) pause(step string) {
 	if t.id.Profile != "test" || t.pauseAt != step {
 		return
 	}
-	msg := "enklave-varauth: TEST PAUSE at " + step + "\n"
+	msg := "enclave-varauth: TEST PAUSE at " + step + "\n"
 	os.Stderr.WriteString(msg)
 	if f, err := os.OpenFile("/dev/ttyS0", os.O_WRONLY, 0); err == nil {
 		f.WriteString(msg)
@@ -252,18 +252,18 @@ func (t *tpm) loadPolicies(espDev string) error {
 	}
 	defer t.r.Run("umount", t.c.espMount()) //nolint:errcheck
 	if t.id.Profile == "test" {
-		if b, err := os.ReadFile(filepath.Join(t.c.espMount(), "EFI/enklave/test-pause")); err == nil {
+		if b, err := os.ReadFile(filepath.Join(t.c.espMount(), "EFI/enclave/test-pause")); err == nil {
 			t.pauseAt = strings.TrimSpace(string(b))
 			// Verify runs as a separate process (test profile only)
 			if err := os.WriteFile(filepath.Join(t.c.RunDir, "test-pause"), b, 0o600); err != nil {
 				return err
 			}
 		}
-		if _, err := os.Stat(filepath.Join(t.c.espMount(), "EFI/enklave/test-skip-bridge-check")); err == nil {
+		if _, err := os.Stat(filepath.Join(t.c.espMount(), "EFI/enclave/test-skip-bridge-check")); err == nil {
 			t.skipBridgeCheck = true
 		}
 		// models firmware whose event log is unusable (B7 proof)
-		if _, err := os.Stat(filepath.Join(t.c.espMount(), "EFI/enklave/test-no-eventlog")); err == nil {
+		if _, err := os.Stat(filepath.Join(t.c.espMount(), "EFI/enclave/test-no-eventlog")); err == nil {
 			t.c.EventLog = filepath.Join(t.c.RunDir, "test-no-eventlog")
 		}
 	}
@@ -296,7 +296,7 @@ func (t *tpm) loadPolicies(espDev string) error {
 // EKCertDir is where EK certificates fetched from the TPM vendor are placed
 // on the ESP (G5), for TPMs that do not carry their certificate in NV
 // (Intel PTT and AMD fTPM publish it through a web service keyed by the EK).
-const EKCertDir = "EFI/enklave/ekcert"
+const EKCertDir = "EFI/enclave/ekcert"
 
 // copyEKCerts copies those certificates to /run for the later steps of this
 // boot. They are untrusted input: only the vendor signature counts.
@@ -1112,7 +1112,7 @@ func (t *tpm) rotate() error {
 // TPMs without an EK certificate in NV (run it on the device, or on the host
 // against a virtual TPM); it needs an empty endorsement auth.
 func EKNames(c Config, r Runner) ([]string, error) {
-	work, err := os.MkdirTemp("", "enklave-ek-")
+	work, err := os.MkdirTemp("", "enclave-ek-")
 	if err != nil {
 		return nil, err
 	}
@@ -1194,7 +1194,7 @@ func ReadDA(r Runner) (DAState, error) {
 // key makes the TPM count every power loss without TPM2_Shutdown as a failed
 // authorization, and anyone can add failures by sending wrong authValues.
 // In lockout the TPM refuses salted sessions, so a few power cuts would make
-// the device fail closed. No enklave secret depends on the lockout: every
+// the device fail closed. No enclave secret depends on the lockout: every
 // authValue is 256 bits of entropy and every index is NO_DA. It runs before
 // the first salted session of every boot; a policy session on the lockout
 // hierarchy works while the TPM is in lockout.
@@ -1214,7 +1214,7 @@ func (t *tpm) disableDA(policy bool) error {
 	if d.Interval != 0 {
 		// keep the other parameters; some TPMs restrict their range
 		if err := lockout("-s", "-n", strconv.FormatUint(d.MaxTries, 10), "-t", "0", "-l", strconv.FormatUint(d.Recovery, 10)); err != nil {
-			fmt.Fprintf(os.Stderr, "enklave-varauth: warning: this TPM does not allow disabling its dictionary-attack lockout: %v\n", err)
+			fmt.Fprintf(os.Stderr, "enclave-varauth: warning: this TPM does not allow disabling its dictionary-attack lockout: %v\n", err)
 		}
 	}
 	if d.Counter != 0 || d.InLockout {
@@ -1257,14 +1257,14 @@ func (t *tpm) checkSignature(f tpmpolicy.File) error {
 	return err
 }
 
-// ForeignObjects lists TPM objects that enklave does not account for. The
+// ForeignObjects lists TPM objects that enclave does not account for. The
 // dictionary-attack lockout is disabled, which is sound only while nothing
-// in the TPM is protected by a guessable authValue: every enklave object is
+// in the TPM is protected by a guessable authValue: every enclave object is
 // NO_DA with a 256-bit or empty-and-policy-only authorization, the
 // hierarchies have random 256-bit authValues, and the only other objects
 // allowed are the vendor's EK certificates and keys (TCG-reserved ranges,
 // no secret authValue) and the storage root key systemd creates at
-// 0x81000001 (empty authValue by design, protects nothing of enklave's).
+// 0x81000001 (empty authValue by design, protects nothing of enclave's).
 func ForeignObjects(r Runner) ([]string, error) {
 	nv, err := DefinedIndices(r)
 	if err != nil {

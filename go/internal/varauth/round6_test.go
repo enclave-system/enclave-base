@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"enklave.local/base/internal/sbstate"
-	"enklave.local/base/internal/sbstate/sbtest"
+	"enclave.local/base/internal/sbstate"
+	"enclave.local/base/internal/sbstate/sbtest"
 )
 
 func (e *env) secretReads(from int) int {
@@ -190,8 +190,8 @@ func TestTransitionEnforcedByTPM(t *testing.T) {
 			e.later()
 			e.shipDbx(t, "dbx-epoch0.auth", revoked)
 			e.mustBoot(t, "pending")
-			os.MkdirAll(filepath.Join(e.c.espMount(), "EFI/enklave"), 0o700)
-			os.WriteFile(filepath.Join(e.c.espMount(), "EFI/enklave/test-skip-bridge-check"), nil, 0o600)
+			os.MkdirAll(filepath.Join(e.c.espMount(), "EFI/enclave"), 0o700)
+			os.WriteFile(filepath.Join(e.c.espMount(), "EFI/enclave/test-skip-bridge-check"), nil, 0o600)
 			mut(e)
 			n := len(e.f.calls)
 			wantErr(t, e.boot(t), "tpm2_policyor: TPM_RC_VALUE")
@@ -200,7 +200,7 @@ func TestTransitionEnforcedByTPM(t *testing.T) {
 			}
 			// the two bound states still work with the checks off
 			e.fw.Vars[dbxVar] = append(sbtest.ESL(older), sbtest.ESL(revoked)...)
-			e.fw.SecureBoot, e.fw.Authority, e.pcr7 = 1, []byte("enklave db certificate"), nil
+			e.fw.SecureBoot, e.fw.Authority, e.pcr7 = 1, []byte("enclave db certificate"), nil
 			e.fw.Vars["db-"+sbstate.GUIDSecurity] = sbtest.NewFirmware().Vars["db-"+sbstate.GUIDSecurity]
 			e.mustBoot(t, "current (1 update")
 		})
@@ -211,7 +211,7 @@ func TestTransitionEnforcedByTPM(t *testing.T) {
 	e.later()
 	e.shipDbx(t, "dbx-epoch0.auth", revoked)
 	e.mustBoot(t, "pending")
-	os.WriteFile(filepath.Join(e.c.espMount(), "EFI/enklave/test-skip-bridge-check"), nil, 0o600)
+	os.WriteFile(filepath.Join(e.c.espMount(), "EFI/enclave/test-skip-bridge-check"), nil, 0o600)
 	e.fw.SecureBoot = 0
 	wantErr(t, e.boot(t), "is none of them")
 	// V lists exactly two states while the update is pending
@@ -395,7 +395,7 @@ func TestForeignObjectsFailClosed(t *testing.T) {
 			mut(e)
 			e.f.daInterval, e.f.daCounter = 1000, 2 // someone re-enabled the lockout parameters
 			n := len(e.f.calls)
-			wantErr(t, e.boot(t), "objects that are not enklave's")
+			wantErr(t, e.boot(t), "objects that are not enclave's")
 			for _, c := range e.f.calls[n:] {
 				if strings.HasPrefix(c, "tpm2_dictionarylockout") {
 					t.Fatal("lockout touched although a foreign object exists")
@@ -409,7 +409,7 @@ func TestForeignObjectsFailClosed(t *testing.T) {
 	// first boot on a TPM that holds a foreign persistent key: not enrolled
 	e := newEnv(t, "prod")
 	foreignKey(e)
-	wantErr(t, e.boot(t), "objects that are not enklave's")
+	wantErr(t, e.boot(t), "objects that are not enclave's")
 	if e.f.h["o"].auth != "" || len(e.f.luks[e.dev]) != 0 {
 		t.Error("TPM locked or volume created")
 	}

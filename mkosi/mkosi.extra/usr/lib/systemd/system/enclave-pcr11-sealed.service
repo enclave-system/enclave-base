@@ -1,0 +1,20 @@
+# Runtime assert (independent of systemd-pcrphase-sysinit's conditions): PCR
+# 11 must have left the only signed phase (enter-initrd:leave-initrd) before
+# the system proceeds, so neither the volume key nor the TPM administration
+# policy can be satisfied any more. Production: power off otherwise.
+[Unit]
+Description=Assert that PCR 11 left the signed boot phase
+DefaultDependencies=no
+After=systemd-pcrphase-sysinit.service sysinit.target
+Before=basic.target shutdown.target
+Conflicts=shutdown.target
+FailureAction=poweroff-force
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardError=journal+console
+ExecStart=/usr/lib/enclave/enclave-varauth sealed
+
+[Install]
+RequiredBy=basic.target

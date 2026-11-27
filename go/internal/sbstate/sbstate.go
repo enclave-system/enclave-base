@@ -205,7 +205,7 @@ func StateDigest(evs []Event, updated []string, add map[string][]Signature) ([]b
 		upd[v] = true
 	}
 	h := sha256.New()
-	fmt.Fprintf(h, "enklave-sb-state-v1\x00%d\x00", len(evs))
+	fmt.Fprintf(h, "enclave-sb-state-v1\x00%d\x00", len(evs))
 	for _, e := range evs {
 		fmt.Fprintf(h, "%08x\x00", e.Type)
 		if e.Var == "" || !upd[e.Var] {

@@ -1,0 +1,29 @@
+# Open /var with the key from the TPM NV secret (enclave-varauth): readable
+# only by an unrevoked, signed enclave UKI in the phase enter-initrd:leave-initrd
+# with Secure Boot (PCR 7) and a clean PCR 12; read-locked afterwards. The
+# volume key is measured into PCR 15. First boot: format and provision.
+# Production: any failure powers the machine off.
+[Unit]
+Description=Unlock /var
+DefaultDependencies=no
+IgnoreOnIsolate=true
+Requires=enclave-var-repart.service
+After=enclave-var-repart.service cryptsetup-pre.target systemd-udevd-kernel.socket systemd-udev-trigger.service
+Wants=tpm2.target
+After=tpm2.target
+Before=cryptsetup.target blockdev@dev-mapper-var.target umount.target systemd-pcrmachine.service systemd-pcrphase-sysinit.service
+Wants=blockdev@dev-mapper-var.target
+Conflicts=umount.target
+FailureAction=poweroff-force
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+KeyringMode=shared
+OOMScoreAdjust=500
+# first boot formats a 1 GiB volume with integrity (device wipe, ~15 s); a
+# hang powers the machine off instead of waiting forever
+TimeoutSec=600
+StandardError=journal+console
+ExecStart=/usr/lib/enclave/var-unlock
+ExecStop=/usr/lib/systemd/systemd-cryptsetup detach var

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Build a hardened enklave kernel flavor as a Debian package.
+# Build a hardened enclave kernel flavor as a Debian package.
 #
 # Usage: build-kernel.sh <client|server> <pki-dir> <out-dir>
 #
-# Result: <out-dir>/linux-image-enklave-<flavor>_<kver>_amd64.deb
+# Result: <out-dir>/linux-image-enclave-<flavor>_<kver>_amd64.deb
 # (a copy of the bindeb-pkg image package, which is natively named
-# linux-image-<kver>-enklave-<flavor>), plus the native debs.
+# linux-image-<kver>-enclave-<flavor>), plus the native debs.
 # Exits non-zero if the tarball signature or check_config.py fails; the config
 # check runs BEFORE the long compile.
 #
-# Env: CONFIG_ONLY=1 (stop after the config check), ENKLAVE_CACHE (default ~/enklave-cache), ENKLAVE_BUILD_ROOT
-# (default ~/enklave-kbuild), JOBS (default 4).
+# Env: CONFIG_ONLY=1 (stop after the config check), ENCLAVE_CACHE (default ~/enclave-cache), ENCLAVE_BUILD_ROOT
+# (default ~/enclave-kbuild), JOBS (default 4).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,8 +30,8 @@ done
 ver="$(tr -d '[:space:]' < "$here/VERSION")"
 [[ "$ver" =~ ^6\.12\.[0-9]+$ ]] || die "VERSION must be 6.12.y, got '$ver'"
 
-cache="${ENKLAVE_CACHE:-$HOME/enklave-cache}/kernel"
-broot="${ENKLAVE_BUILD_ROOT:-$HOME/enklave-kbuild}"
+cache="${ENCLAVE_CACHE:-$HOME/enclave-cache}/kernel"
+broot="${ENCLAVE_BUILD_ROOT:-$HOME/enclave-kbuild}"
 jobs="${JOBS:-4}"
 mkdir -p "$cache" "$broot"
 
@@ -80,10 +80,10 @@ make x86_64_defconfig
 KCONFIG_CONFIG=.config scripts/kconfig/merge_config.sh -m .config \
     "$here/config/common.config" "$here/config/$flavor.config"
 
-cat "$pki/modsign/modsign.crt" "$pki/verity/verity.crt" > "$src/enklave-trusted-keys.pem"
+cat "$pki/modsign/modsign.crt" "$pki/verity/verity.crt" > "$src/enclave-trusted-keys.pem"
 scripts/config --set-str MODULE_SIG_KEY "$pki/modsign/modsign.pem"
-scripts/config --set-str SYSTEM_TRUSTED_KEYS "$src/enklave-trusted-keys.pem"
-scripts/config --set-str LOCALVERSION "-enklave-$flavor"
+scripts/config --set-str SYSTEM_TRUSTED_KEYS "$src/enclave-trusted-keys.pem"
+scripts/config --set-str LOCALVERSION "-enclave-$flavor"
 scripts/config --disable LOCALVERSION_AUTO
 make olddefconfig
 
@@ -94,20 +94,20 @@ python3 "$here/check_config.py" .config "$here/rules/common.rules" "$here/rules/
 [ -z "${CONFIG_ONLY:-}" ] || { echo "CONFIG_ONLY set: stopping after config check"; exit 0; }
 
 # --- Build ----------------------------------------------------------------
-export KBUILD_BUILD_USER=enklave KBUILD_BUILD_HOST=enklave-builder
-export DEBEMAIL=build@enklave.invalid DEBFULLNAME="enklave kernel build"
+export KBUILD_BUILD_USER=enclave KBUILD_BUILD_HOST=enclave-build
+export DEBEMAIL=build@enclave.invalid DEBFULLNAME="enclave kernel build"
 make -j"$jobs" bindeb-pkg
 
 # --- Collect --------------------------------------------------------------
 # Re-check the .config that was actually packaged.
 python3 "$here/check_config.py" .config "$here/rules/common.rules" "$here/rules/$flavor.rules" \
     || die "final config rules FAILED"
-cp -f .config "$out/config-$ver-enklave-$flavor"
+cp -f .config "$out/config-$ver-enclave-$flavor"
 
-rm -f "$out"/linux-image-enklave-"$flavor"_*.deb
+rm -f "$out"/linux-image-enclave-"$flavor"_*.deb
 shopt -s nullglob
-native=("$broot"/linux-image-"$ver"*-enklave-"$flavor"_*_amd64.deb)
+native=("$broot"/linux-image-"$ver"*-enclave-"$flavor"_*_amd64.deb)
 [ ${#native[@]} -eq 1 ] || die "expected exactly one native image deb, found ${#native[@]}"
-cp -f "$broot"/linux-*"$ver"*-enklave-"$flavor"*.deb "$out"/ 2>/dev/null || true
-cp -f "${native[0]}" "$out/linux-image-enklave-${flavor}_${ver}_amd64.deb"
-echo "Built: $out/linux-image-enklave-${flavor}_${ver}_amd64.deb"
+cp -f "$broot"/linux-*"$ver"*-enclave-"$flavor"*.deb "$out"/ 2>/dev/null || true
+cp -f "${native[0]}" "$out/linux-image-enclave-${flavor}_${ver}_amd64.deb"
+echo "Built: $out/linux-image-enclave-${flavor}_${ver}_amd64.deb"

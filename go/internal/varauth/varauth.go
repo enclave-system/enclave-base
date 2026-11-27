@@ -1,8 +1,8 @@
 // Package varauth creates, unlocks, authenticates and heals the encrypted
-// persistent state volume (mounted at /var/lib/enklave).
+// persistent state volume (mounted at /var/lib/enclave).
 //
 // The volume is LUKS2 (aes-xts-plain64 512-bit, hmac-sha256 integrity,
-// argon2id) with a 64-byte random key S held in TPM NV index S. All enklave
+// argon2id) with a 64-byte random key S held in TPM NV index S. All enclave
 // NV indices and the owner, endorsement and lockout hierarchies are governed
 // by policy P:
 //
@@ -19,7 +19,7 @@
 // PolicyAuthorize needs the release's signed approved policy (package
 // tpmpolicy): PCR 11 in enter-initrd:leave-initrd of that very UKI and its
 // security epoch not revoked in the bits index E. So only an unrevoked
-// enklave UKI of the same role and profile, under the recorded Secure Boot
+// enclave UKI of the same role and profile, under the recorded Secure Boot
 // state, without ESP credentials, before sysinit, can read S or administer
 // the TPM. No administrative secret exists: hierarchy authValues are random
 // and discarded, the platform hierarchy is disabled from the OS, Clear is
@@ -46,8 +46,8 @@ import (
 	"strings"
 	"time"
 
-	"enklave.local/base/internal/sbstate"
-	"enklave.local/base/internal/tpmpolicy"
+	"enclave.local/base/internal/sbstate"
+	"enclave.local/base/internal/tpmpolicy"
 )
 
 // Runner runs external commands and returns stdout.
@@ -88,7 +88,7 @@ type Index struct {
 	Final  uint32
 }
 
-// The NV indices (owner range; "E" for enklave).
+// The NV indices (owner range; "E" for enclave).
 var (
 	// Record: PCR 15 of the authentic volume, provisioning epoch, salt key Name.
 	Record = Index{"record", "0x01800E01", recordSize,
@@ -154,23 +154,23 @@ type Config struct {
 // DefaultConfig returns the paths used on the image.
 func DefaultConfig() Config {
 	return Config{
-		RunDir:      "/run/enklave",
+		RunDir:      "/run/enclave",
 		PubKey:      "/run/systemd/tpm2-pcr-public-key.pem",
-		PolicyDir:   "EFI/enklave/policy",
-		RoleFile:    "/usr/lib/enklave/role",
-		TestMarker:  "/usr/lib/enklave/test-profile",
-		ReleaseFile: "/usr/lib/enklave/release.json",
-		StateRoot:   "/var/lib/enklave",
-		EKCADir:     "/usr/share/enklave/tpm-ek-ca",
-		EKTestCADir: "/usr/share/enklave/tpm-ek-ca-test",
-		WritersDir:  "/usr/lib/enklave/state-writers.d",
-		UpdatesDir:  "/usr/lib/enklave/efi-updates",
+		PolicyDir:   "EFI/enclave/policy",
+		RoleFile:    "/usr/lib/enclave/role",
+		TestMarker:  "/usr/lib/enclave/test-profile",
+		ReleaseFile: "/usr/lib/enclave/release.json",
+		StateRoot:   "/var/lib/enclave",
+		EKCADir:     "/usr/share/enclave/tpm-ek-ca",
+		EKTestCADir: "/usr/share/enclave/tpm-ek-ca-test",
+		WritersDir:  "/usr/lib/enclave/state-writers.d",
+		UpdatesDir:  "/usr/lib/enclave/efi-updates",
 		EventLog:    "/sys/kernel/security/tpm0/binary_bios_measurements",
 		EFI:         sbstate.EFIVarFS{Dir: "/sys/firmware/efi/efivars"},
 		Now:         time.Now,
 		Sys:         "/sys",
-		StatusDir:   "/run/enklave-status",
-		ConfigPub:   "/usr/share/enklave/keys/config-signing.pub",
+		StatusDir:   "/run/enclave-status",
+		ConfigPub:   "/usr/share/enclave/keys/config-signing.pub",
 	}
 }
 
@@ -528,7 +528,7 @@ func LockPlatform(c Config, r Runner) (string, error) {
 		_, err := r.Run("tpm2_hierarchycontrol", "-C", "p", "phEnable", "clear")
 		switch {
 		case err == nil:
-			state = "disabled-by-enklave"
+			state = "disabled-by-enclave"
 		case isAuthFailure(err):
 			state = "firmware-auth" // platform auth set by firmware, unusable from the OS
 		default:

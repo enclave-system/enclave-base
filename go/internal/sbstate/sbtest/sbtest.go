@@ -114,9 +114,9 @@ const (
 	guidSecurity = "d719b2cb-3d3a-4596-a3bc-dad00e67656f"
 )
 
-// NewFirmware returns a Secure Boot configuration with enklave-like keys.
+// NewFirmware returns a Secure Boot configuration with enclave-like keys.
 func NewFirmware() *Firmware {
-	return &Firmware{SecureBoot: 1, Authority: []byte("enklave db certificate"), Vars: map[string][]byte{
+	return &Firmware{SecureBoot: 1, Authority: []byte("enclave db certificate"), Vars: map[string][]byte{
 		"PK-" + guidGlobal: ESL(sha256Of("pk")), "KEK-" + guidGlobal: ESL(sha256Of("kek")),
 		"db-" + guidSecurity: ESL(sha256Of("db")), "dbx-" + guidSecurity: nil,
 	}}

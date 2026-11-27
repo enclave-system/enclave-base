@@ -1,5 +1,5 @@
 // Package statefs is the authenticated, rollback-protected persistent state
-// store on the encrypted /var/lib/enklave volume.
+// store on the encrypted /var/lib/enclave volume.
 //
 // dm-integrity authenticates each sector but not its version: an attacker
 // with the disk could splice older ciphertext sectors back in. Therefore
@@ -11,7 +11,7 @@
 //
 // Layout below Root:
 //
-//	data/            the state (consumers read it at /var/lib/enklave/data)
+//	data/            the state (consumers read it at /var/lib/enclave/data)
 //	.manifest        current manifest (JSON with MAC)
 //	.manifest.next   prepared manifest of an in-flight commit
 //	.staging/        prepared data tree of an in-flight commit
@@ -94,7 +94,7 @@ func (s *Store) mac(m Manifest) []byte {
 		Entries []Entry `json:"entries"`
 	}{m.Version, m.Entries})
 	h := hmac.New(sha256.New, s.Key)
-	h.Write([]byte("enklave-state-manifest-v1\x00"))
+	h.Write([]byte("enclave-state-manifest-v1\x00"))
 	h.Write(body)
 	return h.Sum(nil)
 }

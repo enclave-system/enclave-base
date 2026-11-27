@@ -1,6 +1,6 @@
 // Package ekcert authenticates a TPM's endorsement key (EK).
 //
-// The EK is the key every enklave session is salted to. Its public area is
+// The EK is the key every enclave session is salted to. Its public area is
 // never taken on trust from the TPM bus: it is rebuilt locally from the
 // TCG default EK template and the public key of the TPM's EK certificate,
 // which must chain to a TPM vendor CA shipped in the verity-protected /usr

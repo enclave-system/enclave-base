@@ -1,0 +1,19 @@
+[Unit]
+Description=Power off unless UEFI Secure Boot is enabled
+DefaultDependencies=no
+After=sys-firmware-efi-efivars.mount
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+# The test profile replaces this condition and the command (log only).
+ConditionPathExists=!/usr/lib/enclave/test-profile
+# require-secureboot powers off itself if SecureBoot != 1 (and retries
+# forever); FailureAction is the second line of defense.
+FailureAction=poweroff-force
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/enclave/require-secureboot
+
+[Install]
+WantedBy=sysinit.target

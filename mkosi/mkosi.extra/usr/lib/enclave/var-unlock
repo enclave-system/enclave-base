@@ -1,0 +1,53 @@
+#!/bin/sh
+# Resolve the "enclave-var" partition and the ESP on the disk that carries the
+# verity-protected /usr (partitions with that label on other disks are
+# ignored) and hand them to enclave-varauth. Fails closed unless exactly one
+# of each exists on that disk.
+set -eu
+VAR_TYPE=4d21b016-b534-45c2-a9fb-5c16e091fd2d   # GPT type "var"
+ESP_TYPE=c12a7328-f81f-11d2-ba4b-00a0c93ec93b   # GPT type ESP
+LABEL=enclave-var
+die() { echo "enclave-var-unlock: $*" >&2; exit 1; }
+
+usr_dm=""
+for d in /sys/class/block/dm-*; do
+    [ "$(cat "$d/dm/name" 2>/dev/null)" = usr ] && { usr_dm="$d"; break; }
+done
+[ -n "$usr_dm" ] || die "no device-mapper device 'usr'"
+disk=""
+for s in "$usr_dm"/slaves/*; do
+    [ -e "$s" ] || die "/dev/mapper/usr has no backing devices"
+    part="$(readlink -f "$s")"
+    [ -e "$part/partition" ] || die "${part##*/} is not a partition"
+    d="$(basename "$(dirname "$part")")"
+    [ -z "$disk" ] || [ "$disk" = "$d" ] || die "/usr spans several disks ($disk, $d)"
+    disk="$d"
+done
+
+dev=""; esp=""
+for _ in $(seq 60); do
+    udevadm settle --timeout=5 || true
+    dev=""; esp=""; nv=0; ne=0
+    for p in /sys/class/block/"$disk"/*/partition; do
+        [ -e "$p" ] || continue
+        name="$(basename "$(dirname "$p")")"
+        props="$(udevadm info --query=property --name="/dev/$name" 2>/dev/null || true)"
+        plabel="$(printf '%s\n' "$props" | sed -n 's/^ID_PART_ENTRY_NAME=//p')"
+        ptype="$(printf '%s\n' "$props" | sed -n 's/^ID_PART_ENTRY_TYPE=//p' | tr 'A-F' 'a-f')"
+        if [ "$plabel" = "$LABEL" ] && [ "$ptype" = "$VAR_TYPE" ]; then
+            dev="/dev/$name"; nv=$((nv + 1))
+        fi
+        if [ "$ptype" = "$ESP_TYPE" ]; then
+            esp="/dev/$name"; ne=$((ne + 1))
+        fi
+    done
+    [ "$nv" -le 1 ] || die "$nv partitions labelled $LABEL on /dev/$disk"
+    [ "$ne" -le 1 ] || die "$ne ESPs on /dev/$disk"
+    [ -z "$dev" ] || [ -z "$esp" ] || break
+    sleep 1
+done
+[ -n "$dev" ] || die "no $LABEL partition on /dev/$disk"
+[ -n "$esp" ] || die "no ESP on /dev/$disk"
+
+echo "enclave-var-unlock: using $dev (ESP $esp) on /dev/$disk" >&2
+exec /usr/lib/enclave/enclave-varauth unlock "$dev" "$esp"

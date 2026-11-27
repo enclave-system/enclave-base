@@ -12,7 +12,7 @@ import pytest
 # mkfs.vfat lives in /usr/sbin, not on the PATH of unprivileged users on Debian
 os.environ["PATH"] += ":/usr/sbin:/sbin"
 
-TOOL = Path(__file__).resolve().parent.parent / "enklave-pki"
+TOOL = Path(__file__).resolve().parent.parent / "enclave-pki"
 
 DIRS = ["sb", "verity", "modsign", "config", "ca", "update", "pcr"]
 FILES = [
@@ -109,7 +109,7 @@ def make_esp(path, efi):
     run("mcopy", "-i", path, efi, "::/EFI/BOOT/BOOTX64.EFI")
     # the shell runs startup.nsh and prints a marker, then powers off
     nsh = Path(str(path) + ".nsh")
-    nsh.write_text("echo ENKLAVE-SHELL-RAN\nreset -s\n")
+    nsh.write_text("echo ENCLAVE-SHELL-RAN\nreset -s\n")
     run("mcopy", "-i", path, nsh, "::/startup.nsh")
 
 
@@ -128,7 +128,7 @@ def boot(vars_fd, esp, log, timeout=90):
     while time.time() < deadline and p.poll() is None:
         time.sleep(2)
         out = Path(log).read_text(errors="replace") if Path(log).exists() else ""
-        if "ENKLAVE-SHELL-RAN" in out:
+        if "ENCLAVE-SHELL-RAN" in out:
             break
     p.kill()
     p.wait()
@@ -154,8 +154,8 @@ def test_ovmf_vars_secureboot_user_mode(tmp_path):
         shutil.copy(vars_fd, v)
         results[name] = boot(v, esp, tmp_path / f"{name}.log", timeout=90 if name == "signed" else 45)
 
-    assert "ENKLAVE-SHELL-RAN" in results["signed"], results["signed"][-2000:]
-    assert "ENKLAVE-SHELL-RAN" not in results["unsigned"], results["unsigned"][-2000:]
+    assert "ENCLAVE-SHELL-RAN" in results["signed"], results["signed"][-2000:]
+    assert "ENCLAVE-SHELL-RAN" not in results["unsigned"], results["unsigned"][-2000:]
 
 
 def test_init_leaves_no_temp_files(tmp_path):

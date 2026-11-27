@@ -1,0 +1,20 @@
+# Authenticate the opened /var before it is mounted (enclave-varauth verify):
+#  - PCR 15 (volume key measurement) must equal the write-locked NV record
+#  - every NV index must have its pinned public area and policy
+#  - anti-rollback: the counter file in /var must equal the TPM NV counter
+#    (or counter+1 after an interrupted update); both are advanced
+#  - TPM hierarchies locked (random owner/lockout/endorsement auth, Clear disabled)
+[Unit]
+Description=Authenticate /var (TPM record, anti-rollback, hierarchy lock)
+DefaultDependencies=no
+Requires=enclave-var-unlock.service
+After=enclave-var-unlock.service enclave-var-repart.service tpm2.target
+Before=var-lib-enclave.mount local-fs.target systemd-pcrmachine.service systemd-pcrphase-sysinit.service shutdown.target
+Conflicts=shutdown.target
+FailureAction=poweroff-force
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardError=journal+console
+ExecStart=/usr/lib/enclave/enclave-varauth verify

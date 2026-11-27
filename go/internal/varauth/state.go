@@ -17,24 +17,24 @@ import (
 	"sync"
 	"syscall"
 
-	"enklave.local/base/internal/bundle"
-	"enklave.local/base/internal/statefs"
+	"enclave.local/base/internal/bundle"
+	"enclave.local/base/internal/statefs"
 )
 
 // The state service (B8, G4) is the only writer of the state volume and the
 // only holder of the state keys at runtime.
 //
-//   - The unlock step leaves the derived keys in /run/enklave/state.key for
+//   - The unlock step leaves the derived keys in /run/enclave/state.key for
 //     the verify step and this service. The service reads and deletes the
 //     file when it starts, ordered before local-fs.target, so no other
 //     service ever sees it.
 //   - A commit is not "run this command": the caller names a WRITER, and the
 //     command of a writer is fixed in the verity-protected image
-//     (/usr/lib/enklave/state-writers.d/<id>.json).
+//     (/usr/lib/enclave/state-writers.d/<id>.json).
 //   - What a commit can put into the state does not depend on who triggers
 //     it. Each writer declares its input:
 //     "none": the writer gets no input from the caller at all.
-//     "signed-bundle": the caller's input must be an enklave bundle signed
+//     "signed-bundle": the caller's input must be an enclave bundle signed
 //     with the config-signing key, for this role, with a version higher
 //     than the last one this writer accepted. The service verifies all
 //     of that before it runs the writer, and records the accepted
@@ -64,7 +64,7 @@ const maxInput = 64 << 20
 type Writer struct {
 	ID    string   `json:"-"`
 	Unit  string   `json:"unit"`  // systemd unit the caller must run in
-	Exec  []string `json:"exec"`  // command; "{}" and $ENKLAVE_STATE_DIR are the staged copy
+	Exec  []string `json:"exec"`  // command; "{}" and $ENCLAVE_STATE_DIR are the staged copy
 	Input string   `json:"input"` // none, signed-bundle (unverified: test profile only)
 }
 
@@ -295,7 +295,7 @@ func (s *StateServer) Handle(req StateRequest, cgroup string, stdin *os.File) St
 				a[i] = strings.ReplaceAll(x, "{}", staging)
 			}
 			cmd := exec.Command(a[0], a[1:]...)
-			cmd.Env = append(os.Environ(), "ENKLAVE_STATE_DIR="+staging)
+			cmd.Env = append(os.Environ(), "ENCLAVE_STATE_DIR="+staging)
 			cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 			if w.Input != InputBundle {
 				if stdin != nil {
@@ -326,8 +326,8 @@ func (s *StateServer) Handle(req StateRequest, cgroup string, stdin *os.File) St
 					return err
 				}
 			}
-			cmd.Env = append(cmd.Env, "ENKLAVE_INPUT_BUNDLE="+filepath.Join(dir, "bundle"), "ENKLAVE_INPUT_SIG="+filepath.Join(dir, "bundle.sig"),
-				"ENKLAVE_INPUT_VERSION="+strconv.FormatUint(m.Version, 10))
+			cmd.Env = append(cmd.Env, "ENCLAVE_INPUT_BUNDLE="+filepath.Join(dir, "bundle"), "ENCLAVE_INPUT_SIG="+filepath.Join(dir, "bundle.sig"),
+				"ENCLAVE_INPUT_VERSION="+strconv.FormatUint(m.Version, 10))
 			cmd.Stdin = bytes.NewReader(in)
 			if err := cmd.Run(); err != nil {
 				return err

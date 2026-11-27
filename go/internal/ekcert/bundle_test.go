@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-// bundleDir is the TPM vendor CA bundle shipped in /usr/share/enklave/tpm-ek-ca.
-const bundleDir = "../../../mkosi/mkosi.extra/usr/share/enklave/tpm-ek-ca"
+// bundleDir is the TPM vendor CA bundle shipped in /usr/share/enclave/tpm-ek-ca.
+const bundleDir = "../../../mkosi/mkosi.extra/usr/share/enclave/tpm-ek-ca"
 
 // The shipped bundle must load and every vendor must contribute trust
 // anchors (a parser or bundle problem would otherwise only show on real

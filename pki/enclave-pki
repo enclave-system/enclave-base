@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# enclave-pki: offline key generation for the enclave ecosystem.
+#
+#   enclave-pki init [--dev] <dir>         generate the complete PKI into a NEW directory
+#                                          (--dev: mark it DEV-KEYS; only test images
+#                                          may be signed with it)
+#   enclave-pki ovmf-vars <dir> <out.fd>   build an OVMF VARS file (PK/KEK/db enrolled,
+#                                          Secure Boot user mode, no Microsoft keys)
+#   enclave-pki ek-test-ca <dir>           (DEV-KEYS PKI only) create <dir>/ek-test-ca, the
+#                                          CA that certifies the endorsement keys of
+#                                          emulated test TPMs: swtpm_setup --tpm2 --config
+#                                          <dir>/ek-test-ca/swtpm_setup.conf --create-ek-cert
+#                                          Only test-profile images trust this CA.
+#
+# Keeping <dir> offline and protected is the operator's responsibility.
+set -euo pipefail
+umask 077
+
+DAYS=3650
+OVMF_VARS_TEMPLATE="${OVMF_VARS_TEMPLATE:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
+
+tmp=""
+cleanup() {
+    if [ -n "$tmp" ] && [ -d "$tmp" ]; then
+        gpgconf --homedir "$tmp/gnupg" --kill all 2>/dev/null || true
+        rm -rf "$tmp"
+    fi
+}
+die() { echo "enclave-pki: $*" >&2; exit 1; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+# selfsigned <keyfile> <crtfile> <CN> <genpkey args...> -- <extra -addext args...>
+selfsigned() {
+    local key="$1" crt="$2" cn="$3"; shift 3
+    local -a alg=() ext=()
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do alg+=("$1"); shift; done
+    [ "${1:-}" = "--" ] && shift
+    ext=("$@")
+    openssl genpkey "${alg[@]}" -out "$key"
+    openssl req -x509 -new -sha256 -days "$DAYS" -subj "/CN=$cn/O=enclave" \
+        -key "$key" -out "$crt" "${ext[@]}"
+    chmod 600 "$key"; chmod 644 "$crt"
+}
+
+# efi_auth <name> <signer-name> : sb/<name>.auth, signed by sb/<signer>
+efi_auth() {
+    local name="$1" signer="$2" guid
+    guid="$(cat sb/GUID)"
+    cert-to-efi-sig-list -g "$guid" "sb/$name.crt" "sb/$name.esl"
+    sign-efi-sig-list -g "$guid" -k "sb/$signer.key" -c "sb/$signer.crt" \
+        "$name" "sb/$name.esl" "sb/$name.auth"
+    rm -f "sb/$name.esl"
+}
+
+cmd_init() {
+    local dev=0
+    if [ "${1:-}" = "--dev" ]; then dev=1; shift; fi
+    [ "$#" -eq 1 ] || usage
+    local dir="$1"
+    [ ! -e "$dir" ] || die "$dir already exists; refusing to overwrite"
+    mkdir -p "$(dirname "$dir")"
+    mkdir -m 700 "$dir"
+    if [ "$dev" = 1 ]; then
+        echo 'enclave development PKI: only test-profile images may be signed with it' > "$dir/DEV-KEYS"
+    fi
+    cd "$dir"
+    local d
+    for d in sb verity modsign config ca update pcr; do mkdir -m 700 "$d"; done
+    tmp="$(mktemp -d)"
+    trap cleanup EXIT
+
+    # Secure Boot: GUID once, then PK / KEK / db
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid > sb/GUID
+    else
+        uuidgen > sb/GUID
+    fi
+    local n
+    for n in PK KEK db; do
+        selfsigned "sb/$n.key" "sb/$n.crt" "enclave Secure Boot $n" \
+            -algorithm RSA -pkeyopt rsa_keygen_bits:2048
+    done
+    efi_auth PK PK
+    efi_auth KEK PK
+    efi_auth db KEK
+
+    # dm-verity root hash signing
+    selfsigned verity/verity.key verity/verity.crt "enclave dm-verity" \
+        -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -- \
+        -addext "keyUsage=critical,digitalSignature" -addext "basicConstraints=critical,CA:FALSE"
+
+    # kernel module signing (CONFIG_MODULE_SIG_KEY: key + cert in one PEM)
+    selfsigned modsign/modsign.key.tmp modsign/modsign.crt "enclave kernel module signing" \
+        -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -- \
+        -addext "keyUsage=critical,digitalSignature" -addext "basicConstraints=critical,CA:FALSE"
+    cat modsign/modsign.key.tmp modsign/modsign.crt > modsign/modsign.pem
+    rm -f modsign/modsign.key.tmp
+    chmod 600 modsign/modsign.pem
+
+    # CA
+    selfsigned ca/ca.key ca/ca.crt "enclave CA" -algorithm EC -pkeyopt ec_paramgen_curve:P-384 \
+        -pkeyopt ec_param_enc:named_curve -- \
+        -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+    # config signing: Ed25519, raw like Go ed25519.PrivateKey (seed||pub) and raw pub
+    openssl genpkey -algorithm ed25519 -out "$tmp/ed.pem"
+    openssl pkey -in "$tmp/ed.pem" -outform DER | tail -c 32 > "$tmp/seed"
+    openssl pkey -in "$tmp/ed.pem" -pubout -outform DER | tail -c 32 > config/config-signing.pub
+    cat "$tmp/seed" config/config-signing.pub > config/config-signing.key
+    chmod 600 config/config-signing.key; chmod 644 config/config-signing.pub
+
+    # sysupdate SHA256SUMS.gpg key, no passphrase, throwaway GNUPGHOME
+    mkdir -m 700 "$tmp/gnupg"
+    export GNUPGHOME="$tmp/gnupg"
+    gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
+        --quick-generate-key "enclave update signing <update@enclave.invalid>" ed25519 sign never
+    gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
+        --export-secret-keys > update/update.gpg
+    gpg --batch --quiet --export > update/update.pub.gpg
+    chmod 600 update/update.gpg; chmod 644 update/update.pub.gpg
+    unset GNUPGHOME
+
+    # PCR-11 policy signing key (RSA-2048)
+    openssl genrsa -out pcr/pcr-signing.key 2048 2>/dev/null
+    openssl rsa -in pcr/pcr-signing.key -pubout -out pcr/pcr-signing.pub 2>/dev/null
+    chmod 600 pcr/pcr-signing.key; chmod 644 pcr/pcr-signing.pub
+
+    echo "PKI created in $dir. Keep it offline; back it up securely."
+}
+
+cmd_ovmf_vars() {
+    [ "$#" -eq 2 ] || usage
+    local dir="$1" out="$2" guid
+    [ -r "$dir/sb/GUID" ] || die "$dir is not an enclave PKI directory"
+    [ -r "$OVMF_VARS_TEMPLATE" ] || die "OVMF VARS template not found: $OVMF_VARS_TEMPLATE"
+    guid="$(cat "$dir/sb/GUID")"
+    virt-fw-vars -i "$OVMF_VARS_TEMPLATE" \
+        --set-pk "$guid" "$dir/sb/PK.crt" \
+        --add-kek "$guid" "$dir/sb/KEK.crt" \
+        --add-db "$guid" "$dir/sb/db.crt" \
+        --sb --no-microsoft -o "$out"
+}
+
+# CA for the EK certificates of emulated TPMs (VM tests). swtpm_localca
+# creates it on first use; its private keys stay in <dir>/ek-test-ca.
+cmd_ek_test_ca() {
+    [ "$#" -eq 1 ] || usage
+    local dir="$1" ca
+    [ -r "$dir/sb/GUID" ] || die "$dir is not an enclave PKI directory"
+    [ -e "$dir/DEV-KEYS" ] || die "$dir has no DEV-KEYS marker: a test TPM CA must never exist next to production keys"
+    dir="$(cd "$dir" && pwd)"
+    ca="$dir/ek-test-ca"
+    [ ! -e "$ca" ] || die "$ca already exists"
+    command -v swtpm_setup >/dev/null || die "swtpm_setup not found (package swtpm-tools)"
+    command -v swtpm_localca >/dev/null || die "swtpm_localca not found (package swtpm-tools)"
+    mkdir -m 700 "$ca"
+    printf '%s\n' "statedir = $ca" "signingkey = $ca/signkey.pem" "issuercert = $ca/issuercert.pem" \
+        "certserial = $ca/certserial" > "$ca/swtpm-localca.conf"
+    printf '%s\n' "--platform-manufacturer enclave-test" "--platform-version 1" "--platform-model swtpm" \
+        > "$ca/swtpm-localca.options"
+    printf '%s\n' "create_certs_tool=$(command -v swtpm_localca)" "create_certs_tool_config=$ca/swtpm-localca.conf" \
+        "create_certs_tool_options=$ca/swtpm-localca.options" > "$ca/swtpm_setup.conf"
+    tmp="$(mktemp -d)"
+    trap cleanup EXIT
+    mkdir "$tmp/tpm"
+    swtpm_setup --tpm2 --tpmstate "$tmp/tpm" --config "$ca/swtpm_setup.conf" \
+        --create-ek-cert --lock-nvram > /dev/null
+    [ -s "$ca/issuercert.pem" ] && [ -s "$ca/swtpm-localca-rootca-cert.pem" ] \
+        || die "swtpm_localca did not create the CA"
+    chmod 600 "$ca/signkey.pem" "$ca/swtpm-localca-rootca-privkey.pem"
+    chmod 644 "$ca/issuercert.pem" "$ca/swtpm-localca-rootca-cert.pem"
+    echo "Test TPM CA created in $ca (development only)."
+}
+
+case "${1:-}" in
+    init) shift; cmd_init "$@" ;;
+    ek-test-ca) shift; cmd_ek_test_ca "$@" ;;
+    ovmf-vars) shift; cmd_ovmf_vars "$@" ;;
+    *) usage ;;
+esac

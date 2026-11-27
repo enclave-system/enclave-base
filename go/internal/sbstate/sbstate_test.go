@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"enklave.local/base/internal/sbstate/sbtest"
+	"enclave.local/base/internal/sbstate/sbtest"
 )
 
 func hash(s string) []byte { h := sha256.Sum256([]byte(s)); return h[:] }

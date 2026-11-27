@@ -24,13 +24,13 @@ import (
 	"testing"
 	"time"
 
-	"enklave.local/base/internal/bundle"
-	"enklave.local/base/internal/ekcert"
-	"enklave.local/base/internal/sbstate/sbtest"
-	"enklave.local/base/internal/tpmpolicy"
+	"enclave.local/base/internal/bundle"
+	"enclave.local/base/internal/ekcert"
+	"enclave.local/base/internal/sbstate/sbtest"
+	"enclave.local/base/internal/tpmpolicy"
 )
 
-// fakeTPM models the TPM objects and policy semantics enklave relies on.
+// fakeTPM models the TPM objects and policy semantics enclave relies on.
 // Policy digests are computed as a chain like on a real TPM (with fake
 // primitives, except PolicyNV which uses the real formula), so a session
 // satisfies an object only if it reproduces that object's authPolicy.
@@ -820,7 +820,7 @@ func signedInput(t *testing.T, key ed25519.PrivateKey, role string, version uint
 	return f
 }
 
-const configCgroup = "/system.slice/enklave-config.service"
+const configCgroup = "/system.slice/enclave-config.service"
 
 func refOf(role, profile string) string { r, _ := tpmpolicy.Ref(role, profile); return r }
 
@@ -860,7 +860,7 @@ func signedRef(t *testing.T, pcr11 []byte, epoch int, role, profile, ref string)
 func newEnv(t *testing.T, profile string) *env {
 	d := t.TempDir()
 	c := Config{
-		RunDir: filepath.Join(d, "run"), PubKey: filepath.Join(d, "pub.pem"), PolicyDir: "EFI/enklave/policy",
+		RunDir: filepath.Join(d, "run"), PubKey: filepath.Join(d, "pub.pem"), PolicyDir: "EFI/enclave/policy",
 		RoleFile: filepath.Join(d, "usr/role"), TestMarker: filepath.Join(d, "usr/test-profile"),
 		ReleaseFile: filepath.Join(d, "usr/release.json"), StateRoot: filepath.Join(d, "run", "statecheck"), // the fake "mount" is the check mount point
 		EKCADir: filepath.Join(d, "usr/tpm-ek-ca"), EKTestCADir: filepath.Join(d, "usr/tpm-ek-ca-test"),
@@ -879,7 +879,7 @@ func newEnv(t *testing.T, profile string) *env {
 	e.c.EFI = e.fw
 	os.MkdirAll(c.WritersDir, 0o755)
 	os.WriteFile(filepath.Join(c.WritersDir, "config.json"),
-		[]byte(`{"unit":"enklave-config.service","input":"signed-bundle","exec":["/bin/sh","-c","tar -xzOf \"$ENKLAVE_INPUT_BUNDLE\" files/config > \"$ENKLAVE_STATE_DIR/config\""]}`), 0o644)
+		[]byte(`{"unit":"enclave-config.service","input":"signed-bundle","exec":["/bin/sh","-c","tar -xzOf \"$ENCLAVE_INPUT_BUNDLE\" files/config > \"$ENCLAVE_STATE_DIR/config\""]}`), 0o644)
 	os.MkdirAll(filepath.Join(c.EKCADir, "Vendor/RootCA"), 0o755)
 	os.MkdirAll(filepath.Dir(c.EventLog), 0o755)
 	os.WriteFile(filepath.Join(c.EKCADir, "Vendor/RootCA/ca.cer"), vendorCA().cert.Raw, 0o644)

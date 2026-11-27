@@ -16,8 +16,8 @@ systemctl --root="$root" mask \
 systemctl --root="$root" enable apparmor.service nftables.service
 
 # /etc is volatile (factory copy); the ruleset itself lives in /usr.
-ln -sfn ../usr/lib/enklave/nftables.conf "$root/etc/nftables.conf"
-mkdir -p "$root/usr/lib/enklave/nft.d"
+ln -sfn ../usr/lib/enclave/nftables.conf "$root/etc/nftables.conf"
+mkdir -p "$root/usr/lib/enclave/nft.d"
 
-# Secure Boot guard: enklave-selftest dispatches on argv[0].
-ln -sfn enklave-selftest "$root/usr/lib/enklave/require-secureboot"
+# Secure Boot guard: enclave-selftest dispatches on argv[0].
+ln -sfn enclave-selftest "$root/usr/lib/enclave/require-secureboot"

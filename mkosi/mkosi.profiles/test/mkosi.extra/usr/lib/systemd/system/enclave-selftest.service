@@ -1,0 +1,12 @@
+[Unit]
+Description=enclave security self-test (test profile)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/enclave/enclave-selftest --out /dev/ttyS0
+
+[Install]
+# Not multi-user.target: a target is ordered after the units it wants, which
+# would form a cycle with After=multi-user.target. default.target = graphical.target.
+WantedBy=graphical.target

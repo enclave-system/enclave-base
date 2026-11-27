@@ -1,0 +1,15 @@
+# Test profile only: after boot, try to read the /var key from the TPM the way
+# root in the running system would (signed approved policy, authorized
+# session). Must be refused: PCR 11 has left the signed phase and the NV
+# secret is read-locked.
+[Unit]
+Description=Probe: /var key must not be readable after boot (test profile)
+After=enclave-selftest.service
+Before=enclave-test-marker.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'last=$(/usr/lib/enclave/enclave-varauth probe 2>/dev/null | tail -n 1); case "$last" in refused:*) r=ok ;; *) r=BAD ;; esac; echo "enclave-test-unseal-probe: $r: $last" > /dev/ttyS0'
+
+[Install]
+WantedBy=graphical.target

@@ -8,7 +8,7 @@
 #
 # Delivery: put the file into the EFI_UPDATES directory of the NEXT release
 # (make EFI_UPDATES=<dir> SECURITY_EPOCH=<n+1> ...). That release carries it in
-# its verity-protected /usr/lib/enklave/efi-updates/ and applies it itself on
+# its verity-protected /usr/lib/enclave/efi-updates/ and applies it itself on
 # its first boot. A dbx change alters PCR 7; the release moves the state
 # volume's Secure Boot binding across the update on each device (two boots, no
 # re-provisioning, no data loss; README "Secure Boot variable

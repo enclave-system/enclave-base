@@ -1,0 +1,61 @@
+#!/bin/sh
+# Test profile only (B8, G4): what root can and cannot do with the state
+# service.
+#
+# Refused because of who calls:
+#  1. the image's writer "test-record", called from this (other) unit,
+#  2. the same from a transient unit started with systemd-run,
+#  3. the same from a cgroup that root created and named like the reserved
+#     unit (the full cgroup path counts, not its last component),
+#  4. a writer that the image does not define.
+# Refused because of what is passed, although this unit IS the one the
+# writer "test-signed" is reserved for:
+#  5. input that is not a signed bundle,
+#  6. a correctly signed bundle whose version is not newer than the accepted
+#     one (ESP:/EFI/enclave/test-bundle, if the test put one there: the first
+#     call of the first boot accepts it, every later call must refuse it).
+# Also: the state keys must be gone from /run, and a verified read works for
+# any root caller.
+V=/usr/lib/enclave/enclave-varauth
+r="ok"
+say() { echo "enclave-test-state-auth: $*" > /dev/ttyS0; }
+try() { # <label> <command...>: the command must fail
+    label="$1"; shift
+    if out=$("$@" 2>&1 < /dev/null); then r="BAD: $label succeeded"; fi
+    last="$(printf '%s' "$out" | tail -n 1)"
+    say "$label -> ${last#*FAILED: }"
+}
+try "writer test-record from enclave-test-state-auth.service" $V state-exec test-record
+try "writer test-record from a transient unit (systemd-run)" systemd-run --quiet --wait --pipe --collect $V state-exec test-record
+fake=/sys/fs/cgroup/fake/enclave-test-marker.service
+if mkdir -p "$fake" 2>/dev/null; then
+    try "writer test-record from the fake cgroup /fake/enclave-test-marker.service" \
+        sh -c "echo \$\$ > $fake/cgroup.procs && exec $V state-exec test-record"
+else
+    say "fake cgroup: could not create $fake"; r="BAD: fake cgroup not created"
+fi
+try "writer not defined by the image" $V state-exec sh
+
+# 5: unsigned input from the reserved unit
+if out=$(head -c 300 /dev/urandom | $V state-exec test-signed 2>&1); then r="BAD: unsigned input accepted"; fi
+say "writer test-signed from its own unit with unsigned input -> $(printf '%s' "$out" | tail -n 1 | sed 's/.*FAILED: //')"
+# 6: signed bundle, version must rise
+esp=/run/enclave-test-esp-auth
+mkdir -p "$esp"
+if mount -t vfat -o nosuid,nodev,noexec /dev/disk/by-partlabel/esp "$esp" 2>/dev/null; then
+    cp "$esp/EFI/enclave/test-bundle" /run/enclave-test-bundle 2>/dev/null || true
+    umount "$esp"
+fi
+if [ -s /run/enclave-test-bundle ]; then
+    out=$($V state-exec test-signed < /run/enclave-test-bundle 2>&1) && first="accepted" || first="refused"
+    say "writer test-signed with the signed bundle from the ESP, first call of this boot -> $first: $(printf '%s' "$out" | tail -n 1 | sed 's/.*FAILED: //')"
+    if out=$($V state-exec test-signed < /run/enclave-test-bundle 2>&1); then r="BAD: the same signed bundle was accepted twice"; fi
+    say "the same signed bundle again -> $(printf '%s' "$out" | tail -n 1 | sed 's/.*FAILED: //')"
+    say "accepted input version in the state: $($V state-read signed-input.version 2>&1 | tail -n 1)"
+fi
+
+# G9: the status of the Secure Boot updates is readable for every local user
+say "status file: $(ls -l /run/enclave-status/secure-boot-updates.json 2>&1 | cut -d" " -f1,3) $(cat /run/enclave-status/secure-boot-updates.json 2>&1)"
+if [ -e /run/enclave/state.key ]; then r="BAD: state keys readable in /run"; fi
+if ! $V state-status > /dev/null 2>&1; then r="BAD: state-status failed"; fi
+say "$r: state keys in /run: $(ls /run/enclave/state.key 2>/dev/null || echo none); $($V state-status 2>&1 | tail -n 1)"
