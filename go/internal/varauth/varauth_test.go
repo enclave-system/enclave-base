@@ -2,6 +2,8 @@ package varauth
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
@@ -157,7 +159,7 @@ func TestAttacksAfterProvisioning(t *testing.T) {
 			e.install(t, p)
 		}, "signature rejected"},
 		{"test-profile UKI on prod state", func(t *testing.T, e *env) { e.setImage(t, "ref", "test", 0, 0) }, "authPolicy"},
-		{"other role UKI", func(t *testing.T, e *env) { e.setImage(t, "client", "prod", 0, 0) }, "authPolicy"},
+		{"other role UKI", func(t *testing.T, e *env) { e.setImage(t, "gateway", "prod", 0, 0) }, "authPolicy"},
 		{"epoch revoked", func(t *testing.T, e *env) {
 			binary.BigEndian.PutUint64(e.f.nv[handleNum(Epoch.Handle)].data, 1)
 		}, "revoked"},
@@ -169,7 +171,7 @@ func TestAttacksAfterProvisioning(t *testing.T) {
 			k, _ := ekcert.FromPublicKey(&newEKKey().PublicKey)
 			e.f.pers[handleNum(SaltHandle)] = k.TPM2B()
 		}, "is not the authenticated key of this TPM"},
-		{"EK certificate removed", func(t *testing.T, e *env) { e.f.setEKCert(nil) }, "no signed per-device admission"},
+		{"EK certificate removed", func(t *testing.T, e *env) { e.f.setEKCert(nil) }, "production release accepts only endorsement keys certified by a TPM vendor"},
 		{"transition index rewritten", func(t *testing.T, e *env) {
 			e.f.nv[handleNum(Transition.Handle)].policy = nil
 		}, "authPolicy"},
@@ -676,8 +678,8 @@ func TestDbxUpdate(t *testing.T) {
 		if readFile(filepath.Join(e.c.stateMount(), "data/config")) != "kept across the dbx update" {
 			t.Error("state lost")
 		}
-		if ts := e.f.nv[handleNum(Transition.Handle)].data; ts[64] != 0 {
-			t.Errorf("transition index not idle after completion: state %d", ts[64])
+		if ts := e.f.nv[handleNum(Transition.Handle)].data; !bytes.Equal(ts, make([]byte, Transition.Size)) {
+			t.Errorf("transition index not empty after completion: %x", ts)
 		}
 		final := append([]byte{}, e.vDigest()...)
 		e.mustBoot(t, "current (1 update")
@@ -757,28 +759,28 @@ func TestDbxUpdate(t *testing.T) {
 		}
 		e.mustBoot(t, "blocked")
 	})
-	// attacks while the transition is open: nothing but the same boot chain
-	// with an unchanged Secure Boot configuration (plus the signed update)
-	// may complete it
+	// attacks while the transition is open: nothing but the Secure Boot state
+	// before the update, or exactly that state plus the signed update, is
+	// accepted. Index V lists those exact PCR 7 values (G3), so every other
+	// state is refused before any policy session is tried.
+	const none = "is none of them"
 	for name, tc := range map[string]struct {
 		mut  func(e *env)
 		want string
 	}{
-		"secure boot disabled":       {func(e *env) { e.fw.SecureBoot = 0 }, "neither the state before the update"},
-		"db key enrolled":            {func(e *env) { e.fw.Vars["db-"+sbstate.GUIDSecurity] = []byte("attacker") }, "neither the state before the update"},
-		"other signing authority":    {func(e *env) { e.fw.Authority = []byte("attacker cert") }, "neither the state before the update"},
-		"additional authority":       {func(e *env) { e.fw.Extra = []sbtest.Ev{{PCR: 7, Type: 0x800000E0, Data: []byte("x")}} }, "neither the state before the update"},
-		"other boot loader (PCR 4)":  {func(e *env) { e.f.pcr[4] = bytes.Repeat([]byte{0x44}, 32) }, "Secure Boot configuration, firmware or boot chain changed"},
-		"other firmware (PCR 0)":     {func(e *env) { e.f.pcr[0] = bytes.Repeat([]byte{0x40}, 32) }, "Secure Boot configuration, firmware or boot chain changed"},
-		"option ROM/driver (PCR 2)":  {func(e *env) { e.f.pcr[2] = bytes.Repeat([]byte{0x41}, 32) }, "Secure Boot configuration, firmware or boot chain changed"},
-		"ESP credential (PCR 12)":    {func(e *env) { e.f.pcr[12] = bytes.Repeat([]byte{1}, 32) }, "PCR 12"},
-		"transition index cleared":   {func(e *env) { e.f.nv[handleNum(Transition.Handle)].data = make([]byte, Transition.Size) }, "no Secure Boot update is in transit"},
-		"transition index replaced":  {func(e *env) { e.f.nv[handleNum(Transition.Handle)].attrs |= attrPolicyWrite }, "attributes"},
-		"older dbx entry dropped":    {func(e *env) { e.fw.Vars[dbxVar] = sbtest.ESL(revoked) }, "neither the state before the update"},
-		"foreign dbx entry added":    {func(e *env) { e.fw.Vars[dbxVar] = sbtest.ESL(older, revoked, bytes.Repeat([]byte{9}, 32)) }, "neither the state before the update"},
-		"KEK replaced":               {func(e *env) { e.fw.Vars["KEK-"+sbstate.GUIDGlobal] = []byte("attacker") }, "neither the state before the update"},
-		"event log tampered":         {func(e *env) { e.pcr7 = bytes.Repeat([]byte{0x43}, 32) }, "replays PCR 7"},
-		"another UKI (other PCR 11)": {func(e *env) { e.f.pcr[11] = bytes.Repeat([]byte{0x5a}, 32) }, "no signed approved policy"},
+		"secure boot disabled":         {func(e *env) { e.fw.SecureBoot = 0 }, none},
+		"db key enrolled":              {func(e *env) { e.fw.Vars["db-"+sbstate.GUIDSecurity] = []byte("attacker") }, none},
+		"other signing authority":      {func(e *env) { e.fw.Authority = []byte("attacker cert") }, none},
+		"additional authority":         {func(e *env) { e.fw.Extra = []sbtest.Ev{{PCR: 7, Type: 0x800000E0, Data: []byte("x")}} }, none},
+		"ESP credential (PCR 12)":      {func(e *env) { e.f.pcr[12] = bytes.Repeat([]byte{1}, 32) }, "PCR 12"},
+		"transition index cleared":     {func(e *env) { e.f.nv[handleNum(Transition.Handle)].data = make([]byte, Transition.Size) }, "nor a signed variable update in transit"},
+		"transition index replaced":    {func(e *env) { e.f.nv[handleNum(Transition.Handle)].attrs |= attrPolicyWrite }, "attributes"},
+		"older dbx entry dropped":      {func(e *env) { e.fw.Vars[dbxVar] = sbtest.ESL(revoked) }, none},
+		"foreign dbx entry added":      {func(e *env) { e.fw.Vars[dbxVar] = sbtest.ESL(older, revoked, bytes.Repeat([]byte{9}, 32)) }, none},
+		"same entries in other layout": {func(e *env) { e.fw.Vars[dbxVar] = sbtest.ESL(older, revoked) }, none},
+		"KEK replaced":                 {func(e *env) { e.fw.Vars["KEK-"+sbstate.GUIDGlobal] = []byte("attacker") }, none},
+		"event log tampered":           {func(e *env) { e.pcr7 = bytes.Repeat([]byte{0x43}, 32) }, none},
+		"another UKI (other PCR 11)":   {func(e *env) { e.f.pcr[11] = bytes.Repeat([]byte{0x5a}, 32) }, "no signed approved policy"},
 	} {
 		t.Run("pending transition: "+name, func(t *testing.T) {
 			e := start(t, 0)
@@ -977,7 +979,7 @@ func TestEKAdmission(t *testing.T) {
 		}
 	})
 	t.Run("admission signed for another profile", func(t *testing.T) {
-		e := noCert(t, "prod")
+		e := noCert(t, "test")
 		e.install(t, signedRef(t, e.f.pcr[11], 0, "ref", "dev", tpmpolicy.RefEK(refOf("ref", "dev"), e.ekName())))
 		wantErr(t, e.boot(t), "no signed per-device admission")
 	})
@@ -1053,7 +1055,10 @@ func TestDbxRollbackDoesNotReopenBridge(t *testing.T) {
 	e.mustBoot(t, "pending")
 	for i := 0; i < 3; i++ {
 		e.fw.Vars[dbxVar] = sbtest.ESL(older) // SPI flash rolled back
-		e.mustBoot(t, "failed: NOT APPLIED: the firmware lost")
+		e.mustBoot(t, "failed: NOT APPLIED: ")
+		if !strings.Contains(e.updates(), "the firmware lost") || !strings.Contains(e.updates(), "not opened again") {
+			t.Fatalf("round %d: %q", i, e.updates())
+		}
 		if !bytes.Equal(e.vDigest(), steady) {
 			t.Fatalf("round %d: the boot-chain binding is open after a rollback", i)
 		}
@@ -1123,45 +1128,126 @@ func TestStateService(t *testing.T) {
 	}
 	v0 := e.counter()
 	for name, tc := range map[string]struct {
-		req  StateRequest
-		unit string
+		req    StateRequest
+		cgroup string
+		want   string
+	}{
+		"caller in another unit":          {StateRequest{Op: "exec", Writer: "config"}, "/system.slice/evil.service", "not authorized"},
+		"caller outside any unit":         {StateRequest{Op: "exec", Writer: "config"}, "/", "not authorized"},
+		"transient unit of root":          {StateRequest{Op: "exec", Writer: "config"}, "/system.slice/run-u42.service", "not authorized"},
+		"fake cgroup named like the unit": {StateRequest{Op: "exec", Writer: "config"}, "/fake/enklave-config.service", "not authorized"},
+		"cgroup below another unit":       {StateRequest{Op: "exec", Writer: "config"}, "/system.slice/evil.service/enklave-config.service", "not authorized"},
+		"unit name without the slice":     {StateRequest{Op: "exec", Writer: "config"}, "enklave-config.service", "not authorized"},
+		"user slice cgroup of that name":  {StateRequest{Op: "exec", Writer: "config"}, "/user.slice/enklave-config.service", "not authorized"},
+		"writer not in the image":         {StateRequest{Op: "exec", Writer: "sh"}, configCgroup, "unknown state writer"},
+		"unknown operation":               {StateRequest{Op: "key"}, configCgroup, "unknown operation"},
+		"read of a file not in state":     {StateRequest{Op: "read", Path: "../.manifest"}, "/system.slice/x.service", "not exist"},
+		"real unit but no input":          {StateRequest{Op: "exec", Writer: "config"}, configCgroup, "needs a signed bundle"},
+	} {
+		if rep := s.Handle(tc.req, tc.cgroup, nil); rep.OK || !strings.Contains(rep.Error, tc.want) {
+			t.Errorf("%s: %+v, want %q", name, rep, tc.want)
+		}
+	}
+	// G4: from the real unit's cgroup (root can join it), only signed input
+	// for this role with a rising version is accepted
+	_, otherKey, _ := ed25519.GenerateKey(rand.Reader)
+	raw := filepath.Join(t.TempDir(), "raw")
+	os.WriteFile(raw, bytes.Repeat([]byte("forged by root in the unit's cgroup "), 8), 0o600)
+	rawF, _ := os.Open(raw)
+	defer rawF.Close()
+	for name, tc := range map[string]struct {
+		in   *os.File
 		want string
 	}{
-		"caller in another unit":      {StateRequest{Op: "exec", Writer: "config"}, "evil.service", "not authorized"},
-		"caller outside any unit":     {StateRequest{Op: "exec", Writer: "config"}, "", "not authorized"},
-		"transient unit of root":      {StateRequest{Op: "exec", Writer: "config"}, "run-u42.service", "not authorized"},
-		"writer not in the image":     {StateRequest{Op: "exec", Writer: "sh"}, "enklave-config.service", "unknown state writer"},
-		"unknown operation":           {StateRequest{Op: "key"}, "enklave-config.service", "unknown operation"},
-		"read of a file not in state": {StateRequest{Op: "read", Path: "../.manifest"}, "x.service", "not exist"},
+		"unsigned input":        {rawF, "input refused"},
+		"signed with other key": {signedInput(t, otherKey, "ref", 5, "x"), "input refused"},
+		"bundle for other role": {signedInput(t, configKey(), "client", 5, "x"), `bundle is for role "client"`},
+		"version 0":             {signedInput(t, configKey(), "ref", 0, "x"), "not newer"},
 	} {
-		if rep := s.Handle(tc.req, tc.unit, nil); rep.OK || !strings.Contains(rep.Error, tc.want) {
+		if rep := s.Handle(StateRequest{Op: "exec", Writer: "config"}, configCgroup, tc.in); rep.OK || !strings.Contains(rep.Error, tc.want) {
 			t.Errorf("%s: %+v, want %q", name, rep, tc.want)
 		}
 	}
 	if e.counter() != v0 {
 		t.Fatal("a refused request changed the state")
 	}
-	e.commit(t, "config", "hello")
-	rep := s.Handle(StateRequest{Op: "read", Path: "config"}, "any-reader.service", nil)
+	e.commit(t, "config", "hello") // version 1
+	rep := s.Handle(StateRequest{Op: "read", Path: "config"}, "/system.slice/any-reader.service", nil)
 	if !rep.OK || string(rep.Data) != "hello" || rep.Version != v0+1 || rep.Counter != v0+1 {
 		t.Fatalf("verified read: %+v", rep)
+	}
+	// replay of the accepted version and of an older one: refused, nothing changes
+	e.cfgVersion = 5
+	e.commit(t, "config", "five") // version 6
+	for _, v := range []uint64{6, 1, 3} {
+		if rep := s.Handle(StateRequest{Op: "exec", Writer: "config"}, configCgroup, signedInput(t, configKey(), "ref", v, "old")); rep.OK || !strings.Contains(rep.Error, "not newer than the accepted version 6") {
+			t.Errorf("version %d after 6: %+v", v, rep)
+		}
+	}
+	if rep := s.Handle(StateRequest{Op: "read", Path: "config"}, "/", nil); !rep.OK || string(rep.Data) != "five" || rep.Counter != v0+2 {
+		t.Fatalf("after refused replays: %+v", rep)
+	}
+	// the accepted version survives a reboot (it is part of the authenticated state)
+	if err := e.boot(t); err != nil {
+		t.Fatal(err)
+	}
+	s = e.state(t)
+	if rep := s.Handle(StateRequest{Op: "exec", Writer: "config"}, configCgroup, signedInput(t, configKey(), "ref", 6, "old")); rep.OK || !strings.Contains(rep.Error, "not newer") {
+		t.Errorf("replay after reboot: %+v", rep)
 	}
 	// a write that bypassed the service (root remounted the volume) is
 	// detected by the next read, not only at the next boot
 	os.WriteFile(filepath.Join(e.c.stateMount(), "data/config"), []byte("forged"), 0o644)
-	if rep := s.Handle(StateRequest{Op: "read", Path: "config"}, "any-reader.service", nil); rep.OK || !strings.Contains(rep.Error, "manifest") {
+	if rep := s.Handle(StateRequest{Op: "read", Path: "config"}, "/system.slice/any-reader.service", nil); rep.OK || !strings.Contains(rep.Error, "manifest") {
 		t.Errorf("forged content served: %+v", rep)
 	}
-	if rep := s.Handle(StateRequest{Op: "exec", Writer: "config"}, "enklave-config.service", nil); rep.OK {
+	if rep := s.Handle(StateRequest{Op: "exec", Writer: "config"}, configCgroup, signedInput(t, configKey(), "ref", 9, "x")); rep.OK {
 		t.Error("commit on top of forged content")
 	}
-	// writer definitions: only .service units and absolute commands
-	bad := t.TempDir()
-	os.WriteFile(filepath.Join(bad, "x.json"), []byte(`{"unit":"../x","exec":["sh"]}`), 0o644)
-	if _, err := LoadWriters(bad); err == nil {
-		t.Error("malformed writer accepted")
+}
+
+// G4: writer definitions. Only .service units, absolute commands, and a
+// declared, verifiable input; "unverified" exists in the test profile only.
+func TestWriterDefinitions(t *testing.T) {
+	def := func(body string) string {
+		d := t.TempDir()
+		os.WriteFile(filepath.Join(d, "x.json"), []byte(body), 0o644)
+		return d
 	}
-	if w, err := LoadWriters(filepath.Join(bad, "none")); err != nil || len(w) != 0 {
+	for name, tc := range map[string]struct {
+		body string
+		test bool
+		ok   bool
+	}{
+		"relative unit":              {`{"unit":"../x","exec":["/bin/sh"],"input":"none"}`, false, false},
+		"relative command":           {`{"unit":"x.service","exec":["sh"],"input":"none"}`, false, false},
+		"no input declaration":       {`{"unit":"x.service","exec":["/bin/sh"]}`, false, false},
+		"no input declaration test":  {`{"unit":"x.service","exec":["/bin/sh"]}`, true, false},
+		"unverified outside test":    {`{"unit":"x.service","exec":["/bin/sh"],"input":"unverified"}`, false, false},
+		"unverified in test profile": {`{"unit":"x.service","exec":["/bin/sh"],"input":"unverified"}`, true, true},
+		"no input":                   {`{"unit":"x.service","exec":["/bin/sh"],"input":"none"}`, false, true},
+		"signed bundle":              {`{"unit":"x.service","exec":["/bin/sh"],"input":"signed-bundle"}`, false, true},
+	} {
+		if _, err := LoadWriters(def(tc.body), tc.test); (err == nil) != tc.ok {
+			t.Errorf("%s: err = %v, want ok = %v", name, err, tc.ok)
+		}
+	}
+	if w, err := LoadWriters(filepath.Join(t.TempDir(), "none"), false); err != nil || len(w) != 0 {
 		t.Errorf("image without writers: %v %v", w, err)
+	}
+	// a writer with input "none" never sees the caller's input
+	e := newEnv(t, "prod")
+	os.WriteFile(filepath.Join(e.c.WritersDir, "tick.json"),
+		[]byte(`{"unit":"tick.service","input":"none","exec":["/bin/sh","-c","cat > \"$ENKLAVE_STATE_DIR/tick\"; echo tick >> \"$ENKLAVE_STATE_DIR/tick\""]}`), 0o644)
+	if err := e.boot(t); err != nil {
+		t.Fatal(err)
+	}
+	e.later()
+	s := e.state(t)
+	if rep := s.Handle(StateRequest{Op: "exec", Writer: "tick"}, "/system.slice/tick.service", signedInput(t, configKey(), "ref", 1, "smuggled")); !rep.OK {
+		t.Fatal(rep.Error)
+	}
+	if rep := s.Handle(StateRequest{Op: "read", Path: "tick"}, "/", nil); !rep.OK || string(rep.Data) != "tick\n" {
+		t.Errorf("writer with input none consumed caller input: %+v %q", rep, rep.Data)
 	}
 }

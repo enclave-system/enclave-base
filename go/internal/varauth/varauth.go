@@ -116,12 +116,12 @@ var (
 		attrOwnerWrite | attrAuthRead | attrNoDA,
 		attrOwnerWrite | attrAuthRead | attrNoDA | attrWritten}
 
-	// Transition (T): state of a Secure Boot variable update in progress,
-	// written through the owner hierarchy only (under P): the digest of the
-	// Secure Boot state before the update, the digest of the only state the
-	// update may lead to, and a state byte (idle, armed, applied, rolled
-	// back). It is read before the volume key is released.
-	Transition = Index{"transition", "0x01800E06", 72,
+	// Transition (T): record of signed Secure Boot variable updates, written
+	// through the owner hierarchy only (under P): the exact Secure Boot
+	// states index V admits while an update is in transit, and the monotonic
+	// per-update record (layout: verify.go). It is read before the volume key
+	// is released.
+	Transition = Index{"transition", "0x01800E06", 496,
 		attrOwnerWrite | attrAuthRead | attrNoDA,
 		attrOwnerWrite | attrAuthRead | attrNoDA | attrWritten}
 
@@ -146,6 +146,9 @@ type Config struct {
 	EventLog    string // TCG event log of this boot
 	EFI         sbstate.Vars
 	Now         func() time.Time
+	Sys         string // sysfs (IOMMU check)
+	StatusDir   string // world-readable status files for the console
+	ConfigPub   string // config-signing public key (signed writer input)
 }
 
 // DefaultConfig returns the paths used on the image.
@@ -165,6 +168,9 @@ func DefaultConfig() Config {
 		EventLog:    "/sys/kernel/security/tpm0/binary_bios_measurements",
 		EFI:         sbstate.EFIVarFS{Dir: "/sys/firmware/efi/efivars"},
 		Now:         time.Now,
+		Sys:         "/sys",
+		StatusDir:   "/run/enklave-status",
+		ConfigPub:   "/usr/share/enklave/keys/config-signing.pub",
 	}
 }
 
@@ -185,6 +191,7 @@ func (c Config) espMount() string    { return filepath.Join(c.RunDir, "esp") }
 func (c Config) stateMount() string  { return filepath.Join(c.RunDir, "statecheck") }
 func (c Config) keyFile() string     { return filepath.Join(c.RunDir, "var.key") }
 func (c Config) policyCache() string { return filepath.Join(c.RunDir, "policy.json") }
+func (c Config) ekCertDir() string   { return filepath.Join(c.RunDir, "ekcert") }
 
 // CreatedFlag is written by Repart when systemd-repart created the partition.
 func (c Config) CreatedFlag() string { return filepath.Join(c.RunDir, "var-created") }
@@ -247,6 +254,9 @@ func LoadIdentity(c Config) (Identity, error) {
 		return id, err
 	}
 	if id.Ref, err = tpmpolicy.Ref(id.Role, id.Profile); err != nil {
+		return id, err
+	}
+	if err := tpmpolicy.CheckRoleRelease(id.Role, id.Profile, id.Release); err != nil {
 		return id, err
 	}
 	return id, id.Release.Validate()

@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
@@ -22,39 +23,42 @@ import (
 
 // PCR selections of the PCR-bound part of policy P.
 const (
-	selSteady = "sha256:7,12"     // recorded Secure Boot state, no ESP credentials
-	selBridge = "sha256:0,2,4,12" // firmware and boot chain, during a PCR 7 transition
+	selSteady = "sha256:7,12" // exact Secure Boot state, no ESP credentials
 
 	modeSteady = "steady"
 	modeBridge = "transition"
 )
 
-var (
-	pcrsSteady = []int{7, 12}
-	pcrsBridge = []int{0, 2, 4, 12}
-)
+var pcrsSteady = []int{7, 12}
 
 type tpm struct {
 	c  Config
 	r  Runner
 	id Identity
 
-	// policy is P; plit and pbridge are the PCR-bound digests V may hold for
-	// the PCR values of this boot; b1 is V's authPolicy.
-	pcr11, policy, pe, pc, b1, plit, pbridge []byte
-	epoch                                    int
-	ready                                    bool
-	mode                                     string      // which digest V holds (pcrMode)
-	salt                                     *ekcert.Key // authenticated salt key
-	saltSource                               string
-	pauseAt                                  string
+	// policy is P; plit is the PCR-bound digest of this boot (PolicyAuthorize
+	// + PolicyPCR(7,12)): V holds it, or, while a signed Secure Boot update is
+	// in transit, a PolicyOR over a list of such digests that includes it
+	// (branches). b1 is V's authPolicy.
+	pcr11, policy, pe, pc, b1, plit []byte
+	branches                        [][]byte
+	// test profile only: skip the software checks of a pending transition,
+	// to show that the TPM refuses on its own (G3 proof)
+	skipBridgeCheck bool
+	epoch           int
+	ready           bool
+	mode            string      // which digest V holds (pcrMode)
+	salt            *ekcert.Key // authenticated salt key
+	saltSource      string
+	pauseAt         string
 
-	ref    string                    // policyRef of this device (setRef)
-	av     []byte                    // PolicyAuthValue digest
-	files  map[string]tpmpolicy.File // signed policies of the running UKI by ref (ESP)
-	raw    map[string][]byte
-	ekName []byte       // Name of the authenticated endorsement key (chooseEK)
-	ekAlgs []ekcert.Alg // its algorithm (both when only the Name is known)
+	ref      string                    // policyRef of this device (setRef)
+	av       []byte                    // PolicyAuthValue digest
+	files    map[string]tpmpolicy.File // signed policies of the running UKI by ref (ESP)
+	raw      map[string][]byte
+	accepted []certifiedEK // vendor-certified endorsement keys this boot accepts
+	ekName   []byte        // Name of the authenticated endorsement key
+	ekAlgs   []ekcert.Alg  // its algorithm (both when only the Name is known)
 }
 
 func newTPM(c Config, r Runner) (*tpm, error) {
@@ -133,9 +137,6 @@ func (t *tpm) prepare() error {
 	if err := t.pcrValues("pcrs-steady.bin", pcrsSteady); err != nil {
 		return err
 	}
-	if err := t.pcrValues("pcrs-bridge.bin", pcrsBridge); err != nil {
-		return err
-	}
 	b2, err := t.trial([]string{"tpm2_policycommandcode", "TPM2_CC_NV_SetBits"}, []string{"tpm2_policynvwritten", "c"})
 	if err != nil {
 		return err
@@ -166,9 +167,6 @@ func (t *tpm) setRef(ref string) error {
 	if t.plit, err = t.trial(auth, []string{"tpm2_policypcr", "-l", selSteady, "-f", t.w("pcrs-steady.bin")}); err != nil {
 		return err
 	}
-	if t.pbridge, err = t.trial(auth, []string{"tpm2_policypcr", "-l", selBridge, "-f", t.w("pcrs-bridge.bin")}); err != nil {
-		return err
-	}
 	if t.b1, err = t.trial(auth); err != nil {
 		return err
 	}
@@ -180,7 +178,7 @@ func (t *tpm) setRef(ref string) error {
 	t.pc = tpmpolicy.PolicyOR(pca, t.av)
 	for n, d := range map[string][]byte{
 		"p.bin": t.policy, "b1.bin": t.b1, "pca.bin": pca, "pc.bin": t.pc,
-		"v-steady.bin": tpmpolicy.DigestNV(t.plit), "v-bridge.bin": tpmpolicy.DigestNV(t.pbridge),
+		"v-steady.bin": tpmpolicy.DigestNV(t.plit),
 	} {
 		if err := t.put(n, d); err != nil {
 			return err
@@ -197,7 +195,6 @@ type Policies struct {
 	P, PE, PC []byte // hierarchies/A/S, epoch index, counter
 	VAuth     []byte // authPolicy of index V (binds its Name)
 	Steady    []byte // content of V for the Secure Boot state of this boot
-	Bridge    []byte // content of V during a PCR 7 transition started with this boot chain
 }
 
 // ExpectedPolicies returns the policies of this boot for this device (its
@@ -214,7 +211,29 @@ func ExpectedPolicies(c Config, r Runner) (Policies, error) {
 	if err := t.runtimeEK(); err != nil {
 		return Policies{}, err
 	}
-	return Policies{t.policy, t.pe, t.pc, t.b1, tpmpolicy.DigestNV(t.plit), tpmpolicy.DigestNV(t.pbridge)}, nil
+	return Policies{t.policy, t.pe, t.pc, t.b1, tpmpolicy.DigestNV(t.plit)}, nil
+}
+
+// PCRBinding checks index V and describes what it binds (selftest).
+func PCRBinding(c Config, r Runner) (string, error) {
+	t, err := newTPM(c, r)
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(c.work())
+	if err := t.prepare(); err != nil {
+		return "", err
+	}
+	if err := t.runtimeEK(); err != nil {
+		return "", err
+	}
+	if err := t.pcrMode(); err != nil {
+		return "", err
+	}
+	if t.mode == modeBridge {
+		return fmt.Sprintf("PCR 7+12, one of %d exact Secure Boot states (signed variable update pending)", len(t.branches)), nil
+	}
+	return "PCR 7+12", nil
 }
 
 // loadPolicies reads every signed approved policy for the running UKI from
@@ -240,10 +259,16 @@ func (t *tpm) loadPolicies(espDev string) error {
 				return err
 			}
 		}
+		if _, err := os.Stat(filepath.Join(t.c.espMount(), "EFI/enklave/test-skip-bridge-check")); err == nil {
+			t.skipBridgeCheck = true
+		}
 		// models firmware whose event log is unusable (B7 proof)
 		if _, err := os.Stat(filepath.Join(t.c.espMount(), "EFI/enklave/test-no-eventlog")); err == nil {
 			t.c.EventLog = filepath.Join(t.c.RunDir, "test-no-eventlog")
 		}
+	}
+	if err := t.copyEKCerts(); err != nil {
+		return err
 	}
 	files, _ := filepath.Glob(filepath.Join(t.c.espMount(), t.c.PolicyDir, "*.json"))
 	sort.Strings(files)
@@ -264,6 +289,41 @@ func (t *tpm) loadPolicies(espDev string) error {
 	}
 	if len(t.files) == 0 {
 		return fmt.Errorf("no signed approved policy for the running UKI (PCR 11 policy %s) in ESP:/%s", want, t.c.PolicyDir)
+	}
+	return nil
+}
+
+// EKCertDir is where EK certificates fetched from the TPM vendor are placed
+// on the ESP (G5), for TPMs that do not carry their certificate in NV
+// (Intel PTT and AMD fTPM publish it through a web service keyed by the EK).
+const EKCertDir = "EFI/enklave/ekcert"
+
+// copyEKCerts copies those certificates to /run for the later steps of this
+// boot. They are untrusted input: only the vendor signature counts.
+func (t *tpm) copyEKCerts() error {
+	dst := t.c.ekCertDir()
+	if err := os.RemoveAll(dst); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return err
+	}
+	files, _ := filepath.Glob(filepath.Join(t.c.espMount(), EKCertDir, "*"))
+	sort.Strings(files)
+	for i, p := range files {
+		if i >= 256 {
+			break
+		}
+		if fi, err := os.Stat(p); err != nil || !fi.Mode().IsRegular() || fi.Size() > 16<<10 {
+			continue
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dst, fmt.Sprintf("%03d-%s", i, filepath.Base(p))), b, 0o600); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -339,10 +399,11 @@ func (t *tpm) authorize(f tpmpolicy.File) error {
 	return nil
 }
 
-// pcrMode checks index V and finds out which PCR binding it holds: the
-// Secure Boot state of this boot (steady), or this boot chain during a PCR 7
-// transition. Anything else is a foreign Secure Boot configuration or boot
-// chain and fails closed.
+// pcrMode checks index V and finds out what it holds: the Secure Boot state
+// of this boot (steady), or the branch list of a signed Secure Boot update
+// in transit that includes the state of this boot. Anything else is a
+// foreign Secure Boot configuration and fails closed. The TPM enforces the
+// same on its own: no session of another PCR 7 value satisfies V.
 func (t *tpm) pcrMode() error {
 	if err := t.checkIndex(PCRPolicy, PCRPolicy.Final, t.b1); err != nil {
 		return err
@@ -351,34 +412,76 @@ func (t *tpm) pcrMode() error {
 	if err != nil {
 		return err
 	}
-	switch {
-	case bytes.Equal(v, tpmpolicy.DigestNV(t.plit)):
-		t.mode = modeSteady
-	case bytes.Equal(v, tpmpolicy.DigestNV(t.pbridge)):
-		t.mode = modeBridge
-	default:
-		return fmt.Errorf("PCR policy index %s holds %x: neither the Secure Boot state of this boot (PCR 7+12: %x) "+
-			"nor a pending transition for this boot chain (PCR 0+2+4+12: %x); "+
-			"the Secure Boot configuration, firmware or boot chain changed without a signed update",
-			PCRPolicy.Handle, v[2:], t.plit, t.pbridge)
+	if bytes.Equal(v, tpmpolicy.DigestNV(t.plit)) {
+		t.mode, t.branches = modeSteady, nil
+		return nil
 	}
-	return nil
-}
-
-func (t *tpm) sel() (string, string) {
-	if t.mode == modeBridge {
-		return selBridge, t.w("pcrs-bridge.bin")
-	}
-	return selSteady, t.w("pcrs-steady.bin")
-}
-
-// writePCRPolicy rewrites index V through the owner hierarchy (policy P).
-func (t *tpm) writePCRPolicy(file, newMode string) error {
-	if err := t.writeIndex(PCRPolicy, file); err != nil {
+	ts, err := t.readTransition()
+	if err != nil {
 		return err
 	}
-	t.mode = newMode
+	for _, l := range [][][]byte{ts.next, ts.cur} {
+		if len(l) < 2 || !bytes.Equal(v, tpmpolicy.DigestNV(tpmpolicy.PolicyOR(l...))) {
+			continue
+		}
+		in := false
+		for _, b := range l {
+			in = in || bytes.Equal(b, t.plit)
+		}
+		if !in && !t.skipBridgeCheck {
+			return fmt.Errorf("PCR policy index %s holds the %d Secure Boot states of a signed variable update in transit, and the state of this boot (PCR 7+12: %x) is none of them; "+
+				"the Secure Boot configuration changed without a signed update", PCRPolicy.Handle, len(l), t.plit)
+		}
+		return t.setBranches(l)
+	}
+	return fmt.Errorf("PCR policy index %s holds %x: neither the Secure Boot state of this boot (PCR 7+12: %x) "+
+		"nor a signed variable update in transit; "+
+		"the Secure Boot configuration changed without a signed update",
+		PCRPolicy.Handle, v[2:], t.plit)
+}
+
+func (t *tpm) setBranches(l [][]byte) error {
+	for i, b := range l {
+		if err := t.put(fmt.Sprintf("or-%d.bin", i), b); err != nil {
+			return err
+		}
+	}
+	t.mode, t.branches = modeBridge, l
 	return nil
+}
+
+// orList is the -l argument of tpm2_policyor for the branch list.
+func (t *tpm) orList() string {
+	var f []string
+	for i := range t.branches {
+		f = append(f, t.w(fmt.Sprintf("or-%d.bin", i)))
+	}
+	return "sha256:" + strings.Join(f, ",")
+}
+
+// writeSteady binds index V to the Secure Boot state of this boot alone
+// (through the owner hierarchy, policy P).
+func (t *tpm) writeSteady() error {
+	if err := t.writeIndex(PCRPolicy, "v-steady.bin"); err != nil {
+		return err
+	}
+	t.mode, t.branches = modeSteady, nil
+	return nil
+}
+
+// writeBridge binds index V to a list of exact Secure Boot states, the
+// first of which is the state of this boot.
+func (t *tpm) writeBridge(l [][]byte) error {
+	if len(l) < 2 || len(l) > maxBranches {
+		return fmt.Errorf("a transition needs 2 to %d Secure Boot states, got %d", maxBranches, len(l))
+	}
+	if err := t.put("v-or.bin", tpmpolicy.DigestNV(tpmpolicy.PolicyOR(l...))); err != nil {
+		return err
+	}
+	if err := t.writeIndex(PCRPolicy, "v-or.bin"); err != nil {
+		return err
+	}
+	return t.setBranches(l)
 }
 
 // writeIndex rewrites an owner-written index (V or T) under policy P.
@@ -430,11 +533,13 @@ func (t *tpm) session(kind, enc string, cmd ...string) ([]byte, error) {
 		[]string{"tpm2_policynv", "-S", s, "-i", t.w("epochop.bin"), Epoch.Handle, "bc"},
 		[]string{"tpm2_policyauthorize", "-S", s, "-i", t.w("approved.bin"), "-q", t.w("ref.bin"), "-n", t.w("key.name"), "-t", t.w("ticket.bin")},
 	)
-	sel, vals := t.sel()
-	pstar := [][]string{
-		{"tpm2_policypcr", "-S", s, "-l", sel, "-f", vals},
-		{"tpm2_policyauthorizenv", "-S", s, "-C", PCRPolicy.Handle, PCRPolicy.Handle},
+	// PCR-bound part: the exact PCR 7+12 of this boot; during a transition
+	// the TPM additionally checks that it is one of the listed branches.
+	pstar := [][]string{{"tpm2_policypcr", "-S", s, "-l", selSteady, "-f", t.w("pcrs-steady.bin")}}
+	if t.mode == modeBridge {
+		pstar = append(pstar, []string{"tpm2_policyor", "-S", s, "-l", t.orList()})
 	}
+	pstar = append(pstar, []string{"tpm2_policyauthorizenv", "-S", s, "-C", PCRPolicy.Handle, PCRPolicy.Handle})
 	switch kind {
 	case sessP:
 		steps = append(steps, pstar...)
@@ -611,8 +716,38 @@ func (t *tpm) loadEKTrust(nv map[uint64]bool) (ekTrust, error) {
 		}
 		tr.certified = append(tr.certified, certifiedEK{k, fmt.Sprintf("EK certificate %s issued by %q", h, info.Issuer)})
 	}
-	if len(tr.certified) == 0 && len(tr.problems) == 0 {
-		tr.problems = []string{"the TPM holds no EK certificate (NV 0x01C0000A / 0x01C00002)"}
+	// certificates fetched from the vendor and shipped on the ESP (G5)
+	oob, _ := filepath.Glob(filepath.Join(t.c.ekCertDir(), "*"))
+	sort.Strings(oob)
+	var oobProblems []string
+	for _, p := range oob {
+		der, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if blk, _ := pem.Decode(der); blk != nil {
+			der = blk.Bytes
+		}
+		name := filepath.Base(p)
+		k, info, err := store.Verify(der, at)
+		if err != nil {
+			oobProblems = append(oobProblems, fmt.Sprintf("ESP certificate %s: %v", name, err))
+			continue
+		}
+		if t.id.Release.RequireFTPM && !info.Firmware() {
+			oobProblems = append(oobProblems, fmt.Sprintf("ESP certificate %s: this release requires a firmware TPM (require_ftpm) and the certificate is from the discrete-TPM vendor directory %q", name, info.Vendor))
+			continue
+		}
+		tr.certified = append(tr.certified, certifiedEK{k, fmt.Sprintf("EK certificate %s from the ESP, issued by %q", name, info.Issuer)})
+	}
+	if len(tr.certified) == 0 {
+		if len(tr.problems) == 0 {
+			tr.problems = []string{"the TPM holds no EK certificate (NV 0x01C0000A / 0x01C00002)"}
+		}
+		if len(oob) == 0 {
+			tr.problems = append(tr.problems, "no EK certificate in ESP:/"+EKCertDir)
+		}
+		tr.problems = append(tr.problems, oobProblems...)
 	}
 	return tr, nil
 }
@@ -635,13 +770,15 @@ func (t *tpm) chooseEK(st tpmState, first bool) error {
 		return err
 	}
 	if len(trust.certified) > 0 {
-		c := trust.certified[0]
-		t.ekName, t.ekAlgs, t.saltSource = c.key.Name(), []ekcert.Alg{c.key.Alg}, c.desc
+		t.acceptCertified(trust.certified)
 		return t.setRef(t.id.Ref)
 	}
 	why := strings.Join(trust.problems, "; ")
 	if trust.discrete {
 		return errors.New("the TPM's endorsement key is refused: " + why)
+	}
+	if err := t.uncertifiedAllowed(); err != nil {
+		return fmt.Errorf("the TPM's endorsement key cannot be authenticated: %s; %w", why, err)
 	}
 	admit := func(k ekcert.Key) (bool, error) {
 		ref := tpmpolicy.RefEK(t.id.Ref, k.Name())
@@ -719,12 +856,14 @@ func (t *tpm) runtimeEK() error {
 		return err
 	}
 	if len(trust.certified) > 0 {
-		c := trust.certified[0]
-		t.ekName, t.ekAlgs, t.saltSource = c.key.Name(), []ekcert.Alg{c.key.Alg}, c.desc
+		t.acceptCertified(trust.certified)
 		return t.setRef(t.id.Ref)
 	}
 	if trust.discrete {
 		return errors.New("the TPM's endorsement key is refused: " + strings.Join(trust.problems, "; "))
+	}
+	if err := t.uncertifiedAllowed(); err != nil {
+		return fmt.Errorf("the TPM's endorsement key cannot be authenticated: %s; %w", strings.Join(trust.problems, "; "), err)
 	}
 	k, err := t.readEK(SaltHandle)
 	if err != nil {
@@ -735,8 +874,51 @@ func (t *tpm) runtimeEK() error {
 	return t.setRef(tpmpolicy.RefEK(t.id.Ref, k.Name()))
 }
 
+// uncertifiedAllowed says whether this release may accept an endorsement
+// key without a vendor certificate through a signed per-device admission
+// (G5, G8). Production never does: the signer cannot tell the Name of an
+// emulated TPM from a real one, a vendor certificate can. A release that
+// requires a firmware TPM never does either: without a certificate the kind
+// of TPM is unknown.
+func (t *tpm) uncertifiedAllowed() error {
+	if t.id.Profile == "prod" {
+		return errors.New("a production release accepts only endorsement keys certified by a TPM vendor (certificate in the TPM, or fetched from the vendor and placed in ESP:/" + EKCertDir + "); per-device admissions exist in dev and test builds only")
+	}
+	if t.id.Release.RequireFTPM {
+		return errors.New("this release requires a firmware TPM (require_ftpm), which only a vendor certificate proves; a per-device admission is not accepted")
+	}
+	return nil
+}
+
+// acceptCertified makes the vendor-certified keys the only endorsement keys
+// this boot accepts. The TPM's key must be one of them (acceptEK).
+func (t *tpm) acceptCertified(cs []certifiedEK) {
+	t.accepted, t.ekName, t.ekAlgs = cs, nil, nil
+	for _, alg := range ekcert.Algs {
+		for _, c := range cs {
+			if c.key.Alg == alg {
+				t.ekAlgs = append(t.ekAlgs, alg)
+				break
+			}
+		}
+	}
+	t.saltSource = cs[0].desc
+}
+
 // acceptEK decides whether k is this device's authenticated endorsement key.
 func (t *tpm) acceptEK(k ekcert.Key) error {
+	if len(t.accepted) > 0 {
+		var names []string
+		for _, c := range t.accepted {
+			if bytes.Equal(k.Name(), c.key.Name()) {
+				t.ekName, t.saltSource = c.key.Name(), c.desc
+				return nil
+			}
+			names = append(names, fmt.Sprintf("%x, %s", c.key.Name(), c.desc))
+		}
+		return fmt.Errorf("endorsement key %x (%s) is not the authenticated key of this TPM (%s): substituted key or foreign certificate",
+			k.Name(), k.Alg, strings.Join(names, "; "))
+	}
 	if len(t.ekName) == 0 {
 		return errors.New("endorsement key not authenticated yet")
 	}

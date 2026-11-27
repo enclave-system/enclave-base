@@ -126,17 +126,11 @@ func checkVarAuthenticated(root string, r Runner) (string, error) {
 			return "", err
 		}
 	}
-	v, err := varauth.ReadNV(r, varauth.PCRPolicy)
+	// V holds the exact Secure Boot state of this boot, or, while a signed
+	// variable update is in transit, a list of exact states that includes it
+	binding, err := varauth.PCRBinding(c, r)
 	if err != nil {
 		return "", err
-	}
-	binding := "PCR 7+12"
-	switch {
-	case bytes.Equal(v, p.Steady):
-	case bytes.Equal(v, p.Bridge):
-		binding = "PCR 0+2+4+12 (Secure Boot variable update pending)"
-	default:
-		return "", fmt.Errorf("PCR policy index holds %x, want the Secure Boot state of this boot (%x)", v, p.Steady)
 	}
 	b, err := varauth.ReadNV(r, varauth.Record)
 	if err != nil {

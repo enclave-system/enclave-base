@@ -201,3 +201,93 @@ func TestEFIVarFS(t *testing.T) {
 		t.Error("PK update accepted")
 	}
 }
+
+// G3: the PCR 7 value after a variable update is computed in advance.
+func TestPredict(t *testing.T) {
+	fw := sbtest.NewFirmware()
+	fw.Vars[dbxID] = sbtest.ESL(hash("old"))
+	log, pcr7 := fw.Boot()
+	evs, _, err := ParseLog(log, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{"db-" + GUIDSecurity, dbxID, "KEK-" + GUIDGlobal}
+	content, err := Verbatim(evs, ids, fw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, err := Predict(evs, content); err != nil || !bytes.Equal(p, pcr7) {
+		t.Fatalf("this boot: %x %v, PCR 7 %x", p, err, pcr7)
+	}
+	if p, _ := Predict(evs, nil); !bytes.Equal(p, pcr7) {
+		t.Fatal("replay without substitution")
+	}
+	// after a signed append the firmware of the next boot measures exactly the predicted value
+	upd := sbtest.ESL(hash("revoked"))
+	cands, err := AppendCandidates(content[dbxID], upd)
+	if err != nil || len(cands) != 1 {
+		t.Fatalf("candidates %d %v", len(cands), err)
+	}
+	content[dbxID] = cands[0]
+	want, _ := Predict(evs, content)
+	if err := fw.Append("dbx", GUIDSecurity, sbtest.Auth(upd)); err != nil {
+		t.Fatal(err)
+	}
+	if _, next := fw.Boot(); !bytes.Equal(next, want) || bytes.Equal(next, pcr7) {
+		t.Fatalf("next boot PCR 7 %x, predicted %x", next, want)
+	}
+	// any other content gives another value
+	content[dbxID] = sbtest.ESL(hash("revoked"))
+	if p, _ := Predict(evs, content); bytes.Equal(p, want) {
+		t.Fatal("dropped entry predicted to the same PCR 7")
+	}
+	// a variable that changed since boot, or is not measured as stored
+	if _, err := Verbatim(evs, ids, fw); err == nil {
+		t.Error("variable changed since boot not noticed")
+	}
+	fw2 := sbtest.NewFirmware()
+	fw2.Skip = "dbx"
+	log2, _ := fw2.Boot()
+	evs2, _, _ := ParseLog(log2, 7)
+	if _, err := Verbatim(evs2, ids, fw2); err == nil {
+		t.Error("unmeasured variable accepted")
+	}
+	if _, err := VariableData("dbx", nil); err == nil {
+		t.Error("variable id without GUID accepted")
+	}
+}
+
+func TestAppendCandidates(t *testing.T) {
+	a, b, c := hash("a"), hash("b"), hash("c")
+	// the update repeats an entry the variable holds: edk2 drops it, a plain append keeps it
+	cur := sbtest.ESL(a, b)
+	cands, err := AppendCandidates(cur, sbtest.ESL(b, c))
+	if err != nil || len(cands) != 2 {
+		t.Fatalf("%d %v", len(cands), err)
+	}
+	if !bytes.Equal(cands[0], append(append([]byte{}, cur...), sbtest.ESL(c)...)) {
+		t.Errorf("edk2 form: %x", cands[0])
+	}
+	if !bytes.Equal(cands[1], append(append([]byte{}, cur...), sbtest.ESL(b, c)...)) {
+		t.Errorf("plain form: %x", cands[1])
+	}
+	for _, cand := range cands {
+		if ok, err := ExactlyAdded(cur, cand, []Signature{{sbtest.SHA256Type, hex.EncodeToString(b)}, {sbtest.SHA256Type, hex.EncodeToString(c)}}); !ok || err != nil {
+			t.Errorf("candidate is not old plus update: %v", err)
+		}
+	}
+	if _, err := AppendCandidates([]byte("junk"), sbtest.ESL(a)); err == nil {
+		t.Error("malformed variable accepted")
+	}
+	add := []Signature{{sbtest.SHA256Type, hex.EncodeToString(c)}}
+	for name, after := range map[string][]byte{
+		"entry dropped": sbtest.ESL(a, c), "nothing added": sbtest.ESL(a, b), "foreign entry": sbtest.ESL(a, b, c, hash("x")),
+	} {
+		if ok, _ := ExactlyAdded(cur, after, add); ok {
+			t.Errorf("%s accepted as old plus update", name)
+		}
+	}
+	if ok, _ := ExactlyAdded(cur, sbtest.ESL(c, b, a), add); !ok {
+		t.Error("same set in another order refused")
+	}
+}

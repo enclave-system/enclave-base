@@ -173,3 +173,18 @@ func TestRefEK(t *testing.T) {
 		t.Error("foreign ref accepted")
 	}
 }
+
+// G8: a client is never built without require_ftpm, except for the VM tests.
+func TestCheckRoleRelease(t *testing.T) {
+	for _, tc := range []struct {
+		role, profile string
+		ftpm, ok      bool
+	}{
+		{"client", "prod", false, false}, {"client", "dev", false, false}, {"client", "test", false, true},
+		{"client", "prod", true, true}, {"ref", "prod", false, true}, {"gateway", "prod", false, true},
+	} {
+		if err := CheckRoleRelease(tc.role, tc.profile, Release{RequireFTPM: tc.ftpm}); (err == nil) != tc.ok {
+			t.Errorf("%+v: %v", tc, err)
+		}
+	}
+}

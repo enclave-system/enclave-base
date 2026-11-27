@@ -140,6 +140,9 @@ func Verify(c Config, r Runner) (string, error) {
 			return "", err
 		}
 	}
+	if err := WriteUpdateStatus(c, updates); err != nil {
+		return "", err
+	}
 	dev := ""
 	if t.id.Release.DevKeys {
 		dev = "; DEV KEYS (development build, never ship)"
@@ -148,28 +151,187 @@ func Verify(c Config, r Runner) (string, error) {
 		Record.Handle, pcr15, rd.Epoch, version, t.id.Role, t.id.Profile, t.epoch, updates, dev), nil
 }
 
+// UpdateStatus is the status of the release's signed Secure Boot variable
+// updates as every local user and the console can read it (G9):
+// <StatusDir>/secure-boot-updates.json. Status is "current", "pending"
+// (reboot to complete), "failed" or "blocked"; with the last two a
+// revocation shipped by this release is NOT in place.
+type UpdateStatus struct {
+	Status string `json:"status"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail"`
+}
+
+// ParseUpdateStatus splits the status line of secureBootUpdates.
+func ParseUpdateStatus(line string) UpdateStatus {
+	line = strings.TrimSpace(line)
+	s := line
+	if i := strings.IndexAny(line, " :"); i > 0 {
+		s = line[:i]
+	}
+	return UpdateStatus{Status: s, OK: s == "current" || s == "pending", Detail: line}
+}
+
+// WriteUpdateStatus publishes the status outside the root-only run directory.
+func WriteUpdateStatus(c Config, line string) error {
+	if c.StatusDir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(c.StatusDir, 0o755); err != nil {
+		return err
+	}
+	b, err := json.Marshal(ParseUpdateStatus(line))
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(c.StatusDir, ".secure-boot-updates.json.tmp")
+	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(c.StatusDir, "secure-boot-updates.json"))
+}
+
 // ---------------------------------------------------------------- Secure Boot variable updates
 
-// Transition states (last byte block of index T).
+// Index T (transition record). Layout:
+//
+//	[0]        state: 0 idle, 1 armed (index V holds a PolicyOR over a branch list)
+//	[1]        1: an update of this transition was seen in the firmware variable
+//	[2:98]     canonical digests (sbstate.StateDigest) of the Secure Boot state
+//	           before the transition, before the update in flight, after it
+//	[98:227]   branch list V holds (count, 4 digests)
+//	[227:356]  branch list V is being switched to (count, 4 digests)
+//	[356:493]  per-update record (count, 8 x (16-byte id, counter))
+//
+// A branch is the policy digest PolicyAuthorize(key, ref) + PolicyPCR(7, 12)
+// for one exact PCR 7 value. Branch 0 is always the state before the
+// transition.
+//
+// The per-update record is monotonic (G1): the counter of an update goes up
+// every time the transition is armed for it, and to "seen" once the firmware
+// variable held it. An entry is removed only while the firmware holds the
+// update and V is bound to that very Secure Boot state. No release, with or
+// without updates, clears it otherwise.
 const (
-	trIdle       = 0
-	trArmed      = 1 // T and V are set for the update; the firmware may or may not have it
-	trApplied    = 2 // the firmware took the update in a boot that saw it in the variable
-	trRolledBack = 3 // the firmware lost an applied update again; not re-armed
+	trIdle  = 0
+	trArmed = 1
+
+	maxBranches  = 4
+	maxSeen      = 8
+	seenInFW     = 0xFF // the firmware variable held this update once
+	maxArmCount  = 3    // arming attempts per update that the firmware did not take
+	trOffCur     = 98
+	trOffNext    = 227
+	trOffSeen    = 356
+	trSeenRecord = 17
 )
+
+type seenEntry struct {
+	id [16]byte
+	n  byte
+}
 
 // transState is the content of index T.
 type transState struct {
-	old, new []byte // sbstate.StateDigest before the update / the only state it may lead to
-	state    byte
+	state          byte
+	applied        bool
+	old, prev, new []byte
+	cur, next      [][]byte
+	seen           []seenEntry
+}
+
+func putList(b []byte, l [][]byte) {
+	b[0] = byte(len(l))
+	for i, d := range l {
+		copy(b[1+32*i:], d)
+	}
+}
+
+func getList(b []byte) ([][]byte, error) {
+	if int(b[0]) > maxBranches {
+		return nil, errors.New("transition index: bad branch count")
+	}
+	var l [][]byte
+	for i := 0; i < int(b[0]); i++ {
+		l = append(l, append([]byte{}, b[1+32*i:33+32*i]...))
+	}
+	return l, nil
 }
 
 func (ts transState) bytes() []byte {
 	b := make([]byte, Transition.Size)
-	copy(b, ts.old)
-	copy(b[32:], ts.new)
-	b[64] = ts.state
+	b[0] = ts.state
+	if ts.applied {
+		b[1] = 1
+	}
+	copy(b[2:], ts.old)
+	copy(b[34:], ts.prev)
+	copy(b[66:], ts.new)
+	putList(b[trOffCur:], ts.cur)
+	putList(b[trOffNext:], ts.next)
+	b[trOffSeen] = byte(len(ts.seen))
+	for i, e := range ts.seen {
+		copy(b[trOffSeen+1+trSeenRecord*i:], e.id[:])
+		b[trOffSeen+1+trSeenRecord*i+16] = e.n
+	}
 	return b
+}
+
+func parseTransition(b []byte) (transState, error) {
+	if len(b) != Transition.Size {
+		return transState{}, fmt.Errorf("transition index: %d bytes", len(b))
+	}
+	ts := transState{state: b[0], applied: b[1] == 1, old: b[2:34], prev: b[34:66], new: b[66:98]}
+	var err error
+	if ts.cur, err = getList(b[trOffCur:]); err != nil {
+		return ts, err
+	}
+	if ts.next, err = getList(b[trOffNext:]); err != nil {
+		return ts, err
+	}
+	if ts.state > trArmed || int(b[trOffSeen]) > maxSeen {
+		return ts, errors.New("transition index: bad content")
+	}
+	for i := 0; i < int(b[trOffSeen]); i++ {
+		var e seenEntry
+		copy(e.id[:], b[trOffSeen+1+trSeenRecord*i:])
+		e.n = b[trOffSeen+1+trSeenRecord*i+16]
+		ts.seen = append(ts.seen, e)
+	}
+	return ts, nil
+}
+
+// idle ends a transition. The per-update record stays.
+func (ts *transState) idle() {
+	*ts = transState{seen: ts.seen}
+}
+
+func (ts *transState) entry(id [16]byte) *seenEntry {
+	for i := range ts.seen {
+		if ts.seen[i].id == id {
+			return &ts.seen[i]
+		}
+	}
+	return nil
+}
+
+func (ts *transState) drop(id [16]byte) bool {
+	for i := range ts.seen {
+		if ts.seen[i].id == id {
+			ts.seen = append(ts.seen[:i], ts.seen[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func updateID(u sbstate.Update) (id [16]byte) {
+	s := sha256.Sum256(u.Auth)
+	copy(id[:], s[:])
+	return id
 }
 
 func (t *tpm) readTransition() (transState, error) {
@@ -180,7 +342,7 @@ func (t *tpm) readTransition() (transState, error) {
 	if err != nil {
 		return transState{}, err
 	}
-	return transState{old: b[:32], new: b[32:64], state: b[64]}, nil
+	return parseTransition(b)
 }
 
 func (t *tpm) writeTransition(ts transState) error {
@@ -214,20 +376,46 @@ func (t *tpm) pcr7Events() ([]sbstate.Event, error) {
 // updatable are the variables a release may update, as named in the event log.
 var updatable = []string{"db-" + sbstate.GUIDSecurity, "dbx-" + sbstate.GUIDSecurity, "KEK-" + sbstate.GUIDGlobal}
 
-// requireEventLog is the platform check of first provisioning and healing
-// (B7): the firmware's event log must replay to PCR 7 and measure db, dbx
-// and KEK exactly once each, as parseable signature lists. Otherwise a later
-// signed Secure Boot update (the durable revocation of a release) could not
-// be carried, so such a device is not enrolled.
-func (t *tpm) requireEventLog() error {
+// measured checks that this firmware can carry a signed Secure Boot update
+// under a TPM-enforced binding: the event log replays to PCR 7, db, dbx and
+// KEK are measured exactly once each as signature lists, and each is
+// measured verbatim, so that the PCR 7 value after an update can be computed
+// in advance (G3). It returns the events and the variables' content.
+func (t *tpm) measured() ([]sbstate.Event, map[string][]byte, error) {
 	evs, err := t.pcr7Events()
-	if err == nil {
-		err = sbstate.HasVariables(evs, updatable)
-	}
-	if err == nil {
-		_, err = sbstate.StateDigest(evs, updatable, nil)
-	}
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := sbstate.HasVariables(evs, updatable); err != nil {
+		return nil, nil, err
+	}
+	if _, err := sbstate.StateDigest(evs, updatable, nil); err != nil {
+		return nil, nil, err
+	}
+	content, err := sbstate.Verbatim(evs, updatable, t.efi())
+	if err != nil {
+		return nil, nil, err
+	}
+	p, err := sbstate.Predict(evs, content)
+	if err != nil {
+		return nil, nil, err
+	}
+	live, err := ReadPCR(t.r, 7)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !bytes.Equal(p, live) {
+		return nil, nil, errors.New("PCR 7 cannot be recomputed from the measured variables")
+	}
+	return evs, content, nil
+}
+
+// requireEventLog is the platform check of first provisioning and healing
+// (B7, G3). A device whose firmware could not carry a later signed Secure
+// Boot update (the durable revocation of a release) under a TPM-enforced
+// PCR 7 binding is not enrolled.
+func (t *tpm) requireEventLog() error {
+	if _, _, err := t.measured(); err != nil {
 		return fmt.Errorf("this firmware cannot carry signed Secure Boot variable updates (dbx revocation), refusing to enrol the device: %w", err)
 	}
 	return nil
@@ -240,123 +428,131 @@ func (t *tpm) efi() sbstate.Vars {
 	return sbstate.EFIVarFS{Dir: "/sys/firmware/efi/efivars"}
 }
 
-// releaseUpdates loads the release's signed updates: all of them, those not
-// yet in the firmware, the variables they touch and their signatures.
-func (t *tpm) releaseUpdates() (all, todo []sbstate.Update, ids []string, add map[string][]sbstate.Signature, err error) {
+// releaseUpdates loads the release's signed updates: all of them and those
+// not yet in the firmware.
+func (t *tpm) releaseUpdates() (all, todo []sbstate.Update, err error) {
 	if all, err = sbstate.LoadUpdates(t.c.UpdatesDir); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("Secure Boot updates of this release: %w", err)
+		return nil, nil, fmt.Errorf("Secure Boot updates of this release: %w", err)
 	}
-	add = map[string][]sbstate.Signature{}
 	for _, u := range all {
-		if _, seen := add[u.ID()]; !seen {
-			ids = append(ids, u.ID())
-		}
-		add[u.ID()] = append(add[u.ID()], u.Sigs...)
 		cur, err := t.efi().Read(u.Var, u.GUID)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, err
 		}
 		done, err := u.Applied(cur)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, err
 		}
 		if !done {
 			todo = append(todo, u)
 		}
 	}
-	return all, todo, ids, add, nil
+	return all, todo, nil
 }
 
-// apply submits the updates to the firmware (which verifies their KEK/PK
-// signature). It reports the failures and whether any variable changed.
-func (t *tpm) apply(todo []sbstate.Update) (failed []string, changed bool) {
-	for _, u := range todo {
-		before, _ := t.efi().Read(u.Var, u.GUID)
-		err := t.efi().Append(u.Var, u.GUID, u.Auth)
-		after, rerr := t.efi().Read(u.Var, u.GUID)
-		if rerr != nil || !bytes.Equal(before, after) {
-			changed = true
-		}
-		if err == nil {
-			if done, aerr := u.Applied(after); aerr != nil || !done {
-				err = errors.New("the firmware accepted the write but the signatures are not in the variable")
-			}
-		}
-		if err != nil {
-			failed = append(failed, fmt.Sprintf("%s: %v", u.File, err))
-		}
+// branchFor returns the policy branch (PolicyAuthorize + PolicyPCR(7,12))
+// for the PCR 7 value that the events of this boot give with the variables'
+// content replaced.
+func (t *tpm) branchFor(evs []sbstate.Event, content map[string][]byte) ([]byte, error) {
+	pcr7, err := sbstate.Predict(evs, content)
+	if err != nil {
+		return nil, err
 	}
-	return failed, changed
+	pcr12, err := ReadPCR(t.r, 12)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.put("pcrs-pred.bin", append(pcr7, pcr12...)); err != nil {
+		return nil, err
+	}
+	return t.trial([]string{"tpm2_policyauthorize", "-n", t.w("key.name"), "-q", t.w("ref.bin")},
+		[]string{"tpm2_policypcr", "-l", selSteady, "-f", t.w("pcrs-pred.bin")})
 }
 
-// checkBridge is the Secure Boot check of a boot in which index V binds the
-// boot chain (PCR 0+2+4+12) instead of PCR 7. It runs BEFORE the volume key
-// is read (B2) and needs nothing from the state volume: index T, written
-// under policy P when the transition was armed, holds the digests of the
-// only two Secure Boot states that may follow. The state of this boot, from
-// the event log that replays to PCR 7, must be one of them:
+// checkBridge is the software check of a boot in which index V holds a
+// branch list (a signed Secure Boot update is in transit). It runs BEFORE
+// the volume key is read (B2) and needs nothing from the state volume.
 //
-//   - exactly the state before the update (the firmware has not taken it),
-//   - exactly that state with the signatures of the release's signed updates
-//     added to the updated variables (B3): nothing dropped, nothing else
-//     added, Secure Boot on, PK/KEK/db and the signing authority unchanged.
+// The TPM itself already enforces the binding (G3): V authorizes exactly
+// the PCR 7 values of the branch list, and no session of another Secure
+// Boot state satisfies policy P. This check is the second, independent one:
+// the Secure Boot state of this boot, from the event log that replays to
+// PCR 7, must be one of the states index T pins:
 //
-// It returns whether the update is in the firmware.
-func (t *tpm) checkBridge() (applied bool, err error) {
+//   - exactly the state before the transition,
+//   - exactly the state before the update in flight,
+//   - exactly that state with the signatures of that signed update added
+//     (B3): nothing dropped, nothing else added, Secure Boot on, PK/KEK/db
+//     and the signing authority unchanged.
+func (t *tpm) checkBridge() error {
 	ts, err := t.readTransition()
 	if err != nil {
-		return false, err
+		return err
 	}
-	if ts.state != trArmed && ts.state != trApplied {
-		return false, fmt.Errorf("PCR policy index binds the boot chain but no Secure Boot update is in transit (transition state %d)", ts.state)
+	if ts.state != trArmed {
+		return fmt.Errorf("PCR policy index holds a transition but no Secure Boot update is in transit (transition state %d)", ts.state)
 	}
 	evs, err := t.pcr7Events()
 	if err != nil {
-		return false, fmt.Errorf("Secure Boot update in transit: %w", err)
+		return fmt.Errorf("Secure Boot update in transit: %w", err)
 	}
-	_, _, ids, _, err := t.releaseUpdates()
+	cur, err := sbstate.StateDigest(evs, updatable, nil)
 	if err != nil {
-		return false, err
+		return fmt.Errorf("Secure Boot update in transit: %w", err)
 	}
-	cur, err := sbstate.StateDigest(evs, ids, nil)
-	if err != nil {
-		return false, fmt.Errorf("Secure Boot update in transit: %w", err)
+	for _, d := range [][]byte{ts.old, ts.prev, ts.new} {
+		if bytes.Equal(cur, d) {
+			return nil
+		}
 	}
-	switch {
-	case bytes.Equal(cur, ts.new):
-		return true, nil
-	case bytes.Equal(cur, ts.old):
-		return false, nil
-	}
-	return false, fmt.Errorf("Secure Boot update in transit and the Secure Boot state of this boot (%x) is neither the state before the update (%x) nor exactly that state plus the signed update (%x): refusing before the volume key is read",
+	return fmt.Errorf("Secure Boot update in transit and the Secure Boot state of this boot (%x) is neither the state before the update (%x) nor exactly that state plus the signed update (%x): refusing before the volume key is read",
 		cur, ts.old, ts.new)
+}
+
+func uniqueDigests(ds ...[]byte) [][]byte {
+	var out [][]byte
+	for _, d := range ds {
+		dup := false
+		for _, o := range out {
+			dup = dup || bytes.Equal(o, d)
+		}
+		if !dup {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // secureBootUpdates applies the signed Secure Boot variable updates shipped
 // in /usr (dbx appends that revoke old UKIs, db/KEK appends) and moves the
-// state volume's Secure Boot binding along (F3, B2, B3).
+// state volume's Secure Boot binding along (F3, B2, B3, G1, G2, G3).
 //
 // A dbx/db/KEK change alters PCR 7 from the next boot on. Policy P does not
 // hold PCR 7 itself: its PCR-bound part lives in index V.
 //
-//  1. Steady (V = PCR 7+12 of this boot), updates not yet in the firmware:
-//     index T is armed with the digest of the current Secure Boot state and
-//     the digest of that state plus the update; V is switched to PCR
-//     0+2+4+12 (firmware code, option ROMs/drivers, every EFI binary on the
-//     boot path, no ESP credentials); only then the updates are handed to
-//     the firmware, and T is marked "applied". From the V write on, the old
-//     PCR 7 alone opens nothing.
-//  2. Next boot: checkBridge (before the volume key is read) accepts only
-//     the two states pinned in T. If the update is in the firmware, V is set
-//     to the new PCR 7+12 here and T is cleared.
+// For each update, one at a time:
 //
-// One shot: if an update that was marked applied is missing again (the
-// variable store was rolled back), V returns to the old PCR 7 binding, T
-// remembers "rolled back", and the transition is not armed again for this
-// update. A power loss before the firmware took the update is retried; the
-// boot chain binding never admits any other Secure Boot state.
+//  1. The PCR 7 value of the next boot is computed in advance: the events
+//     of this boot with the variable's content replaced by "content plus
+//     the update" (as edk2 stores it, and as a plain append).
+//  2. Index T records the transition, then V is set to a PolicyOR over the
+//     exact branches: the state before the transition, the current state,
+//     and the computed ones. The TPM accepts no other PCR 7 value; there is
+//     no moment in which PCR 7 is not bound.
+//  3. The update is handed to the firmware and the variable is read back.
+//     If it did not change, the update was refused: nothing is pending for
+//     it. If it changed, it must hold exactly the old signatures plus the
+//     update's, and V is narrowed to "before the transition" and the exact
+//     value computed from what was read back. The record of what the
+//     firmware took is what was read back, never what was sent (G2).
+//
+// The next boot comes up in one of the bound states. With the new state, V
+// is set to it alone. With the old state after the firmware had held an
+// update, the variable store was rolled back: V returns to the old state
+// alone and the update is never armed again (the per-update record in T is
+// monotonic, G1).
 func (t *tpm) secureBootUpdates() (string, error) {
-	all, todo, ids, add, err := t.releaseUpdates()
+	all, todo, err := t.releaseUpdates()
 	if err != nil {
 		return "", err
 	}
@@ -365,105 +561,198 @@ func (t *tpm) secureBootUpdates() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	pending := func(failed []string) string {
-		return fmt.Sprintf("pending: %d of %d update(s) handed to the firmware, reboot to complete%s", len(todo)-len(failed), total, failures(failed))
-	}
-
-	if t.mode == modeBridge {
-		applied, err := t.checkBridge() // already passed in Unlock; needed for the decision here
-		if err != nil {
+	completed := false
+	switch {
+	case t.mode == modeBridge:
+		rolledBack := bytes.Equal(t.plit, t.branches[0]) && ts.applied
+		completed = !bytes.Equal(t.plit, t.branches[0])
+		if err := t.writeSteady(); err != nil {
 			return "", err
 		}
-		if applied {
-			if err := t.writePCRPolicy("v-steady.bin", modeSteady); err != nil {
-				return "", err
-			}
-			if err := t.writeTransition(transState{}); err != nil {
-				return "", err
-			}
-			if len(todo) > 0 {
-				return "failed: NOT APPLIED: the firmware holds only part of the release's updates", nil
-			}
-			return fmt.Sprintf("current (%d update(s) in the firmware, Secure Boot state re-recorded after the update)", total), nil
+		ts.idle()
+		if err := t.writeTransition(ts); err != nil {
+			return "", err
 		}
-		if ts.state == trApplied {
-			// the update was in the firmware and is gone: variable store rolled back
-			if err := t.writePCRPolicy("v-steady.bin", modeSteady); err != nil {
-				return "", err
-			}
-			ts.state = trRolledBack
-			if err := t.writeTransition(ts); err != nil {
-				return "", err
-			}
+		if rolledBack {
 			return "failed: NOT APPLIED: the firmware lost the update again (variable store rolled back); the transition is not opened again", nil
 		}
-		// armed, but the firmware never took it (power loss): hand it over again
-		failed, changed := t.apply(todo)
-		if changed {
-			ts.state = trApplied
-			if err := t.writeTransition(ts); err != nil {
-				return "", err
-			}
-			return pending(failed), nil
-		}
-		if err := t.writePCRPolicy("v-steady.bin", modeSteady); err != nil {
+	case ts.state != trIdle:
+		// V was already set back in an interrupted boot
+		ts.idle()
+		if err := t.writeTransition(ts); err != nil {
 			return "", err
 		}
-		if err := t.writeTransition(transState{}); err != nil {
-			return "", err
-		}
-		return "failed" + failures(failed), nil
 	}
-
+	// V is bound to the Secure Boot state of this boot alone. Updates the
+	// firmware holds need no record any more.
+	dropped := false
+	for _, u := range all {
+		in := true
+		for _, o := range todo {
+			in = in && o.File != u.File
+		}
+		if in && ts.drop(updateID(u)) {
+			dropped = true
+		}
+	}
+	if dropped {
+		if err := t.writeTransition(ts); err != nil {
+			return "", err
+		}
+	}
 	if len(todo) == 0 {
-		if ts.state != trIdle {
-			if err := t.writeTransition(transState{}); err != nil {
-				return "", err
-			}
+		if completed {
+			return fmt.Sprintf("current (%d update(s) in the firmware, Secure Boot state re-recorded after the update)", total), nil
 		}
 		return fmt.Sprintf("current (%d update(s) in the firmware)", total), nil
 	}
-	evs, err := t.pcr7Events()
-	if err == nil {
-		err = sbstate.HasVariables(evs, ids)
+	var failed []string
+	var allowed []sbstate.Update
+	for _, u := range todo {
+		e := ts.entry(updateID(u))
+		switch {
+		case e != nil && e.n == seenInFW:
+			failed = append(failed, u.File+": the firmware lost this update before (variable store rolled back); the transition is not opened again")
+		case e != nil && e.n >= maxArmCount:
+			failed = append(failed, fmt.Sprintf("%s: armed %d times and never taken by the firmware; not armed again", u.File, e.n))
+		case e == nil && len(ts.seen) >= maxSeen:
+			failed = append(failed, u.File+": the transition record is full")
+		default:
+			allowed = append(allowed, u)
+			if e == nil {
+				ts.seen = append(ts.seen, seenEntry{id: updateID(u)})
+			}
+		}
 	}
-	var old, next []byte
-	if err == nil {
-		old, err = sbstate.StateDigest(evs, ids, nil)
+	if len(allowed) == 0 {
+		return "failed" + failures(failed), nil
 	}
-	if err == nil {
-		next, err = sbstate.StateDigest(evs, ids, add)
-	}
+	evs, content, err := t.measured()
 	if err != nil {
 		// cannot happen on an enrolled device unless the firmware changed (requireEventLog)
 		return fmt.Sprintf("blocked: %d update(s) not applied, this firmware's PCR 7 log cannot carry the transition: %v", len(todo), err), nil
 	}
-	if ts.state == trRolledBack && bytes.Equal(ts.new, next) {
-		return "failed: NOT APPLIED: the firmware lost this update before (variable store rolled back); the transition is not opened again", nil
-	}
-	if err := t.writeTransition(transState{old: old, new: next, state: trArmed}); err != nil {
+	old, err := sbstate.StateDigest(evs, updatable, nil)
+	if err != nil {
 		return "", err
 	}
-	if err := t.writePCRPolicy("v-bridge.bin", modeBridge); err != nil {
-		return "", err
-	}
-	t.pause("pcr7-bridge")
-	failed, changed := t.apply(todo)
-	t.pause("pcr7-applied")
-	if !changed {
-		// the firmware took nothing: PCR 7 stays, return to the steady binding
-		if err := t.writePCRPolicy("v-steady.bin", modeSteady); err != nil {
+	s0, exact, prevSet := t.plit, t.plit, old
+	add := map[string][]sbstate.Signature{}
+	taken, wide := 0, false
+	var notes []string
+	for _, u := range allowed {
+		id := updateID(u)
+		cur := content[u.ID()]
+		payload, err := sbstate.AuthPayload(u.Auth)
+		if err != nil {
 			return "", err
 		}
-		if err := t.writeTransition(transState{}); err != nil {
+		cands, err := sbstate.AppendCandidates(cur, payload)
+		if err != nil {
+			return "", err
+		}
+		list := [][]byte{s0, exact}
+		for _, c := range cands {
+			content[u.ID()] = c
+			b, err := t.branchFor(evs, content)
+			if err != nil {
+				return "", err
+			}
+			list = append(list, b)
+		}
+		content[u.ID()] = cur
+		list = uniqueDigests(list...)
+		add2 := map[string][]sbstate.Signature{}
+		for k, v := range add {
+			add2[k] = v
+		}
+		add2[u.ID()] = append(append([]sbstate.Signature{}, add[u.ID()]...), u.Sigs...)
+		newSet, err := sbstate.StateDigest(evs, updatable, add2)
+		if err != nil {
+			return "", err
+		}
+		e := ts.entry(id)
+		e.n++
+		ts.state, ts.old, ts.prev, ts.new = trArmed, old, prevSet, newSet
+		ts.cur, ts.next = t.branches, list
+		if err := t.writeTransition(ts); err != nil {
+			return "", err
+		}
+		if err := t.writeBridge(list); err != nil {
+			return "", err
+		}
+		wide = true
+		t.pause("pcr7-bridge")
+		aerr := t.efi().Append(u.Var, u.GUID, u.Auth)
+		after, err := t.efi().Read(u.Var, u.GUID)
+		if err != nil {
+			return "", err
+		}
+		t.pause("pcr7-applied")
+		if bytes.Equal(after, cur) {
+			// refused by the firmware: this arming opened nothing
+			ts.entry(id).n--
+			if aerr == nil {
+				aerr = errors.New("the firmware accepted the write but left the variable unchanged")
+			}
+			failed = append(failed, fmt.Sprintf("%s: %v", u.File, aerr))
+			continue
+		}
+		ok, err := sbstate.ExactlyAdded(cur, after, u.Sigs)
+		if err != nil || !ok {
+			return "", fmt.Errorf("after the signed update %s the firmware variable %s does not hold exactly its old signatures plus the update's (%v): not accepted as a Secure Boot state", u.File, u.Var, err)
+		}
+		content[u.ID()] = after
+		if exact, err = t.branchFor(evs, content); err != nil {
+			return "", err
+		}
+		predicted := false
+		for _, b := range list {
+			predicted = predicted || bytes.Equal(b, exact)
+		}
+		if !predicted {
+			// handled (V is narrowed to the value read back below), but the
+			// hardware model stores appends in a third form: report it
+			notes = append(notes, u.File+": stored by the firmware in a form that was not predicted")
+		}
+		add, prevSet = add2, newSet
+		taken++
+		ts.entry(id).n = seenInFW
+		ts.applied = true
+		ts.prev, ts.cur, ts.next = newSet, t.branches, [][]byte{s0, exact}
+		if err := t.writeTransition(ts); err != nil {
+			return "", err
+		}
+		if err := t.writeBridge(ts.next); err != nil {
+			return "", err
+		}
+		wide = false
+	}
+	if taken == 0 {
+		// the firmware took nothing: PCR 7 stays, back to the binding of this boot
+		if err := t.writeSteady(); err != nil {
+			return "", err
+		}
+		ts.idle()
+		if err := t.writeTransition(ts); err != nil {
 			return "", err
 		}
 		return "failed" + failures(failed), nil
 	}
-	if err := t.writeTransition(transState{old: old, new: next, state: trApplied}); err != nil {
-		return "", err
+	if wide {
+		ts.new, ts.cur, ts.next = ts.prev, t.branches, [][]byte{s0, exact}
+		if err := t.writeTransition(ts); err != nil {
+			return "", err
+		}
+		if err := t.writeBridge(ts.next); err != nil {
+			return "", err
+		}
 	}
-	return pending(failed), nil
+	note := ""
+	if len(notes) > 0 {
+		note = "; note: " + strings.Join(notes, "; ")
+	}
+	return fmt.Sprintf("pending: %d of %d update(s) handed to the firmware, reboot to complete%s%s", taken, total, failures(failed), note), nil
 }
 
 func failures(f []string) string {

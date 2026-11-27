@@ -43,12 +43,11 @@ const (
 
 var (
 	// trial-session outputs of the fake runner
-	fakeB1     = strings.Repeat("11", 32) // PolicyAuthorize(key, ref) = authPolicy of index V
-	fakeAV     = strings.Repeat("33", 32)
-	fakeLit    = strings.Repeat("aa", 32) // ... + PolicyPCR(7,12) of this boot
-	fakeBridge = strings.Repeat("ab", 32) // ... + PolicyPCR(0,2,4,12) of this boot
-	fakePE     = strings.Repeat("bb", 32)
-	fakePol11  = strings.Repeat("cc", 32) // current PCR 11 policy (after boot)
+	fakeB1    = strings.Repeat("11", 32) // PolicyAuthorize(key, ref) = authPolicy of index V
+	fakeAV    = strings.Repeat("33", 32)
+	fakeLit   = strings.Repeat("aa", 32) // ... + PolicyPCR(7,12) of this boot
+	fakePE    = strings.Repeat("bb", 32)
+	fakePol11 = strings.Repeat("cc", 32) // current PCR 11 policy (after boot)
 	// computed locally by varauth: P = PolicyAuthorizeNV(Name(V)), counter policy
 	fakeP, fakePC = expectedPolicies()
 	counter42     = "\x00\x00\x00\x00\x00\x00\x00\x2a"
@@ -182,7 +181,7 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 		"tpm2_nvreadpublic 0x01800E04":   nvPublic("0x01800E04", 0x22040028, 8, fakePE),
 		"tpm2_nvreadpublic 0x01800E05":   nvPublic("0x01800E05", 0x22040002, 34, fakeB1),
 		pcrPolicyReadCmd:                 "\x00\x0b" + string(unhex(fakeLit)),
-		"tpm2_nvreadpublic 0x01800E06":   nvPublic("0x01800E06", 0x22040002, 72, fakeB1),
+		"tpm2_nvreadpublic 0x01800E06":   nvPublic("0x01800E06", 0x22040002, 496, fakeB1),
 		"tpm2_getcap handles-nv-index":   "- 0x1800E01\n- 0x1800E02\n- 0x1800E03\n- 0x1800E04\n- 0x1800E05\n- 0x1800E06\n- 0x1C0000A\n",
 		"tpm2_getcap handles-persistent": "- 0x81000001\n- 0x81000E01\n- 0x81010001\n",
 		ekCertReadCmd:                    string(ekCert) + strings.Repeat("\x00", 32),
@@ -215,9 +214,6 @@ func goodRoot(t *testing.T) (string, *fakeRunner) {
 			for _, a := range args {
 				if a == "sha256:7,12" {
 					return []byte(fakeLit + "\n"), true
-				}
-				if a == "sha256:0,2,4,12" {
-					return []byte(fakeBridge + "\n"), true
 				}
 				if a == "sha256:11" {
 					return []byte(fakePol11 + "\n"), true
@@ -324,7 +320,7 @@ func TestVarChecksNotOk(t *testing.T) {
 			r.out["tpm2_getcap handles-persistent"] += "- 0x81000002\n"
 		}},
 		{"var_authenticated", "transition index Name differs", func(t *testing.T, root string, r *fakeRunner) {
-			r.out["tpm2_nvreadpublic 0x01800E06"] = nvPublic("0x01800E06", 0x22040002, 72, strings.Repeat("99", 32))
+			r.out["tpm2_nvreadpublic 0x01800E06"] = nvPublic("0x01800E06", 0x22040002, 496, strings.Repeat("99", 32))
 		}},
 		{"var_authenticated", "salt key substituted", func(t *testing.T, root string, r *fakeRunner) {
 			r.out["salt"] = string(otherEK.TPM2B())
@@ -426,9 +422,23 @@ func TestVarAuthenticatedDetails(t *testing.T) {
 			t.Errorf("%+v lacks %q", x, want)
 		}
 	}
-	// during a signed Secure Boot variable update the boot chain is bound instead
-	r.out[pcrPolicyReadCmd] = "\x00\x0b" + string(unhex(fakeBridge))
-	if x := find(t, RunChecks(root, r), "var_authenticated"); !x.OK || !strings.Contains(x.Detail, "PCR 0+2+4+12") {
+	// during a signed Secure Boot variable update V lists the exact states
+	// the update may lead to; the state of this boot must be one of them
+	other := unhex(strings.Repeat("ab", 32))
+	tr := make([]byte, 496)
+	tr[0], tr[227] = 1, 2
+	copy(tr[228:], unhex(fakeLit))
+	copy(tr[260:], other)
+	r.out["tpm2_nvread 0x01800E06 -C 0x01800E06 -s 496"] = string(tr)
+	r.out[pcrPolicyReadCmd] = string(tpmpolicy.DigestNV(tpmpolicy.PolicyOR(unhex(fakeLit), other)))
+	if x := find(t, RunChecks(root, r), "var_authenticated"); !x.OK || !strings.Contains(x.Detail, "one of 2 exact Secure Boot states") {
+		t.Errorf("%+v", x)
+	}
+	// a list that does not include the state of this boot
+	copy(tr[228:], unhex(strings.Repeat("cd", 32)))
+	r.out["tpm2_nvread 0x01800E06 -C 0x01800E06 -s 496"] = string(tr)
+	r.out[pcrPolicyReadCmd] = string(tpmpolicy.DigestNV(tpmpolicy.PolicyOR(unhex(strings.Repeat("cd", 32)), other)))
+	if x := find(t, RunChecks(root, r), "var_authenticated"); x.OK || !strings.Contains(x.Detail, "is none of them") {
 		t.Errorf("%+v", x)
 	}
 }
@@ -461,6 +471,11 @@ func TestDevKeys(t *testing.T) {
 func TestAdmittedDeviceReported(t *testing.T) {
 	root, r := goodRoot(t)
 	r.out["tpm2_getcap handles-nv-index"] = "- 0x1800E01\n- 0x1800E02\n- 0x1800E03\n- 0x1800E04\n- 0x1800E05\n- 0x1800E06\n"
+	// production: an endorsement key without vendor certificate is refused (G5)
+	if x := find(t, RunChecks(root, r), "var_authenticated"); x.OK || !strings.Contains(x.Detail, "production release accepts only endorsement keys certified by a TPM vendor") {
+		t.Errorf("prod: %+v", x)
+	}
+	put(t, root, "usr/lib/enklave/release.json", `{"epoch":0,"heal_below":0,"dev_keys":true}`)
 	x := find(t, RunChecks(root, r), "var_authenticated")
 	if !x.OK || !strings.Contains(x.Detail, "signed per-device admission of EK") {
 		t.Errorf("%+v", x)

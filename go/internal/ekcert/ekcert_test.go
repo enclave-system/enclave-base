@@ -191,6 +191,24 @@ func TestVerify(t *testing.T) {
 		at   time.Time
 		want string
 	}{ekCert(t, inter, &ek.PublicKey, func(c *x509.Certificate) { c.UnknownExtKeyUsage = nil }), vectorTime, "not issued for endorsement keys"}
+	// G11: without any extended key usage, a TCG certificate policy marks the EK certificate
+	cases["no EKU and a foreign certificate policy"] = struct {
+		der  []byte
+		at   time.Time
+		want string
+	}{ekCert(t, inter, &ek.PublicKey, func(c *x509.Certificate) {
+		c.UnknownExtKeyUsage = nil
+		c.PolicyIdentifiers = []asn1.ObjectIdentifier{{1, 2, 276, 0, 68, 1, 20, 1}}
+	}), vectorTime, "not issued for endorsement keys"}
+	cases["other EKU with a TCG certificate policy"] = struct {
+		der  []byte
+		at   time.Time
+		want string
+	}{ekCert(t, inter, &ek.PublicKey, func(c *x509.Certificate) {
+		c.UnknownExtKeyUsage = nil
+		c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+		c.PolicyIdentifiers = []asn1.ObjectIdentifier{{2, 23, 133, 2, 99}}
+	}), vectorTime, "not issued for endorsement keys"}
 	cases["other extended key usage only"] = struct {
 		der  []byte
 		at   time.Time
@@ -327,5 +345,21 @@ func TestChainEKUAndVendor(t *testing.T) {
 		if err != nil || info.Vendor != v || info.Firmware() != (v == "Intel") {
 			t.Errorf("%s: %+v %v", v, info, err)
 		}
+	}
+}
+
+// G11: a vendor certificate without extended key usage is accepted when it
+// carries a certificate policy from the TCG arc.
+func TestTCGPolicyInsteadOfEKU(t *testing.T) {
+	root := newCA(t, "root", nil)
+	ek, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	s := NewStore()
+	s.Roots.AddCert(root.cert)
+	der := ekCert(t, root, &ek.PublicKey, func(c *x509.Certificate) {
+		c.UnknownExtKeyUsage = nil
+		c.PolicyIdentifiers = []asn1.ObjectIdentifier{{2, 23, 133, 2, 99}}
+	})
+	if _, _, err := s.Verify(der, vectorTime); err != nil {
+		t.Fatalf("TCG policy OID instead of the EKU: %v", err)
 	}
 }

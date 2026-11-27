@@ -410,3 +410,196 @@ func (v EFIVarFS) Append(name, guid string, auth []byte) error {
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------- PCR 7 prediction
+
+// guidBytes converts the textual GUID form to its EFI_GUID encoding.
+func guidBytes(s string) ([]byte, error) {
+	h, err := hex.DecodeString(strings.ReplaceAll(s, "-", ""))
+	if err != nil || len(h) != 16 || len(s) != 36 {
+		return nil, fmt.Errorf("bad GUID %q", s)
+	}
+	return []byte{h[3], h[2], h[1], h[0], h[5], h[4], h[7], h[6], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]}, nil
+}
+
+// VariableData builds the UEFI_VARIABLE_DATA structure that firmware
+// measures for a variable "<name>-<guid>" with the given content.
+func VariableData(id string, data []byte) ([]byte, error) {
+	if len(id) < 38 || id[len(id)-37] != '-' {
+		return nil, fmt.Errorf("bad variable id %q", id)
+	}
+	g, err := guidBytes(id[len(id)-36:])
+	if err != nil {
+		return nil, err
+	}
+	u := utf16.Encode([]rune(id[:len(id)-37]))
+	b := make([]byte, 0, 32+2*len(u)+len(data))
+	b = append(b, g...)
+	b = binary.LittleEndian.AppendUint64(b, uint64(len(u)))
+	b = binary.LittleEndian.AppendUint64(b, uint64(len(data)))
+	for _, c := range u {
+		b = append(b, byte(c), byte(c>>8))
+	}
+	return append(b, data...), nil
+}
+
+// Predict replays the PCR 7 events of this boot with the content of the
+// given variables ("<name>-<guid>") replaced: the PCR 7 value of the next
+// boot if exactly those variables change to exactly that content. With an
+// empty map it is the PCR 7 of this boot.
+func Predict(evs []Event, content map[string][]byte) ([]byte, error) {
+	value := make([]byte, 32)
+	for _, e := range evs {
+		d, err := hex.DecodeString(e.Digest)
+		if err != nil || len(d) != 32 {
+			return nil, fmt.Errorf("bad event digest %q", e.Digest)
+		}
+		if c, ok := content[e.Var]; ok && e.Var != "" {
+			vd, err := VariableData(e.Var, c)
+			if err != nil {
+				return nil, err
+			}
+			s := sha256.Sum256(vd)
+			d = s[:]
+		}
+		s := sha256.Sum256(append(append([]byte{}, value...), d...))
+		value = s[:]
+	}
+	return value, nil
+}
+
+// Verbatim requires that the firmware measured each named variable exactly
+// as the variable store returns it now: the event digest is the digest of
+// UEFI_VARIABLE_DATA built from the variable's content. Only then can the
+// PCR 7 value after a variable update be computed in advance. It returns
+// the current content by variable id.
+func Verbatim(evs []Event, ids []string, vars Vars) (map[string][]byte, error) {
+	out := map[string][]byte{}
+	for _, id := range ids {
+		for _, e := range evs {
+			if e.Var != id {
+				continue
+			}
+			vd, err := VariableData(id, e.Data)
+			if err != nil {
+				return nil, err
+			}
+			if s := sha256.Sum256(vd); hex.EncodeToString(s[:]) != e.Digest {
+				return nil, fmt.Errorf("firmware measures variable %s in a form that cannot be reproduced", id)
+			}
+			cur, err := vars.Read(id[:len(id)-37], id[len(id)-36:])
+			if err != nil {
+				return nil, err
+			}
+			if !bytes.Equal(cur, e.Data) {
+				return nil, fmt.Errorf("variable %s differs from what the firmware measured at boot (changed since boot, or not measured verbatim)", id)
+			}
+			out[id] = append([]byte{}, e.Data...)
+		}
+		if _, ok := out[id]; !ok {
+			return nil, fmt.Errorf("firmware did not measure variable %s", id)
+		}
+	}
+	return out, nil
+}
+
+type eslList struct {
+	head    []byte // type GUID
+	sigHdr  []byte
+	sigSize uint64
+	entries [][]byte
+}
+
+func splitESL(b []byte) ([]eslList, error) {
+	var out []eslList
+	for len(b) > 0 {
+		if len(b) < 28 {
+			return nil, errors.New("truncated EFI signature list")
+		}
+		listSize := uint64(binary.LittleEndian.Uint32(b[16:20]))
+		hdrSize := uint64(binary.LittleEndian.Uint32(b[20:24]))
+		sigSize := uint64(binary.LittleEndian.Uint32(b[24:28]))
+		if listSize < 28 || listSize > uint64(len(b)) || sigSize <= 16 || 28+hdrSize > listSize || (listSize-28-hdrSize)%sigSize != 0 {
+			return nil, errors.New("malformed EFI signature list")
+		}
+		l := eslList{head: b[:16], sigHdr: b[28 : 28+hdrSize], sigSize: sigSize}
+		for e := b[28+hdrSize : listSize]; len(e) > 0; e = e[sigSize:] {
+			l.entries = append(l.entries, e[:sigSize])
+		}
+		out = append(out, l)
+		b = b[listSize:]
+	}
+	return out, nil
+}
+
+// AppendCandidates returns the contents a signature database may have
+// after the firmware processed an authenticated APPEND of payload to cur:
+// edk2 (and firmware derived from it) drops entries of the new lists that
+// the variable already holds and appends the rest; a plain implementation
+// appends the payload as it is. Both are "cur plus the update".
+func AppendCandidates(cur, payload []byte) ([][]byte, error) {
+	have, err := splitESL(cur)
+	if err != nil {
+		return nil, err
+	}
+	add, err := splitESL(payload)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for _, l := range have {
+		for _, e := range l.entries {
+			seen[string(l.head)+string(e)] = true
+		}
+	}
+	filtered := append([]byte{}, cur...)
+	for _, l := range add {
+		var keep [][]byte
+		for _, e := range l.entries {
+			if !seen[string(l.head)+string(e)] {
+				keep = append(keep, e)
+			}
+		}
+		if len(keep) == 0 {
+			continue
+		}
+		filtered = append(filtered, l.head...)
+		filtered = binary.LittleEndian.AppendUint32(filtered, uint32(28+len(l.sigHdr)+len(keep)*int(l.sigSize)))
+		filtered = binary.LittleEndian.AppendUint32(filtered, uint32(len(l.sigHdr)))
+		filtered = binary.LittleEndian.AppendUint32(filtered, uint32(l.sigSize))
+		filtered = append(filtered, l.sigHdr...)
+		for _, e := range keep {
+			filtered = append(filtered, e...)
+		}
+	}
+	raw := append(append([]byte{}, cur...), payload...)
+	if bytes.Equal(raw, filtered) {
+		return [][]byte{raw}, nil
+	}
+	return [][]byte{filtered, raw}, nil
+}
+
+// ExactlyAdded reports whether the signature set of after is exactly the
+// set of before united with add: nothing dropped, nothing else added.
+func ExactlyAdded(before, after []byte, add []Signature) (bool, error) {
+	b, err := ParseESL(before)
+	if err != nil {
+		return false, err
+	}
+	a, err := ParseESL(after)
+	if err != nil {
+		return false, err
+	}
+	want := map[Signature]bool{}
+	for _, s := range append(b, add...) {
+		want[s] = true
+	}
+	got := map[Signature]bool{}
+	for _, s := range a {
+		if !want[s] {
+			return false, nil
+		}
+		got[s] = true
+	}
+	return len(got) == len(want), nil
+}

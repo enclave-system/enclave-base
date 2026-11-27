@@ -81,6 +81,14 @@ func main() {
 			}
 			f.Close()
 		}
+		// G9: a revocation that is not in place is reported in every profile:
+		// critical journal message here, status file for the console
+		// (/run/enklave-status/secure-boot-updates.json, written by Verify).
+		if u, err := os.ReadFile(c.EFIUpdatesFile()); err == nil {
+			if st := varauth.ParseUpdateStatus(string(u)); !st.OK {
+				fmt.Fprintf(os.Stderr, "<2>enklave: SECURE BOOT UPDATE NOT IN PLACE (%s): a revocation shipped with this release is not active: %s\n", st.Status, st.Detail)
+			}
+		}
 	case "sealed":
 		msg, err := varauth.Sealed(c, r, "/run/systemd/tpm2-pcr-signature.json")
 		if err != nil {
@@ -172,6 +180,12 @@ func remount(root string) func(rw bool) error {
 // serve runs the state service: take the keys out of /run, listen, tell
 // systemd that the keys are gone (Type=notify), serve.
 func serve(c varauth.Config, r execRunner) error {
+	// G10: the process that holds the state keys is never dumped and cannot
+	// be attached to (the unit also sets LimitCORE=0; ptrace is disabled
+	// system-wide by sysctl).
+	if _, _, e := syscall.RawSyscall(syscall.SYS_PRCTL, 4 /* PR_SET_DUMPABLE */, 0, 0); e != 0 {
+		return fmt.Errorf("prctl(PR_SET_DUMPABLE, 0): %w", e)
+	}
 	s, err := varauth.NewStateServer(c, r)
 	if err != nil {
 		return err

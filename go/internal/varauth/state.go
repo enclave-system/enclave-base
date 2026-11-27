@@ -2,9 +2,12 @@ package varauth
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -14,10 +17,11 @@ import (
 	"sync"
 	"syscall"
 
+	"enklave.local/base/internal/bundle"
 	"enklave.local/base/internal/statefs"
 )
 
-// The state service (B8) is the only writer of the state volume and the
+// The state service (B8, G4) is the only writer of the state volume and the
 // only holder of the state keys at runtime.
 //
 //   - The unlock step leaves the derived keys in /run/enklave/state.key for
@@ -26,25 +30,47 @@ import (
 //     service ever sees it.
 //   - A commit is not "run this command": the caller names a WRITER, and the
 //     command of a writer is fixed in the verity-protected image
-//     (/usr/lib/enklave/state-writers.d/<id>.json). The caller only
-//     triggers it and may pass input on stdin; validating that input is the
-//     writer's job (enklave-cfg, for example, accepts signed bundles only).
+//     (/usr/lib/enklave/state-writers.d/<id>.json).
+//   - What a commit can put into the state does not depend on who triggers
+//     it. Each writer declares its input:
+//     "none": the writer gets no input from the caller at all.
+//     "signed-bundle": the caller's input must be an enklave bundle signed
+//     with the config-signing key, for this role, with a version higher
+//     than the last one this writer accepted. The service verifies all
+//     of that before it runs the writer, and records the accepted
+//     version inside the authenticated state.
+//     A writer without such a declaration is refused (the test profile
+//     alone may declare "unverified").
 //   - The caller is authenticated with SO_PEERCRED (uid 0) and SO_PEERPIDFD
-//     and must run in the systemd unit that the writer names (cgroup of the
-//     peer process). Everything else is refused.
+//     and must be in the cgroup /system.slice/<unit> of the unit the writer
+//     names. This keeps ordinary services apart. It is not a boundary
+//     against root: a root process can move itself into that cgroup. Such a
+//     process can trigger a writer; it cannot make the service accept
+//     content that is not signed, not for this role, or not newer.
 //   - Reads go through the service too: every read authenticates the
 //     manifest (MAC), its version (TPM counter) and the file's hash.
 
+// Writer input kinds.
+const (
+	InputNone       = "none"
+	InputBundle     = "signed-bundle"
+	InputUnverified = "unverified" // test profile only
+)
+
+// maxInput bounds a signed input (signature + bundle).
+const maxInput = 64 << 20
+
 // Writer is one entry of the image's writer allowlist.
 type Writer struct {
-	ID   string   `json:"-"`
-	Unit string   `json:"unit"` // systemd unit the caller must run in
-	Exec []string `json:"exec"` // command; "{}" and $ENKLAVE_STATE_DIR are the staged copy
+	ID    string   `json:"-"`
+	Unit  string   `json:"unit"`  // systemd unit the caller must run in
+	Exec  []string `json:"exec"`  // command; "{}" and $ENKLAVE_STATE_DIR are the staged copy
+	Input string   `json:"input"` // none, signed-bundle (unverified: test profile only)
 }
 
 // LoadWriters reads the writer allowlist. A missing directory means that
-// this image has no writer.
-func LoadWriters(dir string) (map[string]Writer, error) {
+// this image has no writer. test admits writers with unverified input.
+func LoadWriters(dir string, test bool) (map[string]Writer, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "*.json"))
 	if err != nil {
 		return nil, err
@@ -62,6 +88,15 @@ func LoadWriters(dir string) (map[string]Writer, error) {
 		w.ID = strings.TrimSuffix(filepath.Base(f), ".json")
 		if !strings.HasSuffix(w.Unit, ".service") || strings.ContainsAny(w.Unit, "/ ") || len(w.Exec) == 0 || !filepath.IsAbs(w.Exec[0]) {
 			return nil, fmt.Errorf("%s: a writer needs a .service unit and an absolute command", f)
+		}
+		if strings.ContainsAny(w.ID, "/. ") || w.ID == "" {
+			return nil, fmt.Errorf("%s: bad writer name", f)
+		}
+		switch {
+		case w.Input == InputNone || w.Input == InputBundle:
+		case w.Input == InputUnverified && test:
+		default:
+			return nil, fmt.Errorf("%s: a writer must declare its input as %q or %q (got %q): input that the service cannot verify is not accepted", f, InputNone, InputBundle, w.Input)
 		}
 		out[w.ID] = w
 	}
@@ -98,6 +133,7 @@ type StateServer struct {
 
 	keys StateKeys
 	test bool
+	role string
 	mu   sync.Mutex
 }
 
@@ -111,12 +147,15 @@ func NewStateServer(c Config, r Runner) (*StateServer, error) {
 	if err := os.Remove(c.StateKeyFile()); err != nil {
 		return nil, err
 	}
-	w, err := LoadWriters(c.WritersDir)
+	id, err := LoadIdentity(c)
 	if err != nil {
 		return nil, err
 	}
-	_, terr := os.Stat(c.TestMarker)
-	return &StateServer{C: c, R: r, Writers: w, keys: keys, test: terr == nil}, nil
+	w, err := LoadWriters(c.WritersDir, id.Profile == "test")
+	if err != nil {
+		return nil, err
+	}
+	return &StateServer{C: c, R: r, Writers: w, keys: keys, test: id.Profile == "test", role: id.Role}, nil
 }
 
 func (s *StateServer) store(pause func(string)) (*statefs.Store, func(), error) {
@@ -134,10 +173,43 @@ func (s *StateServer) store(pause func(string)) (*statefs.Store, func(), error) 
 	return st, func() { os.RemoveAll(work) }, nil
 }
 
-// Handle serves one request. unit is the systemd unit of the authenticated
-// caller ("" if it is not in a service unit); stdin is the caller's input
-// for a writer (may be nil).
-func (s *StateServer) Handle(req StateRequest, unit string, stdin *os.File) StateReply {
+// versionFile holds the last input version a writer accepted. It lives in
+// the state itself, so it is covered by the manifest MAC and the TPM counter.
+func versionFile(staging, writer string) string {
+	return filepath.Join(staging, ".input-version-"+writer)
+}
+
+// verifiedInput reads the caller's input for a signed-bundle writer and
+// verifies it: 64-byte Ed25519 signature followed by the bundle, signed with
+// the config-signing key of the image, for this role.
+func (s *StateServer) verifiedInput(stdin *os.File) (sig, b []byte, m bundle.Manifest, err error) {
+	if stdin == nil {
+		return nil, nil, m, errors.New("this writer needs a signed bundle as input")
+	}
+	in, err := io.ReadAll(io.LimitReader(stdin, maxInput+1))
+	if err != nil {
+		return nil, nil, m, err
+	}
+	if len(in) > maxInput || len(in) <= ed25519.SignatureSize {
+		return nil, nil, m, errors.New("input is not a signed bundle (signature followed by the bundle)")
+	}
+	pub, err := os.ReadFile(s.C.ConfigPub)
+	if err != nil {
+		return nil, nil, m, err
+	}
+	sig, b = in[:ed25519.SignatureSize], in[ed25519.SignatureSize:]
+	if m, err = bundle.Verify(ed25519.PublicKey(pub), b, sig); err != nil {
+		return nil, nil, m, fmt.Errorf("input refused: %w", err)
+	}
+	if m.Role != s.role {
+		return nil, nil, m, fmt.Errorf("input refused: bundle is for role %q, this is %q", m.Role, s.role)
+	}
+	return sig, b, m, nil
+}
+
+// Handle serves one request. cgroup is the cgroup path of the authenticated
+// caller; stdin is the caller's input for a writer (may be nil).
+func (s *StateServer) Handle(req StateRequest, cgroup string, stdin *os.File) StateReply {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fail := func(err error) StateReply { return StateReply{Error: err.Error()} }
@@ -164,8 +236,26 @@ func (s *StateServer) Handle(req StateRequest, unit string, stdin *os.File) Stat
 		if !ok {
 			return fail(fmt.Errorf("unknown state writer %q: writers are defined by the image only", req.Writer))
 		}
-		if unit != w.Unit {
-			return fail(fmt.Errorf("caller in unit %q is not authorized for state writer %q (reserved for %s)", unit, w.ID, w.Unit))
+		if cgroup != "/system.slice/"+w.Unit {
+			return fail(fmt.Errorf("caller in cgroup %q is not authorized for state writer %q (reserved for /system.slice/%s)", cgroup, w.ID, w.Unit))
+		}
+		// G4: what the writer may consume is decided here, before anything runs
+		var sig, in []byte
+		var m bundle.Manifest
+		switch w.Input {
+		case InputNone:
+			stdin = nil
+		case InputBundle:
+			var err error
+			if sig, in, m, err = s.verifiedInput(stdin); err != nil {
+				return fail(err)
+			}
+		case InputUnverified:
+			if !s.test {
+				return fail(errors.New("unverified writer input outside the test profile"))
+			}
+		default:
+			return fail(fmt.Errorf("writer %q declares no verifiable input", w.ID))
 		}
 		var pause func(string)
 		if s.test && req.Pause != "" && s.Pause != nil {
@@ -193,8 +283,46 @@ func (s *StateServer) Handle(req StateRequest, unit string, stdin *os.File) Stat
 			}
 			cmd := exec.Command(a[0], a[1:]...)
 			cmd.Env = append(os.Environ(), "ENKLAVE_STATE_DIR="+staging)
-			cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, os.Stderr, os.Stderr
-			return cmd.Run()
+			cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+			if w.Input != InputBundle {
+				if stdin != nil {
+					cmd.Stdin = stdin
+				}
+				return cmd.Run()
+			}
+			// the version must go up; the last one is read from the verified copy
+			vf := versionFile(staging, w.ID)
+			var last uint64
+			if b, err := os.ReadFile(vf); err == nil {
+				if last, err = strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64); err != nil {
+					return fmt.Errorf("recorded input version of writer %q: %w", w.ID, err)
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if m.Version <= last {
+				return fmt.Errorf("input refused: bundle version %d is not newer than the accepted version %d", m.Version, last)
+			}
+			dir, err := os.MkdirTemp(s.C.RunDir, "input-")
+			if err != nil {
+				return err
+			}
+			defer os.RemoveAll(dir)
+			for name, data := range map[string][]byte{"bundle": in, "bundle.sig": sig} {
+				if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+					return err
+				}
+			}
+			cmd.Env = append(cmd.Env, "ENKLAVE_INPUT_BUNDLE="+filepath.Join(dir, "bundle"), "ENKLAVE_INPUT_SIG="+filepath.Join(dir, "bundle.sig"),
+				"ENKLAVE_INPUT_VERSION="+strconv.FormatUint(m.Version, 10))
+			cmd.Stdin = bytes.NewReader(in)
+			if err := cmd.Run(); err != nil {
+				return err
+			}
+			if err := os.RemoveAll(vf); err != nil {
+				return err
+			}
+			return os.WriteFile(vf, []byte(strconv.FormatUint(m.Version, 10)+"\n"), 0o600)
 		})
 		if err != nil {
 			return fail(err)
@@ -207,7 +335,8 @@ func (s *StateServer) Handle(req StateRequest, unit string, stdin *os.File) Stat
 const soPeerPidfd = 77 // SO_PEERPIDFD (Linux 6.5)
 
 // peerUnit authenticates the peer of a unix connection: uid 0, and the
-// systemd unit its process runs in. The pidfd of the peer (taken by the
+// full cgroup path its process is in (G4: the whole path is compared, a
+// cgroup that merely ends in the unit name does not count). The pidfd of the peer (taken by the
 // kernel at connect time) guards the /proc lookup against pid reuse.
 func peerUnit(conn *net.UnixConn) (string, error) {
 	raw, err := conn.SyscallConn()
@@ -247,11 +376,7 @@ func peerUnit(conn *net.UnixConn) (string, error) {
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		if p, ok := strings.CutPrefix(line, "0::"); ok {
-			u := filepath.Base(p)
-			if strings.HasSuffix(u, ".service") {
-				return u, nil
-			}
-			return "", nil
+			return p, nil
 		}
 	}
 	return "", nil

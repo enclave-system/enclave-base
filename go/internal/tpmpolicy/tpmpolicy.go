@@ -211,6 +211,18 @@ func (r Release) Validate() error {
 	return nil
 }
 
+// CheckRoleRelease enforces release rules that depend on the role (G8):
+// a client must require a firmware TPM, because a client is the device an
+// attacker gets into his hands, and the bus of a discrete TPM can be
+// tapped and driven. Only test-profile builds (emulated TPMs in VMs) are
+// exempt.
+func CheckRoleRelease(role, profile string, r Release) error {
+	if role == "client" && profile != "test" && !r.RequireFTPM {
+		return fmt.Errorf("role client must be built with require_ftpm (REQUIRE_FTPM=1); only test-profile builds are exempt")
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------- local policy arithmetic
 //
 // Everything below is computed locally instead of being asked from the TPM

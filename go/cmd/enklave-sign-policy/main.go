@@ -286,29 +286,32 @@ func espOffset(image string) (int64, error) {
 	return 0, errors.New("no ESP in image")
 }
 
-func embed(image, file, name string) error {
+func embed(image, file, name string) error { return embedAt(image, file, "policy", name) }
+
+// embedAt copies a file to ESP:/EFI/enklave/<dir>/<name> of a disk image.
+func embedAt(image, file, dir, name string) error {
 	off, err := espOffset(image)
 	if err != nil {
 		return err
 	}
 	img := fmt.Sprintf("%s@@%d", image, off)
-	for _, d := range []string{"::/EFI/enklave", "::/EFI/enklave/policy"} {
+	for _, d := range []string{"::/EFI/enklave", "::/EFI/enklave/" + dir} {
 		if _, err := run(nil, "mdir", "-i", img, d); err != nil {
 			if _, err := run(nil, "mmd", "-i", img, d); err != nil {
 				return err
 			}
 		}
 	}
-	if _, err := run(nil, "mcopy", "-o", "-i", img, file, "::/EFI/enklave/policy/"+name); err != nil {
+	if _, err := run(nil, "mcopy", "-o", "-i", img, file, "::/EFI/enklave/"+dir+"/"+name); err != nil {
 		return err
 	}
-	got, err := run(nil, "mtype", "-i", img, "::/EFI/enklave/policy/"+name)
+	got, err := run(nil, "mtype", "-i", img, "::/EFI/enklave/"+dir+"/"+name)
 	if err != nil {
 		return err
 	}
 	want, _ := os.ReadFile(file)
 	if !bytes.Equal(bytes.TrimSpace(got), bytes.TrimSpace(want)) {
-		return errors.New("policy file in ESP differs after copy")
+		return errors.New("file in ESP differs after copy")
 	}
 	return nil
 }
@@ -324,6 +327,7 @@ func main() {
 	profile := flag.String("profile", "", "prod, dev or test")
 	pkiDir := flag.String("pki", "", "PKI directory (checked for the DEV-KEYS marker)")
 	admit := flag.String("admit-ek", "", "file with EK Names (one per line): sign a per-device admission for each (TPMs without EK certificate)")
+	ekCerts := flag.String("ek-certs", "", "directory with EK certificates fetched from the TPM vendor (Intel PTT, AMD fTPM): copied to ESP:/EFI/enklave/ekcert of --image; the device verifies them against the vendor CAs")
 	releasePath := flag.String("release", "", "release.json that went into the image (checked for the dev-key marker and epoch)")
 	flag.Parse()
 	if *uki == "" || *keyPath == "" || *pub == "" || *epoch < 0 || *out == "" || *pkiDir == "" || *releasePath == "" {
@@ -364,8 +368,11 @@ func main() {
 			admitted = append(admitted, b)
 		}
 		sort.Slice(admitted, func(i, j int) bool { return bytes.Compare(admitted[i], admitted[j]) < 0 })
+		// G5: the signer cannot tell the Name of an emulated TPM from a real
+		// one; a vendor certificate can. Production accepts certified
+		// endorsement keys only (the runtime enforces the same).
 		if *profile == "prod" && len(admitted) > 0 {
-			fmt.Fprintf(os.Stderr, "enklave-sign-policy: WARNING: signing %d per-device admission(s) with PRODUCTION keys. Admit only endorsement keys read from real hardware in a trusted environment; never the key of an emulated TPM (its private key is a file).\n", len(admitted))
+			die("refusing to sign per-device admissions for a prod image: production accepts only endorsement keys with a TPM vendor certificate (in the TPM, or fetched from the vendor and shipped with --ek-certs)")
 		}
 	}
 	// M2: the image must carry the truth about its keys (verity-protected
@@ -381,6 +388,15 @@ func main() {
 	if rel.DevKeys != dev {
 		die("%s says dev_keys=%v but %s is %sa DEV-KEYS PKI: refusing to sign an image with a wrong dev-key marker",
 			*releasePath, rel.DevKeys, *pkiDir, map[bool]string{true: "", false: "not "}[dev])
+	}
+	if err := tpmpolicy.CheckRoleRelease(*role, *profile, rel); err != nil {
+		die("%v", err)
+	}
+	if rel.RequireFTPM && len(admitted) > 0 {
+		die("refusing to sign per-device admissions for a release with require_ftpm: only a vendor certificate proves a firmware TPM")
+	}
+	if *ekCerts != "" && *image == "" {
+		die("--ek-certs needs --image")
 	}
 	if rel.Epoch != *epoch {
 		die("%s is for epoch %d, signing for epoch %d", *releasePath, rel.Epoch, *epoch)
@@ -466,6 +482,16 @@ func main() {
 				die("embedding into %s: %v", *image, err)
 			}
 			fmt.Printf("enklave-sign-policy: embedded as ESP:/EFI/enklave/policy/%s\n", espName)
+		}
+	}
+	if *ekCerts != "" {
+		files, _ := filepath.Glob(filepath.Join(*ekCerts, "*"))
+		sort.Strings(files)
+		for _, f := range files {
+			if err := embedAt(*image, f, "ekcert", filepath.Base(f)); err != nil {
+				die("embedding %s into %s: %v", f, *image, err)
+			}
+			fmt.Printf("enklave-sign-policy: EK certificate embedded as ESP:/EFI/enklave/ekcert/%s\n", filepath.Base(f))
 		}
 	}
 	sign(ref, "", *out, base+".json", 0)

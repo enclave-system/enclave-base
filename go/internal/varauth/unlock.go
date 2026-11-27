@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"enklave.local/base/internal/statefs"
 	"enklave.local/base/internal/tpmpolicy"
@@ -216,6 +217,10 @@ func Unlock(c Config, r Runner, varDev, espDev string) (string, error) {
 	if err := RequireCleanPCR12(r); err != nil {
 		return "", err
 	}
+	// G6: no volume key without DMA protection
+	if err := RequireIOMMU(c); err != nil {
+		return "", err
+	}
 	first, err := exists(c.CreatedFlag())
 	if err != nil {
 		return "", err
@@ -280,10 +285,15 @@ func Unlock(c Config, r Runner, varDev, espDev string) (string, error) {
 		}
 		// B2: while a Secure Boot variable update is in transit, the complete
 		// Secure Boot state is checked here, before the volume key is read.
-		if t.mode == modeBridge {
-			if _, err := t.checkBridge(); err != nil {
+		if t.mode == modeBridge && !t.skipBridgeCheck {
+			if err := t.checkBridge(); err != nil {
 				return "", err
 			}
+		}
+		// G7: the lockout is switched off only on a TPM that holds nothing
+		// but enklave's objects
+		if err := requireNoForeignObjects(r); err != nil {
+			return "", err
 		}
 		// before the first salted session of this boot
 		if err := t.disableDA(true); err != nil {
@@ -427,7 +437,11 @@ func (t *tpm) provision(f tpmpolicy.File, varDev string) ([]byte, error) {
 		return nil, err
 	}
 	// The dictionary-attack lockout is disabled while the lockout auth is
-	// still empty, before the first salted session.
+	// still empty, before the first salted session, and only on a TPM that
+	// holds nothing but enklave's objects (G7).
+	if err := requireNoForeignObjects(t.r); err != nil {
+		return nil, err
+	}
 	if err := t.disableDA(false); err != nil {
 		return nil, err
 	}
@@ -575,4 +589,62 @@ func (t *tpm) heal(st tpmState, rd *RecordData, varDev string) ([]byte, error) {
 		}
 	}
 	return t.provisionVolume(varDev)
+}
+
+// requireNoForeignObjects fails closed if the TPM holds an object enklave
+// does not account for (G7). The dictionary-attack lockout is switched off
+// on every boot; that is sound only while nothing in the TPM is protected
+// by a guessable authValue (ForeignObjects).
+func requireNoForeignObjects(r Runner) error {
+	foreign, err := ForeignObjects(r)
+	if err != nil {
+		return err
+	}
+	if len(foreign) > 0 {
+		return fmt.Errorf("the TPM holds objects that are not enklave's (%s): the dictionary-attack lockout is not switched off for them, refusing",
+			strings.Join(foreign, ", "))
+	}
+	return nil
+}
+
+// RequireIOMMU fails closed unless DMA remapping is active (G6): the
+// firmware describes an IOMMU (ACPI DMAR or IVRS), the kernel runs it, and
+// every device group is translated (no identity/passthrough domain). The
+// kernel command line demands this (iommu=force, intel_iommu=on,
+// amd_iommu=force_isolation, strict); this check is what refuses the volume
+// key when the platform does not deliver it, for example with VT-d/AMD-Vi
+// switched off in the firmware setup, a setting that is not measured into a
+// PCR enklave binds.
+func RequireIOMMU(c Config) error {
+	sys := c.Sys
+	if sys == "" {
+		sys = "/sys"
+	}
+	const why = ": no DMA protection, refusing to release the volume key (enable VT-d / AMD-Vi in the firmware setup)"
+	acpi := false
+	for _, t := range []string{"DMAR", "IVRS"} {
+		if _, err := os.Stat(filepath.Join(sys, "firmware/acpi/tables", t)); err == nil {
+			acpi = true
+		}
+	}
+	if !acpi {
+		return errors.New("the firmware describes no IOMMU (no ACPI DMAR or IVRS table)" + why)
+	}
+	if units, _ := filepath.Glob(filepath.Join(sys, "class/iommu/*")); len(units) == 0 {
+		return errors.New("the kernel runs no IOMMU (/sys/class/iommu is empty)" + why)
+	}
+	groups, _ := filepath.Glob(filepath.Join(sys, "kernel/iommu_groups/*/type"))
+	if len(groups) == 0 {
+		return errors.New("no device is behind the IOMMU (no IOMMU groups)" + why)
+	}
+	for _, g := range groups {
+		b, err := os.ReadFile(g)
+		if err != nil {
+			return err
+		}
+		if typ := strings.TrimSpace(string(b)); typ != "DMA" && typ != "DMA-FQ" && typ != "blocked" {
+			return fmt.Errorf("IOMMU group %s is of type %q, not translated%s", filepath.Base(filepath.Dir(g)), typ, why)
+		}
+	}
+	return nil
 }

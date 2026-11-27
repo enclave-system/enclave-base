@@ -3,6 +3,7 @@ package varauth
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
@@ -23,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"enklave.local/base/internal/bundle"
 	"enklave.local/base/internal/ekcert"
 	"enklave.local/base/internal/sbstate/sbtest"
 	"enklave.local/base/internal/tpmpolicy"
@@ -784,7 +786,41 @@ type env struct {
 	admitted      [][]byte // EK Names with a signed per-device admission
 	requireFTPM   bool
 	srv           *StateServer
+	cfgVersion    uint64 // last signed config bundle version
 }
+
+var (
+	cfgKeyOnce sync.Once
+	cfgKey     ed25519.PrivateKey
+)
+
+// configKey is the config-signing key of the test images.
+func configKey() ed25519.PrivateKey {
+	cfgKeyOnce.Do(func() { _, cfgKey, _ = ed25519.GenerateKey(rand.Reader) })
+	return cfgKey
+}
+
+// signedInput builds the input of a signed-bundle writer: signature, then a
+// bundle for role with one file "config".
+func signedInput(t *testing.T, key ed25519.PrivateKey, role string, version uint64, content string) *os.File {
+	t.Helper()
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "config"), []byte(content), 0o640)
+	var b bytes.Buffer
+	if err := bundle.Build(src, role, version, testNow, &b); err != nil {
+		t.Fatal(err)
+	}
+	in := filepath.Join(t.TempDir(), "in")
+	os.WriteFile(in, append(bundle.Sign(key, b.Bytes()), b.Bytes()...), 0o600)
+	f, err := os.Open(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+const configCgroup = "/system.slice/enklave-config.service"
 
 func refOf(role, profile string) string { r, _ := tpmpolicy.Ref(role, profile); return r }
 
@@ -831,12 +867,19 @@ func newEnv(t *testing.T, profile string) *env {
 		WritersDir: filepath.Join(d, "usr/state-writers.d"), UpdatesDir: filepath.Join(d, "usr/efi-updates"),
 		EventLog: filepath.Join(d, "sys/binary_bios_measurements"),
 		Now:      func() time.Time { return testNow },
+		Sys:      filepath.Join(d, "sysfs"), StatusDir: filepath.Join(d, "run-status"), ConfigPub: filepath.Join(d, "usr/config-signing.pub"),
 	}
+	for p, content := range map[string]string{"firmware/acpi/tables/DMAR": "", "class/iommu/dmar0": "", "kernel/iommu_groups/0/type": "DMA\n", "kernel/iommu_groups/1/type": "DMA-FQ\n"} {
+		os.MkdirAll(filepath.Dir(filepath.Join(c.Sys, p)), 0o755)
+		os.WriteFile(filepath.Join(c.Sys, p), []byte(content), 0o644)
+	}
+	os.MkdirAll(filepath.Dir(c.ConfigPub), 0o755)
+	os.WriteFile(c.ConfigPub, configKey().Public().(ed25519.PublicKey), 0o644)
 	e := &env{c: c, f: newFakeTPM(t, c.stateMount()), fw: sbtest.NewFirmware(), dev: "/dev/vda8"}
 	e.c.EFI = e.fw
 	os.MkdirAll(c.WritersDir, 0o755)
 	os.WriteFile(filepath.Join(c.WritersDir, "config.json"),
-		[]byte(`{"unit":"enklave-config.service","exec":["/bin/sh","-c","cat > \"$ENKLAVE_STATE_DIR/config\""]}`), 0o644)
+		[]byte(`{"unit":"enklave-config.service","input":"signed-bundle","exec":["/bin/sh","-c","tar -xzOf \"$ENKLAVE_INPUT_BUNDLE\" files/config > \"$ENKLAVE_STATE_DIR/config\""]}`), 0o644)
 	os.MkdirAll(filepath.Join(c.EKCADir, "Vendor/RootCA"), 0o755)
 	os.MkdirAll(filepath.Dir(c.EventLog), 0o755)
 	os.WriteFile(filepath.Join(c.EKCADir, "Vendor/RootCA/ca.cer"), vendorCA().cert.Raw, 0o644)
@@ -947,18 +990,15 @@ func (e *env) state(t *testing.T) *StateServer {
 	return e.srv
 }
 
-// commit writes data/config through the image's test writer, called from
-// the unit the writer is reserved for.
+// commit writes data/config through the image's config writer: a signed
+// bundle with the next version, from the cgroup the writer is reserved for.
 func (e *env) commit(t *testing.T, rel, content string) {
 	t.Helper()
 	if rel != "config" {
 		t.Fatalf("the test writer writes config only, not %s", rel)
 	}
-	in := filepath.Join(t.TempDir(), "in")
-	os.WriteFile(in, []byte(content), 0o600)
-	f, _ := os.Open(in)
-	defer f.Close()
-	if rep := e.state(t).Handle(StateRequest{Op: "exec", Writer: "config"}, "enklave-config.service", f); !rep.OK {
+	e.cfgVersion++
+	if rep := e.state(t).Handle(StateRequest{Op: "exec", Writer: "config"}, configCgroup, signedInput(t, configKey(), e.role, e.cfgVersion, content)); !rep.OK {
 		t.Fatal(rep.Error)
 	}
 }

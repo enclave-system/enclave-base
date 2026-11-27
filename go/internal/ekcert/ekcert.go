@@ -373,8 +373,28 @@ func hasEKU(c *x509.Certificate) bool {
 // EK usage, which crypto/x509 does not know: the leaf must carry
 // tcg-kp-EKCertificate, and an issuing CA below the trust anchor that
 // restricts its usages must include it (or anyExtendedKeyUsage).
+// markedEK reports whether a certificate is issued as an EK certificate
+// (G11): it carries the extended key usage tcg-kp-EKCertificate, or, if it
+// carries no extended key usage at all, a certificate policy from the TCG
+// arc (2.23.133), which the TCG EK Credential Profile allows vendors to use
+// instead. A certificate with other extended key usages only is refused.
+func markedEK(c *x509.Certificate) bool {
+	if hasEKU(c) {
+		return true
+	}
+	if len(c.ExtKeyUsage)+len(c.UnknownExtKeyUsage) != 0 {
+		return false
+	}
+	for _, o := range c.PolicyIdentifiers {
+		if len(o) > 3 && o[0] == 2 && o[1] == 23 && o[2] == 133 {
+			return true
+		}
+	}
+	return false
+}
+
 func chainAllowsEKU(chain []*x509.Certificate) bool {
-	if !hasEKU(chain[0]) {
+	if !markedEK(chain[0]) {
 		return false
 	}
 	for _, c := range chain[1 : len(chain)-1] {
@@ -478,7 +498,7 @@ func (s *Store) Verify(der []byte, now time.Time) (Key, Info, error) {
 		}
 	}
 	if !ok {
-		return Key{}, Info{}, fmt.Errorf("certificate (issuer %q) is not issued for endorsement keys (extended key usage tcg-kp-EKCertificate missing in the certificate or excluded by its chain)", c.Issuer.String())
+		return Key{}, Info{}, fmt.Errorf("certificate (issuer %q) is not issued for endorsement keys (extended key usage tcg-kp-EKCertificate missing in the certificate or excluded by its chain, and no TCG certificate policy in its place)", c.Issuer.String())
 	}
 	pub, err := publicKey(c)
 	if err != nil {
