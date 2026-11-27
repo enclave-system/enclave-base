@@ -2,3 +2,12 @@
 *.raw binary
 *.fd binary
 *.vhdx binary
+*.der binary
+*.cer binary
+*.crt binary
+*.tr binary
+*.name binary
+*.pub binary
+*.auth binary
+*.bin binary
+*.CER binary

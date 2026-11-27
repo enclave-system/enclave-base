@@ -101,14 +101,41 @@ func TestRefAndFileDecode(t *testing.T) {
 }
 
 func TestRelease(t *testing.T) {
-	for _, r := range []Release{{0, 0}, {3, 3}, {3, 1}} {
+	for _, r := range []Release{{Epoch: 0}, {Epoch: 3, HealBelow: 3}, {Epoch: 3, HealBelow: 1}} {
 		if err := r.Validate(); err != nil {
 			t.Errorf("%+v: %v", r, err)
 		}
 	}
-	for _, r := range []Release{{-1, 0}, {64, 0}, {2, 3}, {2, -1}} {
+	for _, r := range []Release{{Epoch: -1}, {Epoch: 64}, {Epoch: 2, HealBelow: 3}, {Epoch: 2, HealBelow: -1}} {
 		if err := r.Validate(); err == nil {
 			t.Errorf("%+v accepted", r)
 		}
+	}
+}
+
+// Vectors captured from swtpm 0.7.1 / tpm2-tools 5.7 (fix round 4):
+//
+//	tpm2_nvdefine 0x01800E05 -C o -s 34 -a "ownerwrite|authread|no_da"; tpm2_nvwrite ...
+//	tpm2_nvreadpublic 0x01800E05                      -> name, attributes 0x22040002
+//	tpm2_policyauthorizenv -S trial -C 0x01800E05 0x01800E05 -L pstar
+//	tpm2_policycommandcode -S trial TPM2_CC_NV_ChangeAuth -L pca
+func TestLocalPolicyArithmeticMatchesTPM(t *testing.T) {
+	name := NVName(0x01800E05, 0x22040002, nil, 34)
+	if want := mustHex(t, "000b1f8f84c29e1d730ce5290644ec503e750714f551f84518f7e1213f67de5cfd06"); !bytes.Equal(name, want) {
+		t.Fatalf("NV name %x, want %x", name, want)
+	}
+	pstar := PolicyAuthorizeNV(name)
+	if want := mustHex(t, "2558a6fe60bfa7232a8f816bd014b29873fd48a09f3b8a7eff4d7b171c83b980"); !bytes.Equal(pstar, want) {
+		t.Fatalf("PolicyAuthorizeNV %x, want %x", pstar, want)
+	}
+	pca := PolicyCommandCode(pstar, CCNVChangeAuth)
+	if want := mustHex(t, "2e035f844b930fed7af178db46324e9ce58f07d56cddb992750bdea83d416e76"); !bytes.Equal(pca, want) {
+		t.Fatalf("PolicyCommandCode %x, want %x", pca, want)
+	}
+	if d := DigestNV(pstar); len(d) != 34 || d[0] != 0 || d[1] != 0x0b {
+		t.Errorf("DigestNV %x", d)
+	}
+	if bytes.Equal(NVName(0x01800E05, 0x22040002, []byte{1}, 34), name) {
+		t.Error("authPolicy does not change the NV name")
 	}
 }

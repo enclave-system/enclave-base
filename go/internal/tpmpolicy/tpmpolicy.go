@@ -122,6 +122,9 @@ type File struct {
 	Approved    string `json:"approved"`     // hex
 	Ref         string `json:"ref"`
 	Signature   string `json:"signature"` // base64 RSASSA-PKCS1-v1_5/SHA-256 over approved||ref
+	// DevKeys is informational release metadata: signed with a development
+	// PKI. The authoritative marker is release.json in the verity /usr.
+	DevKeys bool `json:"dev_keys,omitempty"`
 }
 
 // Decode checks f against the expected role/profile and returns the binary
@@ -153,6 +156,11 @@ func SignedMessage(approved []byte, ref string) []byte {
 type Release struct {
 	Epoch     int `json:"epoch"`
 	HealBelow int `json:"heal_below"` // /var provisioned under an epoch < HealBelow is rekeyed
+	// DevKeys marks a build signed with a development PKI (DEV-KEYS); such a
+	// build must never ship. Built is the build time (Unix seconds), the lower
+	// bound of the clock used to validate EK certificates.
+	DevKeys bool  `json:"dev_keys"`
+	Built   int64 `json:"built"`
 }
 
 // Validate checks the release values.
@@ -165,3 +173,63 @@ func (r Release) Validate() error {
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------- local policy arithmetic
+//
+// Everything below is computed locally instead of being asked from the TPM
+// with a trial session: the results must not depend on what a TPM-bus
+// interposer answers.
+
+const (
+	ccPolicyOR          = 0x00000171
+	ccPolicyCommandCode = 0x0000016C
+	ccPolicyAuthorizeNV = 0x00000192
+	algSHA256           = 0x000B
+
+	// CCNVChangeAuth and CCNVSetBits are the command codes used in policies.
+	CCNVChangeAuth = 0x0000013B
+	CCNVSetBits    = 0x00000135
+)
+
+func be32(v uint32) []byte { b := make([]byte, 4); binary.BigEndian.PutUint32(b, v); return b }
+func be16(v uint16) []byte { b := make([]byte, 2); binary.BigEndian.PutUint16(b, v); return b }
+
+func sum(parts ...[]byte) []byte {
+	h := sha256.New()
+	for _, p := range parts {
+		h.Write(p)
+	}
+	return h.Sum(nil)
+}
+
+// NVName is the TPM Name of an NV index with nameAlg SHA-256:
+// TPM_ALG_SHA256 || H(TPMS_NV_PUBLIC).
+func NVName(handle, attributes uint32, authPolicy []byte, dataSize int) []byte {
+	pub := append(be32(handle), be16(algSHA256)...)
+	pub = append(pub, be32(attributes)...)
+	pub = append(pub, be16(uint16(len(authPolicy)))...)
+	pub = append(pub, authPolicy...)
+	pub = append(pub, be16(uint16(dataSize))...)
+	return append(be16(algSHA256), sum(pub)...)
+}
+
+// PolicyAuthorizeNV is the policy digest after TPM2_PolicyAuthorizeNV with the
+// named index: the digest is reset and extended with the command code and
+// the index Name (TPM 2.0 Part 3, 23.22).
+func PolicyAuthorizeNV(nvName []byte) []byte {
+	return sum(make([]byte, sha256.Size), be32(ccPolicyAuthorizeNV), nvName)
+}
+
+// PolicyCommandCode extends a policy digest with TPM2_PolicyCommandCode.
+func PolicyCommandCode(old []byte, code uint32) []byte {
+	return sum(old, be32(ccPolicyCommandCode), be32(code))
+}
+
+// PolicyOR is the policy digest after TPM2_PolicyOR over the given branches.
+func PolicyOR(branches ...[]byte) []byte {
+	parts := [][]byte{make([]byte, sha256.Size), be32(ccPolicyOR)}
+	return sum(append(parts, branches...)...)
+}
+
+// DigestNV is the content of a PolicyAuthorizeNV index: a TPMT_HA.
+func DigestNV(policy []byte) []byte { return append(be16(algSHA256), policy...) }
