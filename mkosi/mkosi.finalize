@@ -173,7 +173,20 @@ for f in "$root"/usr/lib/enklave/state-writers.d/*; do
     case "${f##*/}" in *.json) ;; *) die "unexpected file in state-writers.d: ${f##*/}" ;; esac
     grep -q '"unit"' "$f" || die "${f##*/}: a state writer names its unit"
     grep -q '"exec"' "$f" || die "${f##*/}: a state writer names its command"
+    # G4: what a writer may consume is declared and verified by the state
+    # service: no caller input at all, or a signed, versioned bundle. Input
+    # the service cannot verify exists in the test profile only.
+    if grep -Eq '"input"[[:space:]]*:[[:space:]]*"(none|signed-bundle)"' "$f"; then :
+    elif [ -e "$root/usr/lib/enklave/test-profile" ] && grep -Eq '"input"[[:space:]]*:[[:space:]]*"unverified"' "$f"; then :
+    else die "${f##*/}: a state writer must declare \"input\": \"none\" or \"signed-bundle\""
+    fi
 done
+# G10: the process holding the state keys leaves no core dump.
+[ "$(unit_value "$dst/enklave-state.service" Service LimitCORE)" = 0 ] || die "enklave-state.service must set LimitCORE=0"
+# G8: a client is built with require_ftpm (test-profile VM builds excepted).
+if [ "$(cat "$root/usr/lib/enklave/role" 2>/dev/null)" = client ] && [ ! -e "$root/usr/lib/enklave/test-profile" ]; then
+    grep -q '"require_ftpm":true' "$root/usr/lib/enklave/release.json" || die "role client without require_ftpm (build with REQUIRE_FTPM=1)"
+fi
 grep -qx 'kernel.yama.ptrace_scope = 3' "$root/usr/lib/sysctl.d/50-enklave-ptrace.conf" || die "ptrace is not disabled (state keys live in the state service)"
 # The state volume is mounted read-only (state-exec writes in a private namespace).
 case ",$(unit_value "$dst/var-lib-enklave.mount" Mount Options)," in

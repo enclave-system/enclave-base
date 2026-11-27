@@ -10,8 +10,8 @@
 # (make EFI_UPDATES=<dir> SECURITY_EPOCH=<n+1> ...). That release carries it in
 # its verity-protected /usr/lib/enklave/efi-updates/ and applies it itself on
 # its first boot. A dbx change alters PCR 7; the release moves the state
-# volume's Secure Boot binding across the update on each device (two boots of
-# the same UKI, no re-provisioning, no data loss; README "Secure Boot variable
+# volume's Secure Boot binding across the update on each device (two boots, no
+# re-provisioning, no data loss; README "Secure Boot variable
 # updates (dbx, db, KEK) and PCR 7"). Do not apply the file by other means
 # (efi-updatevar, firmware setup) on a provisioned device: PCR 7 would change
 # without the transition and the device would fail closed.

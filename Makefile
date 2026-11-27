@@ -30,14 +30,20 @@ REF_TEST_OUT ?= ref-test
 # Such an image has profile "dev" (its own TPM policyRef), never "prod".
 ENKLAVE_DEV_PROD ?= 0
 REF_PROFILE := $(if $(filter 1,$(ENKLAVE_DEV_PROD)),dev,prod)
-# Per-device admissions (optional): file with one TPM endorsement-key Name per
-# line. For each Name the release gets one additional signed policy on the
-# ESP that admits exactly that device (TPMs without EK certificate: AMD fTPM;
-# emulated TPMs only with the dev and test profiles). Nothing goes into the
-# image. See README "TPM authenticity".
+# Per-device admissions (optional, dev and test profiles only): file with one
+# TPM endorsement-key Name per line. For each Name the release gets one
+# additional signed policy on the ESP that admits exactly that device
+# (emulated TPMs of development VMs). Refused for prod: production accepts
+# vendor-certified endorsement keys only. See README "TPM authenticity".
 EK_ADMIT ?=
-# 1: provisioning refuses TPMs whose EK certificate is from a discrete-TPM
-# vendor (README "Accepted limits"). Role repos set it; clients should.
+# EK certificates fetched from the TPM vendor (optional): directory whose
+# files are copied to ESP:/EFI/enklave/ekcert, for TPMs that do not carry
+# their certificate in NV (Intel PTT, AMD fTPM). The device verifies them
+# against the vendor CAs of the image; nothing here is trusted as such.
+EK_CERTS ?=
+# 1: only TPMs whose EK certificate is from a firmware-TPM vendor are
+# accepted (README "Accepted limits"). Mandatory for role client (refused
+# otherwise by enklave-sign-policy, mkosi.finalize and at boot).
 REQUIRE_FTPM ?= 0
 # Signed Secure Boot variable updates (optional): directory with
 # <dbx|db|KEK>-<id>.auth files (scripts/revoke-release.sh) that this release
@@ -142,6 +148,7 @@ define mkosi_build
 	    --epoch $(SECURITY_EPOCH) --role $(1) --profile $(6) --pki $(ENKLAVE_PKI_DIR) \
 	    --release $(STAGE)/usr/lib/enklave/release.json \
 	    $(if $(EK_ADMIT),--admit-ek $(EK_ADMIT)) \
+	    $(if $(EK_CERTS),--ek-certs $(EK_CERTS)) \
 	    --out $(OUT)/$(2)/enklave-$(1)_$(3).policy.json \
 	    --image $(OUT)/$(2)/enklave-$(1)_$(3).raw
 endef

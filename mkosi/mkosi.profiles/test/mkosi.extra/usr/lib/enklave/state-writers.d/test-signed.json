@@ -1,0 +1,1 @@
+{"unit": "enklave-test-state-auth.service", "input": "signed-bundle", "exec": ["/bin/sh", "-c", "cp \"$ENKLAVE_INPUT_BUNDLE\" \"$ENKLAVE_STATE_DIR/signed-input\" && echo \"$ENKLAVE_INPUT_VERSION\" > \"$ENKLAVE_STATE_DIR/signed-input.version\""]}
