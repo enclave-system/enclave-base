@@ -58,18 +58,14 @@ func (a Alg) CertHandle() string {
 	return "0x01C00002"
 }
 
-// CreateArgs returns the tpm2_createprimary arguments (without hierarchy
-// authorization and context) that create this EK, and the content of the
-// unique-data file ("-u"): the TPM2B fields of the template's unique area
-// with little-endian sizes, all zero.
-func (a Alg) CreateArgs() (args []string, unique []byte) {
-	const attrs = "fixedtpm|fixedparent|sensitivedataorigin|adminwithpolicy|restricted|decrypt"
+// Tool is the algorithm name for "tpm2_createek -G", which creates the EK
+// from the TCG default template (checked on swtpm: the result equals the
+// public area that FromPublicKey builds from the EK certificate).
+func (a Alg) Tool() string {
 	if a == ECC {
-		u := append([]byte{0x20, 0x00}, make([]byte, 32)...)
-		u = append(u, append([]byte{0x20, 0x00}, make([]byte, 32)...)...)
-		return []string{"-G", "ecc256:aes128cfb", "-g", "sha256", "-a", attrs}, u
+		return "ecc"
 	}
-	return []string{"-G", "rsa2048:aes128cfb", "-g", "sha256", "-a", attrs}, append([]byte{0x00, 0x01}, make([]byte, 256)...)
+	return "rsa"
 }
 
 // PolicyA is the authPolicy of the default EK templates:

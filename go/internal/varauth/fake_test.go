@@ -512,16 +512,19 @@ func (f *fakeTPM) Run(name string, args ...string) ([]byte, error) {
 		f.requireEnc(sx, "decrypt", "nv changeauth")
 		ix.auth = newAuth
 		return nil, nil
-	case "tpm2_createprimary":
-		hi := f.h[arg(args, "-C")]
+	case "tpm2_createek": // endorsement hierarchy authorization
+		hi := f.h["e"]
 		if _, err := f.authEntity(arg(args, "-P"), hi.auth, hi.policy, ""); err != nil {
 			return nil, err
 		}
-		if arg(args, "-C") != "e" || arg(args, "-G") != "ecc256:aes128cfb" || !bytes.Equal(f.read(arg(args, "-L")), ekcert.PolicyA) {
-			// only the ECC EK exists in this model; another template yields another key
-			return nil, os.WriteFile(arg(args, "-c"), []byte("OTHER"), 0o600)
+		pub := f.ekPublic()
+		if arg(args, "-G") != "ecc" {
+			pub = []byte("OTHER") // only the ECC EK exists in this model
 		}
-		return nil, os.WriteFile(arg(args, "-c"), f.ekPublic(), 0o600)
+		if err := os.WriteFile(arg(args, "-u"), pub, 0o600); err != nil {
+			return nil, err
+		}
+		return nil, os.WriteFile(arg(args, "-c"), pub, 0o600)
 	case "tpm2_evictcontrol":
 		o := f.h["o"]
 		if _, err := f.authEntity(arg(args, "-P"), o.auth, o.policy, ""); err != nil {

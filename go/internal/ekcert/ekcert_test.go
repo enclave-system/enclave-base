@@ -40,7 +40,7 @@ func swtpmStore(t *testing.T) *Store {
 var vectorTime = time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
 
 // The vectors were captured from swtpm 0.7.1 (swtpm_setup --create-ek-cert,
-// EK created with tpm2_createprimary and the default template, persisted at
+// EK created from the default template (tpm2_createek), persisted at
 // 0x81000E01, "tpm2_readpublic -o -n -t").
 func TestSwtpmVector(t *testing.T) {
 	k, c, err := swtpmStore(t).Verify(read(t, "swtpm-ek.der"), vectorTime)

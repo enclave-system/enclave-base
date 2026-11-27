@@ -659,24 +659,18 @@ func (t *tpm) installSalt(tr ekTrust, policy bool) error {
 	} else if len(tr.allow) == 0 {
 		return fmt.Errorf("the TPM's endorsement key cannot be authenticated: %s; no signed EK allowlist in this release", strings.Join(tr.problems, "; "))
 	}
-	if err := t.put("ek-policy.bin", ekcert.PolicyA); err != nil {
-		return err
-	}
 	var problems []string
 	for _, alg := range algs {
 		if _, err := t.run("tpm2_flushcontext", "-t"); err != nil {
 			return err
 		}
-		args, unique := alg.CreateArgs()
-		if err := t.put("ek-unique.bin", unique); err != nil {
-			return err
-		}
-		create := append(args, "-L", t.w("ek-policy.bin"), "-u", t.w("ek-unique.bin"), "-c", t.w("ek.ctx"))
+		// tpm2_createek applies the TCG default EK template of the algorithm
+		create := []string{"tpm2_createek", "-G", alg.Tool(), "-c", t.w("ek.ctx"), "-u", t.w("ek-created.pub")}
 		var err error
 		if policy {
-			_, err = t.session(sessP, "", append(append([]string{"tpm2_createprimary"}, create...), "-C", "e", "-P")...)
+			_, err = t.session(sessP, "", append(create, "-P")...)
 		} else {
-			_, err = t.run("tpm2_createprimary", append([]string{"-C", "e"}, create...)...)
+			_, err = t.run(create[0], create[1:]...)
 		}
 		if err != nil {
 			return err
@@ -797,17 +791,9 @@ func EKNames(c Config, r Runner) ([]string, error) {
 	defer os.RemoveAll(work)
 	c.Work = work
 	t := &tpm{c: c, r: r}
-	if err := t.put("ek-policy.bin", ekcert.PolicyA); err != nil {
-		return nil, err
-	}
 	var out []string
 	for _, alg := range ekcert.Algs {
-		args, unique := alg.CreateArgs()
-		if err := t.put("ek-unique.bin", unique); err != nil {
-			return nil, err
-		}
-		create := append([]string{"-C", "e"}, append(args, "-L", t.w("ek-policy.bin"), "-u", t.w("ek-unique.bin"), "-c", t.w("ek.ctx"))...)
-		if _, err := t.run("tpm2_createprimary", create...); err != nil {
+		if _, err := t.run("tpm2_createek", "-G", alg.Tool(), "-c", t.w("ek.ctx"), "-u", t.w("ek-created.pub")); err != nil {
 			return nil, err
 		}
 		k, err := t.readEK(t.w("ek.ctx"))
