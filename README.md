@@ -71,8 +71,8 @@ make the next boot fail closed, it can never forge state.
 
 ### TPM policy and ownership
 
-Every enklave TPM object and the owner, endorsement and lockout hierarchies are
-governed by
+The volume key, the record, the administration of the counter and the owner,
+endorsement and lockout hierarchies are governed by
 
     P = PolicyAuthorizeNV(V)
     V = PolicyAuthorize(PCR key, "enklave-var-v1:<role>:<profile>") + PolicyPCR(7 = recorded, 12 = 0)
@@ -81,6 +81,13 @@ governed by
 and can be written only through the owner hierarchy, that is, under P itself.
 The Name of `V` (and with it P) is bound to the PCR signing key, role and
 profile.
+
+Two indices have their own policies:
+
+- The revocation bits `0x01800E04`: bits can be set by any approved UKI of the
+  same role and profile (`PolicyAuthorize` alone) and never cleared.
+- The counter `0x01800E03`: read and incremented at runtime with an authValue
+  derived from the volume key; that authValue can be set under P only.
 
 The authorized part is the release's signed approved policy
 (`/EFI/enklave/policy/<uki>.json` on the ESP, made by `enklave-sign-policy`):
@@ -160,9 +167,11 @@ Intel PTT on some platforms, virtual TPMs of development VMs), a release can
 carry the EK Names of individual devices: build with
 `EK_ALLOWLIST=<file>` (one Name per line, `#` comments). The file ends up in
 the verity-protected `/usr/lib/enklave/ek-allowlist` and is signed with the
-release. Get the Names with `enklave-varauth ek-name` on the device before
-provisioning, in a trusted environment: an allowlist entry is only as good as
-the moment it was read.
+release. Get the Names on the device before provisioning, from a trusted
+provisioning system with tpm2-tools: `enklave-varauth ek-name`, or
+`tpm2_createek -G ecc -c ek.ctx -u ek.pub` and the `name` line of
+`tpm2_readpublic -c ek.ctx`. An allowlist entry is only as good as the moment
+it was read.
 
 ### Security epochs: revoking a vulnerable release
 
