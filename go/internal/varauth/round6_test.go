@@ -521,3 +521,58 @@ func TestUnpredictedAppendFormIsReadBack(t *testing.T) {
 	}
 	e.mustBoot(t, "current (1 update")
 }
+
+// A healing release that arrives while a Secure Boot update is pending
+// heals and completes the transition in the same boot (PCR 7 is bound
+// exactly in both modes, so healing needs no steady state).
+func TestHealingWhileUpdatePending(t *testing.T) {
+	older, revoked := bytes.Repeat([]byte{0x0d}, 32), bytes.Repeat([]byte{0xd0}, 32)
+	for name, rolledBack := range map[string]bool{"update in the firmware": false, "update rolled back": true} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, "prod")
+			e.fw.Vars[dbxVar] = sbtest.ESL(older)
+			e.mustBoot(t, "current")
+			e.later()
+			e.setImage(t, "ref", "prod", 1, 0)
+			e.shipDbx(t, "dbx-epoch0.auth", revoked)
+			e.mustBoot(t, "pending")
+			key := append([]byte{}, e.f.luks[e.dev]...)
+			e.setImage(t, "ref", "prod", 2, 2) // healing release, same update
+			if rolledBack {
+				e.fw.Vars[dbxVar] = sbtest.ESL(older)
+				e.mustBoot(t, "failed: NOT APPLIED: the firmware lost")
+			} else {
+				e.mustBoot(t, "current (1 update")
+			}
+			if bytes.Equal(key, e.f.luks[e.dev]) {
+				t.Fatal("not healed")
+			}
+			if ts, err := parseTransition(e.f.nv[handleNum(Transition.Handle)].data); err != nil || ts.state != trIdle {
+				t.Fatalf("transition not closed: %+v %v", ts, err)
+			}
+			key = append([]byte{}, e.f.luks[e.dev]...)
+			if err := e.boot(t); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(key, e.f.luks[e.dev]) {
+				t.Fatal("healed twice")
+			}
+			// a foreign Secure Boot state is refused by a healing release as well
+			e.fw.SecureBoot = 0
+			wantErr(t, e.boot(t), "Secure Boot configuration changed")
+		})
+	}
+	// ... and a healing release does not heal under a foreign Secure Boot state
+	e := newEnv(t, "prod")
+	e.mustBoot(t, "current")
+	e.later()
+	e.shipDbx(t, "dbx-epoch0.auth", revoked)
+	e.mustBoot(t, "pending")
+	key := append([]byte{}, e.f.luks[e.dev]...)
+	e.setImage(t, "ref", "prod", 1, 1)
+	e.fw.SecureBoot = 0
+	wantErr(t, e.boot(t), "is none of them")
+	if !bytes.Equal(key, e.f.luks[e.dev]) {
+		t.Fatal("healed under a foreign Secure Boot state")
+	}
+}

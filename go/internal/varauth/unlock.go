@@ -550,9 +550,9 @@ func (t *tpm) withState(fn func(root string) error) error {
 // record A still exists, must have the recorded Name (F4). The platform
 // check of the first boot is repeated (B7).
 func (t *tpm) heal(st tpmState, rd *RecordData, varDev string) ([]byte, error) {
-	if t.mode != modeSteady {
-		return nil, errors.New("a Secure Boot variable update is pending (PCR 7 transition): boot the release that started it once more before healing")
-	}
+	// Healing does not depend on whether a Secure Boot update is in transit:
+	// V and T are not touched here, PCR 7 is bound exactly in both modes, and
+	// the verify step of this boot completes the transition as usual.
 	if err := t.requireEventLog(); err != nil {
 		return nil, err
 	}
