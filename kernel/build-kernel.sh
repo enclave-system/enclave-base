@@ -52,7 +52,9 @@ gnupghome="$cache/gnupg"
 mkdir -p "$gnupghome"; chmod 700 "$gnupghome"
 gpgk() { gpg --homedir "$gnupghome" --batch --no-default-keyring --keyring "$gnupghome/kernel.kbx" "$@"; }
 if ! gpgk --list-keys "$GREG" >/dev/null 2>&1; then
-    gpgk --auto-key-locate clear,wkd --locate-keys gregkh@kernel.org torvalds@kernel.org >/dev/null 2>&1 \
+    # Fetched by pinned fingerprint. keys.openpgp.org serves these keys
+    # without user IDs, which gpg refuses to import.
+    gpgk --keyserver hkps://keyserver.ubuntu.com --recv-keys "$GREG" "$LINUS" \
         || gpgk --keyserver hkps://keys.openpgp.org --recv-keys "$GREG" "$LINUS" \
         || die "could not import kernel.org signing keys"
 fi
