@@ -105,6 +105,10 @@ func TestRollbackRecordIsMonotonic(t *testing.T) {
 		e.fw.Reject = errors.New("EACCES")
 		for i := 0; i < 5; i++ {
 			e.mustBoot(t, "failed: NOT APPLIED: dbx-epoch0.auth: EACCES")
+			// a refused update leaves no entry behind (the record has 8 slots)
+			if ts := e.f.nv[handleNum(Transition.Handle)].data; !bytes.Equal(ts, make([]byte, Transition.Size)) {
+				t.Fatalf("record not empty after a refusal: %x", ts)
+			}
 		}
 		e.fw.Reject = nil
 		e.mustBoot(t, "pending")
@@ -153,6 +157,10 @@ func TestPartialUpdateAcceptance(t *testing.T) {
 			// reports the rest
 			e.mustBoot(t, "failed: NOT APPLIED: ")
 			e.mustBoot(t, "failed: NOT APPLIED: ")
+			// refused updates occupy no record entry, taken ones are dropped once in the firmware
+			if ts := e.f.nv[handleNum(Transition.Handle)].data; !bytes.Equal(ts, make([]byte, Transition.Size)) {
+				t.Fatalf("record not empty: %x", ts)
+			}
 			if readFile(filepath.Join(e.c.stateMount(), "data/config")) != "kept" {
 				t.Error("state lost")
 			}

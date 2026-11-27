@@ -608,6 +608,7 @@ func (t *tpm) secureBootUpdates() (string, error) {
 	}
 	var failed []string
 	var allowed []sbstate.Update
+	fresh := 0 // updates that will need a new record entry
 	for _, u := range todo {
 		e := ts.entry(updateID(u))
 		switch {
@@ -615,12 +616,12 @@ func (t *tpm) secureBootUpdates() (string, error) {
 			failed = append(failed, u.File+": the firmware lost this update before (variable store rolled back); the transition is not opened again")
 		case e != nil && e.n >= maxArmCount:
 			failed = append(failed, fmt.Sprintf("%s: armed %d times and never taken by the firmware; not armed again", u.File, e.n))
-		case e == nil && len(ts.seen) >= maxSeen:
+		case e == nil && len(ts.seen)+fresh >= maxSeen:
 			failed = append(failed, u.File+": the transition record is full")
 		default:
 			allowed = append(allowed, u)
 			if e == nil {
-				ts.seen = append(ts.seen, seenEntry{id: updateID(u)})
+				fresh++
 			}
 		}
 	}
@@ -671,8 +672,12 @@ func (t *tpm) secureBootUpdates() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		e := ts.entry(id)
-		e.n++
+		// the record entry exists from the moment the transition is armed
+		// for this update, and only as long as it says something
+		if ts.entry(id) == nil {
+			ts.seen = append(ts.seen, seenEntry{id: id})
+		}
+		ts.entry(id).n++
 		ts.state, ts.old, ts.prev, ts.new = trArmed, old, prevSet, newSet
 		ts.cur, ts.next = t.branches, list
 		if err := t.writeTransition(ts); err != nil {
@@ -691,7 +696,11 @@ func (t *tpm) secureBootUpdates() (string, error) {
 		t.pause("pcr7-applied")
 		if bytes.Equal(after, cur) {
 			// refused by the firmware: this arming opened nothing
-			ts.entry(id).n--
+			if e := ts.entry(id); e.n <= 1 {
+				ts.drop(id)
+			} else {
+				e.n--
+			}
 			if aerr == nil {
 				aerr = errors.New("the firmware accepted the write but left the variable unchanged")
 			}
