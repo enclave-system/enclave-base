@@ -71,19 +71,37 @@ and the only holder of the state keys at runtime:
   authorization in `/run/enklave/state.key`. The state service reads and
   deletes the file before it reports ready, and `local-fs.target` requires
   the service, so no ordinary service ever runs while the file exists.
-  Afterwards the keys exist in that process only. `kernel.yama.ptrace_scope=3`
-  and `lockdown=confidentiality` keep other processes, root included, from
-  reading its memory.
+  Afterwards the keys exist in that process only. The process is not
+  dumpable (`PR_SET_DUMPABLE` 0, `LimitCORE=0`), and
+  `kernel.yama.ptrace_scope=3` with `lockdown=confidentiality` keeps other
+  processes, root included, from reading its memory.
 - **Writers are defined by the image.** A commit is not "run this command".
   The caller names a writer, and the command of a writer is fixed in the
-  verity-protected `/usr/lib/enklave/state-writers.d/<id>.json`
-  (`{"unit": "<x>.service", "exec": [...]}`). The caller can pass input on
-  stdin; checking that input is the writer's job (`enklave-cfg`, for example,
-  accepts signed bundles only).
-- **Callers are authorized.** The service takes the caller's identity from
-  the kernel (`SO_PEERCRED`, `SO_PEERPIDFD`): uid 0, and the process must run
-  in the systemd unit the writer is reserved for (cgroup of the peer). A
-  root shell, another service or a transient unit (`systemd-run`) is refused.
+  verity-protected `/usr/lib/enklave/state-writers.d/<id>.json`:
+  `{"unit": "<x>.service", "input": "<kind>", "exec": [...]}`.
+- **Input is verified by the service, not by the writer.** Every writer
+  declares what it consumes:
+  - `"input": "none"`: the writer gets nothing from the caller. What it
+    writes is decided by the image alone.
+  - `"input": "signed-bundle"`: the caller passes a 64-byte Ed25519 signature
+    followed by an enklave bundle (`enklave-cfg build`, `sign`). Before
+    anything runs, the service checks the signature against the
+    config-signing key of the image, that the bundle is for this role, and
+    that its version is **higher than the last version this writer
+    accepted**. That last version is stored inside the authenticated state
+    (covered by the manifest MAC and the TPM counter), so it cannot be turned
+    back. The writer then gets the verified bundle (`$ENKLAVE_INPUT_BUNDLE`,
+    `$ENKLAVE_INPUT_SIG`, `$ENKLAVE_INPUT_VERSION`, and on stdin).
+
+  A writer without one of these declarations is refused by the service and
+  by the image build (`mkosi.finalize`). The test profile alone may declare
+  `"unverified"`.
+- **Callers are separated by unit.** The service takes the caller's identity
+  from the kernel (`SO_PEERCRED`, `SO_PEERPIDFD`): uid 0, and the process must
+  be in the cgroup `/system.slice/<unit>` of the unit the writer is reserved
+  for. The whole cgroup path is compared; a cgroup that merely carries the
+  unit's name somewhere else does not count. Another service, a root shell or
+  a transient unit (`systemd-run`) is refused.
 - **The volume is writable only inside the service** (`PrivateMounts=yes`),
   for the duration of one commit.
 - **Reads are authenticated.** `enklave-varauth state-read <path>` (package
@@ -96,25 +114,34 @@ and the only holder of the state keys at runtime:
 Usage: `enklave-varauth state-exec <writer> < input`,
 `enklave-varauth state-read <path>`, `enklave-varauth state-status`.
 
-What this does and does not guarantee:
+What this guarantees, exactly:
 
-- A process without the state keys cannot produce state that the system
-  accepts. Bypassing the mount (own mount namespace, block device) only
-  yields content that every authenticated read and the next boot refuse.
-- The keys can leave the service only through a kernel compromise. A root
-  process cannot attach to it, read its memory, or read kernel memory.
-- A root process **can** still replace how an allowed unit is started: systemd
-  honours unit drop-ins from `/etc` and `/run` (both tmpfs), and its private
-  socket accepts any request from uid 0. systemd has no switch that forbids
-  this to root, so it cannot be closed in the base image. Such a process can
-  then *trigger* a writer with input of its choice; it still cannot make the
-  service run anything but the image's writer commands. Therefore:
-  - writers must validate their input (signatures), and
-  - **role services must not run as root and must have no access to the
-    systemd bus or private socket** (`User=`, `PrivateUsers=`,
-    `ProtectSystem=strict`, no `CAP_SYS_ADMIN`). This is a requirement for
-    the role repos; the base image itself has no login, no interactive root
-    and starts no service outside its own verity-protected units.
+- **No process can forge state content that the system accepts**, root
+  included. There are three ways to try, and each ends the same way:
+  1. Writing the volume directly (own mount namespace, block device): the
+     process has no state keys, so every authenticated read and the next
+     boot refuse the result.
+  2. Calling the service from the wrong place: refused (unit separation).
+  3. Calling the service from the right place. The unit separation is **not**
+     a boundary against root: a root process can move itself into the cgroup
+     of the reserved unit, or have systemd start that unit differently
+     (systemd honours drop-ins from `/etc` and `/run` and requests from
+     uid 0; it has no switch that forbids this to root). Such a process can
+     **trigger** a writer. It cannot choose what the writer consumes: a
+     writer either takes no input, or only a bundle signed with the
+     config-signing key, for this role, newer than the last one. Replaying an
+     old signed bundle is refused by the version check.
+- What root can therefore do is run an image-defined writer once more with
+  no input, or deliver a genuine, newer signed bundle earlier than its
+  intended transport would have. Neither puts content into the state that
+  the signer did not sign or the image did not define.
+- The keys can leave the service only through a kernel compromise.
+
+Requirement for the role repos: a writer with `"input": "none"` must not
+derive what it writes from anything a local process controls (files in
+`/run`, environment, network input); such data needs a signed bundle. Role
+services should still not run as root (`User=`, `ProtectSystem=strict`, no
+`CAP_SYS_ADMIN`); the guarantees above do not depend on it.
 
 ### TPM policy and ownership
 
@@ -123,6 +150,8 @@ endorsement and lockout hierarchies are governed by
 
     P = PolicyAuthorizeNV(V)
     V = PolicyAuthorize(PCR key, "enklave-var-v1:<role>:<profile>") + PolicyPCR(7 = recorded, 12 = 0)
+        (during a signed Secure Boot update: a PolicyOR over two to four such
+        digests, each for one exact PCR 7 value)
 
 `V` is the NV index `0x01800E05`. It holds the PCR-bound part of the policy
 and can be written only through the owner hierarchy, that is, under P itself.
@@ -131,8 +160,9 @@ profile.
 
 Two indices have their own policies:
 
-- `T` `0x01800E06`, the transition state, is written through the owner
-  hierarchy like `V` (under P only).
+- `T` `0x01800E06`, the record of Secure Boot variable updates (the exact
+  states `V` admits during an update, and the monotonic per-update record),
+  is written through the owner hierarchy like `V` (under P only).
 - The revocation bits `0x01800E04`: bits can be set by any approved UKI of the
   same role and profile (`PolicyAuthorize` alone) and never cleared.
 - The counter `0x01800E03`: read and incremented at runtime with an authValue
@@ -148,16 +178,18 @@ volume and one role cannot open another's.
 There is no administrative secret. The first boot on a fresh TPM runs in this
 order:
 
-1. The platform is checked: the TPM implements `TPM2_PolicyAuthorizeNV`, and
-   the firmware's event log replays to PCR 7 and measures db, dbx and KEK
-   exactly once each (otherwise the device could not take a signed dbx update
-   later; it is not enrolled).
+1. The platform is checked. DMA remapping is active (IOMMU, see "Why PCR 1
+   is not bound"). The TPM implements `TPM2_PolicyAuthorizeNV` and holds no
+   object that is not enklave's or the vendor's. The firmware's event log
+   replays to PCR 7 and measures db, dbx and KEK exactly once each and
+   verbatim (otherwise the device could not take a signed dbx update later
+   under an exact PCR 7 binding; it is not enrolled).
 2. The TPM's endorsement key is authenticated (next section) and persisted as
    the salt key `0x81000E01`.
 3. The three indices that hold no secret are defined with the still-empty
    owner auth: the revocation bits `0x01800E04`, `V` `0x01800E05` (holding
-   the Secure Boot state of this boot) and `T` `0x01800E06` (state of a
-   Secure Boot variable update in transit, idle).
+   the Secure Boot state of this boot) and `T` `0x01800E06` (record of
+   Secure Boot variable updates, empty).
 4. The hierarchies are locked: policy P, random discarded authValues,
    `TPM2_Clear` disabled.
 5. Only then the indices that protect data are created, each authorized by P:
@@ -190,11 +222,13 @@ binding must be re-checked on every boot, or an interposer swaps the salt
 key). The lockout would still have to be reset under policy P each boot. What
 makes disabling it sound is an invariant, and the invariant is enforced: no
 secret in this TPM is a guessable authValue. All enklave authValues are
-256-bit random values and all enklave indices are `NO_DA`; the selftest check
-`tpm_locked` fails if the lockout is still enabled **or if the TPM holds any
-object enklave does not account for** (anything outside the enklave indices,
-the salt key, the vendor's EK certificates and keys, and the storage root
-key that systemd creates with an empty authValue).
+256-bit random values and all enklave indices are `NO_DA`. **Every unlock, in
+every profile, fails closed before it touches the lockout if the TPM holds
+any object enklave does not account for** (anything outside the enklave
+indices, the salt key, the vendor's EK certificates and keys, and the storage
+root key that systemd creates with an empty authValue); first provisioning
+does the same. The selftest check `tpm_locked` reports the same condition and
+that the lockout is disabled.
 
 ### TPM authenticity: endorsement key certificate
 
@@ -203,14 +237,18 @@ or RSA 2048). Its public area is never taken on trust from the TPM bus. On
 **every boot** (first provisioning, healing and normal boots):
 
 - the EK certificate is read from the TPM (NV `0x01C0000A` ECC, `0x01C00002`
-  RSA; intermediate certificates from NV `0x01C00100`–`0x01C001FF`) and must
-  chain to a TPM vendor CA in `/usr/share/enklave/tpm-ek-ca` (AMD, Atmel,
+  RSA; intermediate certificates from NV `0x01C00100`–`0x01C001FF`), or, for
+  TPMs that do not carry it, from `ESP:/EFI/enklave/ekcert/` (below), and
+  must chain to a TPM vendor CA in `/usr/share/enklave/tpm-ek-ca` (AMD, Atmel,
   Infineon, Intel, NationZ, Nuvoton, Qualcomm, STMicro; provenance in
   `SOURCE`, hashes in `SHA256SUMS`);
 - the certificate must be an EK certificate as the TCG EK Credential Profile
-  defines it: extended key usage `tcg-kp-EKCertificate` (2.23.133.8.1), not
-  excluded by an issuing CA that restricts its usages, and a subjectAltName
-  that names the TPM manufacturer, model and version;
+  defines it. This is mandatory: extended key usage `tcg-kp-EKCertificate`
+  (2.23.133.8.1), not excluded by an issuing CA that restricts its usages;
+  or, only if the certificate carries no extended key usage at all, a
+  certificate policy from the TCG arc (2.23.133). A certificate with other
+  usages only, or with neither mark, is refused. In addition the
+  subjectAltName must name the TPM manufacturer, model and version;
 - the EK public area is rebuilt locally from the default template and the
   certificate's public key; the key in the TPM must be exactly that key;
 - sessions are started from a locally built key reference, so the TPM tools
@@ -239,27 +277,54 @@ Not accepted on purpose:
 - **SHA-1 signed EK certificates** of TPMs from before 2016.
 
 **Firmware TPM required (`REQUIRE_FTPM=1`, `require_ftpm` in the signed
-`release.json`).** When set, provisioning also refuses EK certificates of
-discrete-TPM vendors (Atmel, Infineon, NationZ, Nuvoton, STMicro) and accepts
-only firmware-TPM vendors (AMD fTPM and Pluton, Intel PTT, Qualcomm). A
+`release.json`).** When set, only EK certificates of firmware-TPM vendors are
+accepted (AMD fTPM and Pluton, Intel PTT, Qualcomm); certificates of
+discrete-TPM vendors (Atmel, Infineon, NationZ, Nuvoton, STMicro) are
+refused, from the TPM and from the ESP alike, and so is every device without
+a vendor certificate (an admission proves nothing about the kind of TPM). A
 discrete TPM has a bus that can be tapped and reset; a firmware TPM has none.
-Default: **off in this base repo** (the reference role runs in VMs and on
-servers whose TPM is discrete); **role repos set it, and the client role must
-set it**, because notebooks are the devices an attacker gets physical access
-to.
 
-**TPMs without an EK certificate: per-device admission.** Some firmware TPMs
-keep no certificate in NV (AMD fTPM, Intel PTT on some platforms), and the
-emulated TPMs of development VMs have none that a non-test image trusts.
-Such a device is admitted individually, by a signature, never by a list in
-the image:
+- Role `client` **must** be built with it. `enklave-sign-policy` refuses to
+  sign, `mkosi.finalize` refuses to build and the unlock step refuses to run
+  a client release without it. Only test-profile builds (emulated TPMs in
+  VMs) are exempt.
+- For other roles it is a per-role decision; default off in this base repo
+  (the reference role runs in VMs and on servers whose TPM is discrete).
+
+**TPMs that do not carry their EK certificate: certificate on the ESP.** Some
+firmware TPMs keep no certificate in NV (AMD fTPM, Intel PTT on some
+platforms); the vendor publishes it through a web service keyed by the EK
+public key. Fetch it once per device, out of band (`enklave-varauth ek-name`
+prints the EK Names; `tpm2_createek -G ecc -c ek.ctx -u ek.pub` gives the
+public key the vendor service asks for), and ship it with the release:
+
+    make EK_CERTS=<dir with *.cer / *.pem> ...
+
+`enklave-sign-policy` copies the files to `ESP:/EFI/enklave/ekcert/`. The
+location gives them no authority. The device verifies each one exactly like
+a certificate from NV (vendor CA, EK usage, TPM attributes, `require_ftpm`),
+and its endorsement key must be the key of one of the verified certificates.
+A device authenticated this way uses the same policyRef as one with the
+certificate in NV. A directory with the certificates of a whole fleet works:
+every device finds its own.
+
+**Production accepts vendor-certified endorsement keys only.** This is
+enforced in code: `enklave-sign-policy` refuses to sign a per-device
+admission for a `prod` image, and a `prod` release ignores any admission it
+finds. The reason: whoever signs an admission cannot tell the Name of an
+emulated TPM (whose private key is a file) from the Name of a real one. A
+vendor certificate can.
+
+**Per-device admission (dev and test builds only).** The emulated TPMs of
+development VMs have no certificate that a non-test image trusts. Such a
+device is admitted individually, by a signature, never by a list in the
+image:
 
 - `make EK_ADMIT=<file>` (one EK Name per line) lets `enklave-sign-policy`
-  sign, for each Name, one additional policy for the policyRef
-  derived from `enklave-var-v1:<role>:<profile>` and that Name (a digest:
-  `ek1:<base64>`). It is stored next to the
-  release's policy on the ESP. No image contains an allowlist (asserted by
-  the build).
+  sign, for each Name, one additional policy for the policyRef derived from
+  `enklave-var-v1:<role>:<profile>` and that Name (a digest: `ek1:<base64>`).
+  It is stored next to the release's policy on the ESP. No image contains an
+  allowlist (asserted by the build).
 - The device computes the Name of its own EK, looks for the policy signed
   for exactly that ref, and binds all its TPM objects to that ref.
 - **An admission cannot be used elsewhere.** On another device it names a key
@@ -267,17 +332,8 @@ the image:
   provisioned through an EK certificate is bound to the base ref: if an
   interposer hides its certificate and presents an admitted key, the device
   ends up under another ref, whose policy opens none of its objects.
-- **A TPM with a valid certificate is never matched against admissions.**
-- **Emulated TPMs** (their private key is a file) may be admitted for the
-  `dev` and `test` profiles only. The tool cannot tell an emulated TPM's Name
-  from a real one, so for `prod` this is an operator rule, and
-  `enklave-sign-policy` prints a warning whenever it signs an admission with
-  production keys: read the Name on the real device, before provisioning, in
-  a trusted environment (`enklave-varauth ek-name`, or
-  `tpm2_createek -G ecc -c ek.ctx -u ek.pub` and the `name` line of
-  `tpm2_readpublic -c ek.ctx`).
-- `require_ftpm` does not apply to admissions: the operator vouches for the
-  device.
+- A TPM with a valid certificate is never matched against admissions.
+- Not available with `require_ftpm`.
 
 ### Security epochs: revoking a vulnerable release
 
@@ -309,88 +365,130 @@ Pre-scheme UKIs (empty policyRef, builds ≤ 2fd8d34) never satisfy P.
 ### Secure Boot variable updates (dbx, db, KEK) and PCR 7
 
 A dbx, db or KEK change alters PCR 7 from the next boot on. The binding to
-PCR 7 therefore lives in `V` and is moved by the release, per device, without
-ever accepting a Secure Boot state it has not pinned in advance:
+PCR 7 therefore lives in `V` and is moved by the release, per device. **PCR 7
+is bound at every moment, and the TPM enforces it**: `V` holds either the
+exact PCR 7 + 12 of the device, or, while a signed update is in transit, a
+`PolicyOR` over a short list of exact PCR 7 + 12 values.
 
-1. **Boot A** (new release, old PCR 7 still valid). After the state volume is
-   verified, the release finds that its `efi-updates/*.auth` are not yet in
-   the firmware. From the event log of this boot it computes two digests:
-   the Secure Boot state as it is, and that state with exactly the signatures
-   of the signed update added to the updated variable. It writes both into
-   the NV index `T` (`0x01800E06`, writable under P only), rewrites `V` to
-   bind **PCR 0, 2, 4 and 12** (firmware code, option ROMs/drivers, every EFI
-   binary on the boot path, no ESP credentials), hands the update to the
-   firmware and marks `T` "applied". Status: `pending`.
-2. **Boot B** (same UKI). **Before the volume key is read**, the boot replays
-   the event log against PCR 7 and computes the digest of the Secure Boot
-   state of this boot. It must equal one of the two digests in `T`:
-   - the state before the update (the firmware has not taken it yet), or
-   - that state plus exactly the signed update: nothing dropped from dbx,
-     nothing else added, Secure Boot on, PK, KEK, db and the signing
-     authority unchanged.
+**Boot A** (new release, old PCR 7 still valid). After the state volume is
+verified, the release takes its `efi-updates/*.auth` that are not yet in the
+firmware, one at a time:
 
-   Anything else is refused at this point; the volume key stays in the TPM.
-   If the update is in the firmware, `V` is rewritten to the new PCR 7 + 12
-   and `T` is cleared. Status: `current`.
+1. It computes the PCR 7 value of the next boot in advance: the events of
+   this boot, with the measurement of the updated variable replaced by the
+   measurement of "current content plus the update". Two forms are computed,
+   because firmware stores an append in one of two ways: edk2 drops entries
+   the variable already holds, other firmware appends the update as it is.
+2. It records the transition in the NV index `T` (`0x01800E06`, writable
+   under P only) and sets `V` to the list: the state before the transition,
+   the current state, and the computed ones.
+3. It hands the update to the firmware and **reads the variable back**.
+   - Unchanged: the firmware refused the update. Nothing is pending for it.
+   - Changed: the variable must hold exactly its old signatures plus the
+     update's. `V` is narrowed to two values: the state before the
+     transition and the exact value computed from what was read back.
+
+Status: `pending`. What `T` and `V` record is always what was read back from
+the firmware, never what was sent. If the firmware takes only some of the
+updates (for example a full dbx), the next boot is still one of the listed
+states.
+
+**Boot B.** The TPM releases the volume key only if PCR 7 + 12 of this boot
+is one of the values in `V`; any other Secure Boot state gets no policy
+session. Independently, and also **before the volume key is read**, the boot
+replays the event log against PCR 7 and compares the Secure Boot state with
+the states `T` pins (before the update, or that state plus exactly the signed
+update: nothing dropped from dbx, nothing else added, Secure Boot on, PK,
+KEK, db and the signing authority unchanged). Then:
+
+- New state: `V` is set to it alone. Status: `current`.
+- Old state, and the firmware had held the update in boot A: the variable
+  store was rolled back. `V` returns to the old state alone. Status:
+  `failed`.
 
 Properties:
 
-- **No window.** While `V` binds the boot chain, the Secure Boot state is not
-  free: only the two pinned states unlock. Secure Boot off, another key, a
-  dropped dbx entry or a disabled protection that the firmware measures into
-  PCR 7 all fail before the key is read.
-- **One shot.** If an update that was marked applied is missing again (the
-  variable store was rolled back, e.g. by rewriting the SPI flash), the
-  device returns to its old PCR 7 binding, remembers "rolled back" in `T`
-  and does **not** open the transition again for this update, however often
-  the rollback is repeated. Status: `failed`.
-- **No brick.** A power loss before the firmware took the update is retried
-  (the state is then exactly the old one). If the firmware rejects the
-  update, the device returns to its PCR 7 binding and reports `failed`.
+- **Enforced by the TPM, not by a check.** During the transition a boot with
+  Secure Boot off, another key, a dropped dbx entry or any other PCR 7 value
+  cannot build a policy session that `V` accepts. An attacker who patches the
+  software check out of memory, or who answers `TPM2_PCR_Read` falsely on the
+  bus, gains nothing: the TPM compares its own PCR 7.
+- **One shot, and the record is monotonic.** `T` keeps a record per update
+  (16-byte digest of the `.auth` file): how often the transition was armed
+  for it, and whether the firmware variable ever held it. An update that the
+  firmware held and lost again (the variable store was rolled back, e.g. by
+  rewriting the SPI flash) is **never armed again**, by this or any other
+  release. An update that was armed and never taken (power cut before the
+  firmware wrote it) is armed at most three times. An entry is removed only
+  while the firmware holds the update and `V` is bound to that state. A
+  release without updates does not touch the record; a release with more
+  updates adds entries and keeps the others.
+- **No brick.** A power loss at any point leaves the firmware in one of the
+  listed states: before the write the old one, after it one of the computed
+  ones. A refused update changes nothing. A partially accepted set of
+  updates is recorded as accepted. One case cannot be closed from the
+  operating system: firmware that stores an append in a form that is neither
+  of the two computed ones, **and** a power loss in the milliseconds between
+  the firmware's write and the narrowing of `V` in the same boot. The TPM
+  cannot be told to accept a value nobody knows yet; accepting unknown
+  values would reopen the window that the exact binding closes. Without the
+  power loss such firmware is handled (the exact value is read back and
+  recorded); with it the device fails closed and needs a factory reset.
 - **Firmware that cannot carry this is not enrolled.** First provisioning and
-  healing require the event log to replay to PCR 7 and to measure db, dbx
-  and KEK exactly once each as signature lists. A device that passed cannot
-  end up unable to take a revocation later (status `blocked`) unless its
-  firmware is changed.
+  healing require: the event log replays to PCR 7; db, dbx and KEK are
+  measured exactly once each as signature lists; each is measured verbatim
+  (the measurement is the digest of the variable as the variable store
+  returns it), so that the next PCR 7 can be computed. A device that passed
+  cannot end up unable to take a revocation later (status `blocked`) unless
+  its firmware is changed.
 - **Per device.** Nothing is signed per device class: each device records its
   own PCR 7 at provisioning and after each signed update.
 
-The status is in `/run/enklave/efi-updates`, on the serial port and in the
-selftest check `efi_updates`. `failed` means the durable revocation is **not**
-in place on that device.
+**Status, visible in production.** Every boot writes
+`/run/enklave-status/secure-boot-updates.json` (world-readable:
+`{"status": "current|pending|failed|blocked", "ok": bool, "detail": ...}`),
+for the console to collect. `failed` and `blocked` are also logged as a
+critical journal message (`SECURE BOOT UPDATE NOT IN PLACE`) and on the
+serial port; the selftest check `efi_updates` reports them in test builds.
+`failed` or `blocked` means the durable revocation is **not** in place on
+that device. After a detected rollback the device keeps running on its
+verified old Secure Boot state: nothing is disclosed, and it is reported.
 
 Operational rules:
 
-- Between boot A and boot B the device must boot the **same UKI**. Do not
-  install another update while `efi-updates` says `pending` (Task 7 enforces
-  this). If another UKI was booted, boot the previous one again.
 - Supported updates are appends to dbx, db and KEK, signed for the enrolled
   KEK/PK. Changing the certificate that signs the boot chain (a new db key
   used for the UKI) changes PCR 7 without a variable update and is not
   supported in place: it requires a factory reset.
+- Any release of the same role, profile and a non-revoked epoch can complete
+  a pending transition; the same UKI is not required.
 
-### Why PCR 1 is not bound
+### Why PCR 1 is not bound, and what is enforced instead
 
 PCR 1 holds the firmware's configuration data: boot order and boot entries,
 SMBIOS and ACPI tables, and whatever setup options a vendor chooses to
-measure. It is bound neither in the steady state nor during a transition:
+measure. It is not bound:
 
 - It changes for harmless reasons (a boot entry rewritten by the firmware, a
   memory module replaced, a firmware setting touched), and its content is
   vendor specific. Binding it would make devices fail closed at random.
 - What an attacker gains from changing those settings is covered elsewhere.
-  Booting other code (boot order, external media, network boot) changes
-  PCR 4 or PCR 7 and the Secure Boot guard; unsigned option ROMs and drivers
-  change PCR 2. Disabling Secure Boot or its keys changes PCR 7. "DMA
-  protection disabled" is measured into PCR 7 by firmware that follows the
-  TCG PC Client Platform Firmware Profile.
-- What is **not** covered by any PCR enklave binds: a firmware that lets
-  someone switch off the IOMMU (VT-d/AMD-Vi) or enable a debug interface and
-  measures that into PCR 1 only, or not at all. This is not left to PCR 1.
-  The kernel is built and started to enforce DMA remapping
+  Booting other code (boot order, external media, network boot) is stopped
+  by Secure Boot and changes PCR 11 of the UKI. Disabling Secure Boot or
+  changing its keys changes PCR 7.
+- The setting that matters and that firmware may measure into PCR 1 only, or
+  not at all, is the IOMMU (VT-d / AMD-Vi). **This is enforced directly**:
+  before the volume key is read, and before a device is provisioned, the
+  unlock step requires that the firmware describes an IOMMU (ACPI DMAR or
+  IVRS), that the kernel runs it (`/sys/class/iommu`), and that every device
+  group is translated (no identity/passthrough domain). Otherwise it fails
+  closed. The kernel is built and started to demand DMA remapping
   (`iommu=force intel_iommu=on amd_iommu=force_isolation`,
-  `CONFIG_IOMMU_DEFAULT_DMA_STRICT`), and the firmware setup must be locked
-  with a supervisor password (hardware requirement, see below).
+  `CONFIG_IOMMU_DEFAULT_DMA_STRICT`); the check is what refuses the key when
+  the platform does not deliver it.
+- Debug interfaces and other vendor settings that no PCR and no kernel
+  interface reports must be locked with a supervisor password on the
+  firmware setup (hardware requirement, see below).
 
 ### Healing after a compromise
 
@@ -432,8 +530,8 @@ system) and boot again.
   setup, a firmware update that measures differently, a new signing
   certificate for the UKI): the device fails closed. Restore the previous
   state or factory-reset.
-- **Firmware or boot loader updates while a PCR 7 transition is pending:** not
-  allowed (they change PCR 0/2/4).
+- **Firmware updates** that change how or what the firmware measures into
+  PCR 7: the device fails closed, also while a transition is pending.
 
 ### Factory reset and interrupted provisioning
 
@@ -467,6 +565,32 @@ These cannot be closed from the operating system:
 - **Revocation by epoch does not survive a TPM clear.** A cleared TPM has no
   memory of revoked epochs. The durable revocation is the dbx update shipped
   with the release (above); its delivery in updates is part of Task 7.
-- **Firmware setup.** Settings that the firmware does not measure into a PCR
-  enklave binds (see "Why PCR 1 is not bound") must be protected by a
-  supervisor password.
+- **Firmware setup.** Settings that neither a bound PCR nor the kernel
+  reports (debug interfaces, vendor options; see "Why PCR 1 is not bound")
+  must be protected by a supervisor password. The IOMMU is not among them:
+  it is checked on every boot.
+
+### Hardware bring-up checklist
+
+Everything above is proven on QEMU, OVMF and swtpm. Before a hardware model
+is approved, check on one device (a test-profile build prints the reasons on
+the serial port; each item fails closed if it does not hold):
+
+1. **EK certificate.** The TPM carries one in NV, or the vendor service
+   delivers one. It chains to a CA in `/usr/share/enklave/tpm-ek-ca`, and it
+   is marked as an EK certificate (extended key usage 2.23.133.8.1, or no
+   extended key usage and a TCG certificate policy) with TPM manufacturer,
+   model and version in the subjectAltName. If a vendor's certificates
+   carry neither mark, the model is not supported; do not relax the check.
+2. **TPM.** `TPM2_PolicyAuthorizeNV` present; an NV index of 496 bytes can be
+   defined; the dictionary-attack recovery time can be set to 0; no foreign
+   NV index or persistent key is present after a TPM clear.
+3. **Event log.** Replays to PCR 7; db, dbx and KEK measured once each,
+   verbatim.
+4. **Variable update.** A signed dbx append is stored in one of the two
+   computed forms (status goes `pending`, then `current`, and the `pending`
+   status carries no note "not predicted").
+5. **IOMMU.** ACPI DMAR or IVRS present with VT-d / AMD-Vi enabled; all IOMMU
+   groups of type `DMA`.
+6. **PCR 7 stable** across reboots and across a firmware setup visit without
+   changes.
