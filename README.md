@@ -92,6 +92,10 @@ and the only holder of the state keys at runtime:
     (covered by the manifest MAC and the TPM counter), so it cannot be turned
     back. The writer then gets the verified bundle (`$ENKLAVE_INPUT_BUNDLE`,
     `$ENKLAVE_INPUT_SIG`, `$ENKLAVE_INPUT_VERSION`, and on stdin).
+    A bundle is bound to the role and to its version, not to a writer, so an
+    image defines at most one signed-bundle writer (enforced by the service
+    and the image build); otherwise a bundle signed for one writer could be
+    handed to another.
 
   A writer without one of these declarations is refused by the service and
   by the image build (`mkosi.finalize`). The test profile alone may declare

@@ -1235,6 +1235,17 @@ func TestWriterDefinitions(t *testing.T) {
 	if w, err := LoadWriters(filepath.Join(t.TempDir(), "none"), false); err != nil || len(w) != 0 {
 		t.Errorf("image without writers: %v %v", w, err)
 	}
+	// a bundle is not bound to a writer: one signed-bundle writer per image
+	two := t.TempDir()
+	for _, n := range []string{"a", "b"} {
+		os.WriteFile(filepath.Join(two, n+".json"), []byte(`{"unit":"`+n+`.service","exec":["/bin/sh"],"input":"signed-bundle"}`), 0o644)
+	}
+	if _, err := LoadWriters(two, false); err == nil || !strings.Contains(err.Error(), "an image may define one") {
+		t.Errorf("two signed-bundle writers: %v", err)
+	}
+	if w, err := LoadWriters(two, true); err != nil || len(w) != 2 {
+		t.Errorf("test profile with its probe writer: %v %v", w, err)
+	}
 	// a writer with input "none" never sees the caller's input
 	e := newEnv(t, "prod")
 	os.WriteFile(filepath.Join(e.c.WritersDir, "tick.json"),

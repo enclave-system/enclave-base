@@ -100,6 +100,19 @@ func LoadWriters(dir string, test bool) (map[string]Writer, error) {
 		}
 		out[w.ID] = w
 	}
+	// A bundle is bound to the role and to a version, not to a writer. With
+	// two signed-bundle writers, a bundle signed for one could be handed to
+	// the other. An image therefore has at most one (the test profile adds
+	// its probe writer next to the role's).
+	n := 0
+	for _, w := range out {
+		if w.Input == InputBundle {
+			n++
+		}
+	}
+	if n > 1 && !test {
+		return nil, fmt.Errorf("%s: %d writers take signed bundles; an image may define one (a bundle is not bound to a writer)", dir, n)
+	}
 	return out, nil
 }
 

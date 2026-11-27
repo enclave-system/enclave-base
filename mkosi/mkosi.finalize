@@ -181,6 +181,10 @@ for f in "$root"/usr/lib/enklave/state-writers.d/*; do
     else die "${f##*/}: a state writer must declare \"input\": \"none\" or \"signed-bundle\""
     fi
 done
+# A bundle is bound to role and version, not to a writer: one signed-bundle
+# writer per image (the test profile adds its probe writer).
+nsigned="$( (grep -El '"input"[[:space:]]*:[[:space:]]*"signed-bundle"' "$root"/usr/lib/enklave/state-writers.d/*.json 2>/dev/null || true) | wc -l)"
+[ "$nsigned" -le 1 ] || [ -e "$root/usr/lib/enklave/test-profile" ] || die "$nsigned state writers take signed bundles; an image may define one"
 # G10: the process holding the state keys leaves no core dump.
 [ "$(unit_value "$dst/enklave-state.service" Service LimitCORE)" = 0 ] || die "enklave-state.service must set LimitCORE=0"
 # G8: a client is built with require_ftpm (test-profile VM builds excepted).
