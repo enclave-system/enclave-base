@@ -10,10 +10,17 @@
 //  4. writes the JSON next to the UKI and, with --image, into the image's ESP
 //     at /EFI/enklave/policy/<uki>.json (mtools).
 //
+// It refuses to sign when the release metadata that went into the image
+// (--release, the verity-protected release.json) disagrees with the PKI
+// about the dev-key marker or with --epoch, a test-profile image with
+// non-dev keys, and a prod image with dev keys unless
+// --allow-dev-key-for-prod is given (development builds only).
+//
 // Usage:
 //
 //	enklave-sign-policy --uki X.efi --key pcr-signing.key --pub pcr-signing.pub \
-//	    --epoch N --out X.policy.json [--image X.raw]
+//	    --epoch N --role R --profile prod|test --pki DIR --release release.json \
+//	    --out X.policy.json [--image X.raw] [--allow-dev-key-for-prod]
 package main
 
 import (
