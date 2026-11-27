@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Durable revocation of released UKIs (N3b): produce a signed UEFI dbx append
+# Durable revocation of released UKIs: produce a signed UEFI dbx append
 # (authenticated variable update, signed with the Secure Boot KEK) holding the
 # Authenticode SHA-256 hashes of the given EFI binaries. Once applied, the
 # firmware refuses to boot them, even after a TPM clear.

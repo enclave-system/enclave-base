@@ -164,7 +164,7 @@ test-unit:
 	cd go && go vet ./... && go test ./... -race -count=1
 	python3 -m pytest -q -m "not vm" pki/tests kernel/tests
 
-# tests/vm arrives with task 6b; until then only the PKI VM test runs.
+# VM tests: the PKI test, plus tests/vm when present.
 test-vm:
 	python3 -m pytest -v -m vm pki/tests $(wildcard tests/vm)
 

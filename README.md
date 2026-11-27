@@ -1,22 +1,135 @@
 # enclave-base
 
-Foundation repo of the enclave ecosystem: minimal, signed, immutable Linux
-images for a hardened custom OS, built with mkosi on Debian 13 (trixie).
+The base image of [Enclave](https://github.com/enclave-system): a minimal,
+signed, immutable and amnesic Linux operating system for high-security
+devices, built with mkosi on Debian 13 (trixie).
 
-Specification (outside this repo):
-`docs\superpowers\specs\2026-11-26-enclave-design.md`
+Every Enclave role (reference image, client, server roles) is built on top of
+this repository. It provides the hardened kernel, the image layout, the
+Secure Boot and measured-boot chain, and the only piece of persistent state a
+device has: a small encrypted volume whose key is released by the TPM to a
+genuine, non-revoked release only.
 
-**Build runs only on the Linux build host** (Debian 13). Windows is used
-for editing and committing only.
+## Architecture
 
-Build host setup:
+- **Kernel.** Linux 6.12 LTS (`kernel/VERSION`), built from the signed
+  kernel.org tarball in two flavors, `server` and `client`
+  (`kernel/build-kernel.sh`). Hardening is enforced by a rule check
+  (`kernel/check_config.py`, `kernel/rules/`) that runs before and after the
+  compile: forced lockdown (`confidentiality`), mandatory module signatures,
+  strict IOMMU, no debugfs, no debug info. The package is named
+  `linux-image-<version>-enclave-<flavor>`.
+- **UKI.** Kernel, initrd and the fixed command line are one Unified Kernel
+  Image, booted by systemd-boot. The UKI carries a signed PCR 11 policy for
+  the boot phase `enter-initrd:leave-initrd` (`mkosi/tools/ukify`). The
+  command line cannot be changed and credentials from the ESP, SMBIOS or
+  fw_cfg are never imported.
+- **Secure Boot.** The UKI and systemd-boot are signed with the Enclave db
+  key. Keys are enrolled by the owner (`pki/enclave-pki ovmf-vars` for VMs),
+  never auto-enrolled from the ESP. Without Secure Boot the device powers off.
+- **dm-verity.** There is no root partition: `/` is a tmpfs, `/usr` is an
+  erofs partition protected by a signed dm-verity root hash, with A/B slots
+  for systemd-sysupdate. `/etc` is populated from `/usr/share/factory/etc` at
+  every boot. Nothing written at runtime survives a reboot, except:
+- **/var with TPM.** One 1 GiB LUKS2 partition (`enclave-var`), created on
+  the first boot and mounted read-only at `/var/lib/enclave`. Its key lives
+  only in a TPM NV index, released under a policy bound to the PCR signing
+  key, the role, the profile, PCR 7 (Secure Boot state), PCR 11 (the UKI)
+  and PCR 12. The TPM's endorsement key is authenticated against the TPM
+  vendor CAs on every boot.
+- **State store.** Content of the state volume is authenticated by an HMAC
+  manifest whose version is bound to a TPM NV counter, so spliced, older or
+  foreign content is refused. Only the state service writes it, through
+  writers defined by the image, and only with input the image declares
+  (none, or a bundle signed with the config-signing key).
+- **Revocation epochs.** Every release carries a security epoch. The first
+  boot of a newer release revokes all older epochs in a set-only TPM bit
+  field, so older UKIs can no longer open the state volume. `HEAL_BELOW`
+  re-provisions devices whose state may have leaked.
+- **dbx updates.** A release can ship signed Secure Boot variable updates
+  (dbx, db, KEK appends) and applies them itself. The TPM binding of PCR 7 is
+  moved across the update per device, enforced by the TPM at every moment,
+  so revocation by dbx works without re-provisioning and without a window.
+- **Network.** nftables drops everything by default in every direction (role
+  repos add their rules); the kernels are built without IPv6.
+
+The details, the exact guarantees and the accepted limits are in
+[Security model](#security-model) below.
+
+## Repository layout
+
+| Path | Content |
+|---|---|
+| `kernel/` | Kernel version, config fragments, hardening rules, build script and its tests |
+| `mkosi/` | The base image: mkosi configuration, partition layout, units, nftables, test profile |
+| `ref/` | The reference role `ref`: the base image without role content |
+| `go/` | `enclave-varauth` (unlock, provisioning, state service), `enclave-selftest`, `enclave-cfg` (config bundles), `enclave-sign-policy` (release signing) |
+| `pki/` | `enclave-pki`: key generation, OVMF variable stores, test TPM CA |
+| `scripts/` | Build host bootstrap and check, `revoke-release.sh` (signed dbx appends) |
+| `SECURITY_EPOCH`, `HEAL_BELOW` | Security epoch of this release line and the healing threshold |
+
+## Building
+
+Builds run on a Linux build host with Debian 13, KVM and passwordless sudo.
+Tool versions are pinned in `BUILDHOST.lock`.
 
     sudo scripts/bootstrap-buildhost.sh   # idempotent
     scripts/check-buildhost.sh            # silent, exit 0 = ready
 
-Pinned tool versions live in `BUILDHOST.lock`.
+Create a PKI once (see [PKI](#pki)). For development:
 
-## PKI
+    pki/enclave-pki init --dev ~/enclave-pki-dev
+    pki/enclave-pki ek-test-ca ~/enclave-pki-dev     # CA for emulated test TPMs
+    export ENCLAVE_PKI_DIR=~/enclave-pki-dev
+
+Make targets:
+
+| Target | Result |
+|---|---|
+| `make kernel-server`, `make kernel-client` | Kernel debs in `$(KERNEL_OUT)` (default `~/enclave-out`); about 25 minutes each, never rebuilt if present |
+| `make go` | The Go tools in `out/bin` |
+| `make ref` | Reference image, profile `prod` (production PKI) or `dev` (`ENCLAVE_DEV_PROD=1` with a dev PKI), in `out/ref` |
+| `make ref-test` | Reference image with the test profile (selftest, serial console), in `out/ref-test` |
+| `make test-unit` | Go vet and tests with the race detector, Python tests |
+| `make test-vm` | Tests that need a VM |
+| `make clean` | Removes the image outputs and the staging trees |
+
+Variables: `ENCLAVE_PKI_DIR` (PKI directory), `KERNEL_OUT`,
+`SECURITY_EPOCH`, `HEAL_BELOW`, `EFI_UPDATES` (signed `.auth` files to apply),
+`EK_CERTS` (EK certificates fetched from the TPM vendor), `EK_ADMIT`
+(per-device admissions, dev and test only), `REQUIRE_FTPM=1` (firmware TPMs
+only), `ENCLAVE_DEV_PROD=1`, `REF_OUT`, `REF_TEST_OUT`.
+
+An image directory holds the disk image (`enclave-ref_<version>.raw`), the
+signed UKI (`.efi`) and the signed policy (`.policy.json`), which
+`enclave-sign-policy` also writes to the ESP of the image. Check the
+signature with `sbverify --cert $ENCLAVE_PKI_DIR/sb/db.crt <uki>.efi`.
+
+## Testing
+
+    make test-unit
+
+runs `go vet`, `go test ./... -race` and the Python tests of the PKI tool and
+the kernel config check. A test-profile image (`make ref-test`) runs
+`enclave-selftest` at every boot and prints one JSON line per check on the
+serial console, ending in `{"check":"done","ok":true}`. It is booted in QEMU
+with OVMF (Secure Boot keys enrolled with `pki/enclave-pki ovmf-vars`), swtpm
+(EK certificate from the test CA) and a virtual IOMMU (`-device intel-iommu`).
+The attacks the design defends against (swapped or spliced state volumes,
+snapshot rollback, test UKI against a production state, foreign TPM
+objects, Secure Boot changes during an update, power cuts) are exercised in
+such VMs. The test profile has pause points and test hooks that exist only
+in test-profile images.
+
+Before a hardware model is approved, run the
+[hardware bring-up checklist](#hardware-bring-up-checklist).
+
+## Security model
+
+This section states what the base image guarantees, how, and where the
+guarantees end. Everything here is enforced in code and fails closed.
+
+### PKI
 
 `pki/enclave-pki init <dir>` generates all signing keys (Secure Boot, dm-verity,
 module signing, config signing, update GPG, PCR policy). Protecting that
@@ -45,7 +158,7 @@ directory is the operator's job:
   `enclave-sign-policy` refuses to sign an image whose marker does not match
   the PKI.
 
-## Persistent state, /var and the TPM
+### Persistent state, /var and the TPM
 
 The root file system is a tmpfs; `/var` is volatile. The **only persistent
 storage** is the state volume mounted at `/var/lib/enclave` (1 GiB partition
@@ -62,7 +175,7 @@ storage** is the state volume mounted at `/var/lib/enclave` (1 GiB partition
   authenticates sectors but not their version). A crash during a commit is
   rolled forward or back at the next boot.
 
-### The state service: who may write and how to read
+#### The state service: who may write and how to read
 
 `enclave-state.service` (`enclave-varauth state-serve`) is the only writer
 and the only holder of the state keys at runtime:
@@ -147,7 +260,7 @@ derive what it writes from anything a local process controls (files in
 services should still not run as root (`User=`, `ProtectSystem=strict`, no
 `CAP_SYS_ADMIN`); the guarantees above do not depend on it.
 
-### TPM policy and ownership
+#### TPM policy and ownership
 
 The volume key, the record, the administration of the counter and the owner,
 endorsement and lockout hierarchies are governed by
@@ -234,7 +347,7 @@ root key that systemd creates with an empty authValue); first provisioning
 does the same. The selftest check `tpm_locked` reports the same condition and
 that the lockout is disabled.
 
-### TPM authenticity: endorsement key certificate
+#### TPM authenticity: endorsement key certificate
 
 The salt key is the TPM's endorsement key (EK, TCG default template, ECC P-256
 or RSA 2048). Its public area is never taken on trust from the TPM bus. On
@@ -339,7 +452,7 @@ image:
 - A TPM with a valid certificate is never matched against admissions.
 - Not available with `require_ftpm`.
 
-### Security epochs: revoking a vulnerable release
+#### Security epochs: revoking a vulnerable release
 
 Rules:
 
@@ -364,9 +477,9 @@ Rules:
    fleet (factory reset clears the epoch index); plan epochs per security
    release, not per build.
 
-Pre-scheme UKIs (empty policyRef, builds ≤ 2fd8d34) never satisfy P.
+UKIs from before the policyRef scheme (empty policyRef) never satisfy P.
 
-### Secure Boot variable updates (dbx, db, KEK) and PCR 7
+#### Secure Boot variable updates (dbx, db, KEK) and PCR 7
 
 A dbx, db or KEK change alters PCR 7 from the next boot on. The binding to
 PCR 7 therefore lives in `V` and is moved by the release, per device. **PCR 7
@@ -467,7 +580,7 @@ Operational rules:
 - Any release of the same role, profile and a non-revoked epoch can complete
   a pending transition; the same UKI is not required.
 
-### Why PCR 1 is not bound, and what is enforced instead
+#### Why PCR 1 is not bound, and what is enforced instead
 
 PCR 1 holds the firmware's configuration data: boot order and boot entries,
 SMBIOS and ACPI tables, and whatever setup options a vendor chooses to
@@ -494,7 +607,7 @@ measure. It is not bound:
   interface reports must be locked with a supervisor password on the
   firmware setup (hardware requirement, see below).
 
-### Healing after a compromise
+#### Healing after a compromise
 
 `HEAL_BELOW=N` (baked into the verity-protected `release.json`) makes a
 release re-provision every state volume provisioned under an epoch < N on its
@@ -511,12 +624,12 @@ obtained under a revoked epoch is useless afterwards.
   enrollment and configuration, which are restored through the console
   (re-enrollment). The data volumes of backup and file servers are separate
   volumes and are not touched by healing; their keys must not be kept in the
-  state volume alone (Task of the role repos), otherwise healing makes the
-  data unreadable.
+  state volume alone (a requirement for the role repos), otherwise healing
+  makes the data unreadable.
 - A release with both `HEAL_BELOW` and a dbx update heals in boot A and
   completes the PCR 7 transition in boot B.
 
-### Recovery: tainted PCR 12
+#### Recovery: tainted PCR 12
 
 systemd-stub measures credentials (`*.cred`), addons and command line
 overrides found on the (unauthenticated) ESP into PCR 12; the state volume is
@@ -525,7 +638,7 @@ bound to PCR 12 = 0, so a stray or planted file such as
 machine power off at every boot. Remove the files from the ESP (from another
 system) and boot again.
 
-### Impact of key and firmware changes
+#### Impact of key and firmware changes
 
 - **PCR signing key:** the hierarchies and indices are bound to it. A new key
   requires a factory reset; revoke releases with epochs, not new keys.
@@ -537,7 +650,7 @@ system) and boot again.
 - **Firmware updates** that change how or what the firmware measures into
   PCR 7: the device fails closed, also while a transition is pending.
 
-### Factory reset and interrupted provisioning
+#### Factory reset and interrupted provisioning
 
 Factory reset: clear the TPM in the firmware setup (physical presence; this
 wipes all owner objects and re-enables Clear) and delete the `enclave-var`
@@ -568,7 +681,8 @@ These cannot be closed from the operating system:
   old UKIs are stopped only by dbx. `REQUIRE_FTPM=1` removes the bus.
 - **Revocation by epoch does not survive a TPM clear.** A cleared TPM has no
   memory of revoked epochs. The durable revocation is the dbx update shipped
-  with the release (above); its delivery in updates is part of Task 7.
+  with the release (above); delivering it with system updates is the job of
+  the update mechanism.
 - **Firmware setup.** Settings that neither a bound PCR nor the kernel
   reports (debug interfaces, vendor options; see "Why PCR 1 is not bound")
   must be protected by a supervisor password. The IOMMU is not among them:
@@ -598,3 +712,8 @@ the serial port; each item fails closed if it does not hold):
    groups of type `DMA`.
 6. **PCR 7 stable** across reboots and across a firmware setup visit without
    changes.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE). Redistributions and derivative
+works must keep the [NOTICE](NOTICE) file.
